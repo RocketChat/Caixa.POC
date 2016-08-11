@@ -1,0 +1,27 @@
+<template name="messages">
+	<div class="messages">
+		<div class="wrapper">
+			<ul>
+				{{#each messages}}
+					{{#nrr nrrargs 'message' .}}{{/nrr}}
+				{{/each}}
+			</ul>
+		</div>
+		<div class="new-message not">
+			<span>{{_ "New_messages"}}</span>
+		</div>
+
+		<div class="error">
+			<span></span>
+		</div>
+	</div>
+	<div class="footer">
+		<div class="input-wrapper">
+			<textarea class="input-message" placeholder="{{_ "Type_your_message"}}"></textarea>
+		</div>
+		<i class="send-button icon-paper-plane" aria-label="{{_ "Send"}}"></i>
+
+		{{> options show=showOptions}}
+		<button class="toggle-options">{{optionsLink}}</button>
+	</div>
+</template>

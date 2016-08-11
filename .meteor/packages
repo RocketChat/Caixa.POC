@@ -1,0 +1,47 @@
+# Meteor packages used by this project, one per line.
+# Check this file (and the other files in this directory) into your repository.
+#
+# 'meteor add' and 'meteor remove' will edit this file for you,
+# but you can also edit it by hand.
+
+
+
+
+
+accounts-password
+blaze
+blaze-html-templates    # Compile .html files into Meteor Blaze views
+check
+coffeescript
+ddp
+deps
+ecmascript
+ejson
+es5-shim
+jquery
+kadira:blaze-layout
+kadira:flow-router
+kevohagan:sweetalert
+konecty:nrr
+less
+livedata
+logging
+meteor
+meteor-base             # Packages every Meteor app needs to have
+mizzao:timesync
+mobile-experience       # Packages for a great mobile UX
+momentjs:moment
+mongo
+random
+reactive-var
+rocketchat:streamer
+session
+spacebars
+standard-minifiers
+tap:i18n
+templating
+tracker
+ui
+underscore
+underscorestring:underscore.string
+webapp

@@ -1,0 +1,31 @@
+<template name="livechatWindow">
+	{{#if livechatStarted}}
+		<div class="livechat-room">
+			<div class="title" style="background-color:{{color}}; color: {{fontColor}}">
+				<div class="toolbar">
+					&nbsp;
+					{{#if soundActive}}
+						<i class="sound icon-bell-alt" title="Toggle notification sound"></i>
+					{{else}}
+						<i class="sound icon-bell-off" title="toggle notification sound"></i>
+					{{/if}}
+				</div>
+				<h1>{{title}}</h1>
+			</div>
+
+			{{#if livechatOnline}}
+				{{#if showRegisterForm}}
+					{{> register}}
+				{{else}}
+					{{> messages}}
+				{{/if}}
+			{{else}}
+				<div class="offline">
+					{{> offlineForm (offlineData)}}
+				</div>
+			{{/if}}
+
+			{{> poweredBy }}
+		</div>
+	{{/if}}
+</template>
