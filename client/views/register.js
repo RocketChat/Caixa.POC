@@ -10,13 +10,21 @@ Template.register.helpers({
 	},
 	departments() {
 		return Department.find();
+	},
+	loggedIn() {
+		return !!Meteor.userId();
 	}
 });
 
 Template.register.events({
 	'submit #livechat-registration'(e, instance) {
-		var $email, $name;
 		e.preventDefault();
+		if (Meteor.userId()) {
+			Livechat.registrationForm = false;
+			return;
+		}
+
+		var $email, $name;
 		$name = instance.$('input[name=name]');
 		// $email = instance.$('input[name=email]');
 		if (!$name.val().trim()) {
