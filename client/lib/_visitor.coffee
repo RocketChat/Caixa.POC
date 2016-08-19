@@ -34,15 +34,19 @@ msgStream = new Meteor.Streamer 'room-messages'
 
 	subscribeToRoom = (roomId) ->
 		msgStream.on roomId, (msg) ->
+			console.log 'msg!', msg
 			if msg.t is 'command'
-				if msg.msg is 'survey'
-					unless $('body #survey').length
-						Blaze.render(Template.survey, $('body').get(0))
+				switch msg.msg
+					when 'survey'
+						unless $('body #survey').length
+							Blaze.render(Template.survey, $('body').get(0))
+					when 'endCall'
+						LivechatVideoCall.finish()
 			else
 				ChatMessage.upsert { _id: msg._id }, msg
 
-				# notification sound 
-				if Session.equals('sound', true) 
+				# notification sound
+				if Session.equals('sound', true)
 					if msg.u._id isnt Meteor.user()._id
 						$('#chatAudioNotification')[0].play();
 

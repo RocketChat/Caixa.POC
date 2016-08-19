@@ -19,9 +19,18 @@ Template.register.helpers({
 Template.register.events({
 	'submit #livechat-registration'(e, instance) {
 		e.preventDefault();
+
+		let start = () => {
+			instance.hideError();
+			if (instance.request === 'chat') {
+				Livechat.registrationForm = false;
+			} else if (instance.request === 'video') {
+				LivechatVideoCall.request();
+			}
+		};
+
 		if (Meteor.userId()) {
-			Livechat.registrationForm = false;
-			return;
+			return start();
 		}
 
 		var $email, $name;
@@ -52,18 +61,25 @@ Template.register.events({
 					if (error) {
 						return instance.showError(error.reason);
 					}
-					Livechat.registrationForm = false;
+					start();
 				});
 			});
 		}
 	},
 	'click .error'(e, instance) {
 		return instance.hideError();
+	},
+	'click .request-chat'(e, instance) {
+		instance.request = 'chat';
+	},
+	'click .request-video'(e, instance) {
+		instance.request = 'video';
 	}
 });
 
 Template.register.onCreated(function() {
 	this.error = new ReactiveVar();
+	this.request = '';
 	this.showError = (msg) => {
 		$('.error').addClass('show');
 		this.error.set(msg);

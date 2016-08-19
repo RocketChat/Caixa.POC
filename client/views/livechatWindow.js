@@ -37,6 +37,12 @@ Template.livechatWindow.helpers({
 			offlineUnavailableMessage: Livechat.offlineUnavailableMessage.replace(/([^>\r\n]?)(\r\n|\n\r|\r|\n)/g, '$1<br>$2'),
 			displayOfflineForm: Livechat.displayOfflineForm
 		};
+	},
+	showIframe() {
+		return Template.instance().showIframe.get();
+	},
+	videoCalling() {
+		return LivechatVideoCall.isActive();
 	}
 });
 
@@ -51,11 +57,16 @@ Template.livechatWindow.events({
 	'click .sound'(event) {
 		event.stopPropagation();
 		Session.set({sound: !Session.get('sound')});
+	},
+	'click #criar-iframe'(event, instance) {
+		instance.showIframe.set(true);
 	}
 });
 
 Template.livechatWindow.onCreated(function() {
 	Session.set({sound: true});
+
+	this.showIframe = new ReactiveVar(false);
 
 	const defaultAppLanguage = () => {
 		let lng = window.navigator.userLanguage || window.navigator.language || 'en';
@@ -98,6 +109,7 @@ Template.livechatWindow.onCreated(function() {
 				RoomHistoryManager.getMoreIfIsEmpty(result.room._id);
 				visitor.subscribeToRoom(result.room._id);
 				visitor.setRoom(result.room._id);
+				Livechat.registrationForm = false;
 			}
 
 			TAPi18n.setLanguage((result.language || defaultAppLanguage()).split('-').shift());

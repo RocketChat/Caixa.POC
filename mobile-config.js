@@ -13,8 +13,8 @@ App.icons({
   'android_mdpi': 'assets/android-caixa-mdpi.png',
   'android_hdpi': 'assets/android-caixa-hdpi.png',
   'android_xhdpi': 'assets/android-caixa-xhdpi.png',
-  // 'android_xxhdpi': 'assets/android-caixa-xxhdpi.png',
-  // 'android_xxxhdpi': 'assets/android-xxxhdpi.png',
+  'android_xxhdpi': 'assets/android-caixa-xxhdpi.png',
+  'android_xxxhdpi': 'assets/android-caixa-xxxhdpi.png',
   // 'iphone_2x': 'icons/icon-60@2x.png',
   // ... more screen sizes and platforms ...
 });
@@ -35,6 +35,16 @@ App.setPreference('BackgroundColor', '0xffFFFFFF');
 App.setPreference('HideKeyboardFormAccessoryBar', true);
 App.setPreference('Orientation', 'default');
 App.setPreference('Orientation', 'all', 'ios');
+App.accessRule('https://jitsi.rocket.chat/*', { type: 'navigation' } );
+App.accessRule('https://meet.jit.si/*', { type: 'navigation' } );
+App.accessRule('http://*');
+App.accessRule('https://*');
+App.accessRule('*');
+App.accessRule('*://173.194.71.127:*');
+App.accessRule('*5.9.154.226:*');
+App.accessRule('*://localhost:*');
+App.accessRule('*://192.168.192.251:*');
+
 // Pass preferences for a particular PhoneGap/Cordova plugin
 // App.configurePlugin('com.phonegap.plugins.facebookconnect', {
 //   APP_ID: '1234567890',

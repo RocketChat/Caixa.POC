@@ -648,6 +648,57 @@ input:focus {
 	}
 }
 
+.video-call {
+	position: fixed;
+	top: @header-min-height;
+	bottom: 0;
+	left: 0;
+	right: 0;
+	background-color: #000;
+	z-index: 11;
+
+	.video-overlay {
+		position: fixed;
+		top: 0;
+		bottom: 0;
+		left: 0;
+		right: 0;
+		z-index: 13;
+
+		.toolbar {
+			position: absolute;
+			bottom: 50px;
+			bottom: 180px;
+			width: 100%;
+			text-align: center;
+			opacity: 0;
+			.transform(translateY(80px));
+
+			.transition(opacity 0.175s ease-out, transform 0.175s ease-out);
+
+			&.visible {
+				opacity: 1;
+				.transform(translateY(0px));
+			}
+
+			.end-call {
+				background-color: red;
+				color: white;
+				border-radius: 50%;
+				height: 60px;
+				width: 60px;
+				text-align: center;
+				font-size: 30px;
+				outline: none;
+			}
+		}
+	}
+
+	.container {
+		z-index: 12;
+	}
+}
+
 .sweet-overlay {
 	border-top-right-radius: inherit;
 	border-top-left-radius: inherit;
