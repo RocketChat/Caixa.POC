@@ -128,7 +128,7 @@ Autoupdate._retrySubscription = function () {
                 newLink.setAttribute("rel", "stylesheet");
                 newLink.setAttribute("type", "text/css");
                 newLink.setAttribute("class", "__meteor-css__");
-                newLink.setAttribute("href", Meteor._relativeToSiteRootUrl(css.url));
+                newLink.setAttribute("href", css.url);
                 attachStylesheetLink(newLink);
               });
             } else {
@@ -153,4 +153,4 @@ Autoupdate._retrySubscription = function () {
     }
   });
 };
-Autoupdate._retrySubscription();
+// Autoupdate._retrySubscription();
