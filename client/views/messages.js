@@ -52,6 +52,10 @@ Template.messages.events({
 	},
 	'click .toggle-options': function(event, instance) {
 		instance.showOptions.set(!instance.showOptions.get());
+	},
+	'click .video-button': function(event) {
+		event.preventDefault();
+		LivechatVideoCall.request();
 	}
 });
 

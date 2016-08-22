@@ -19,7 +19,10 @@
 		<div class="input-wrapper">
 			<textarea class="input-message" placeholder="{{_ "Type_your_message"}}"></textarea>
 		</div>
-		<i class="send-button icon-paper-plane" aria-label="{{_ "Send"}}"></i>
+		<div class="buttons">
+			<i class="send-button icon-paper-plane" aria-label="{{_ "Send"}}"></i>
+			<i class="video-button icon-videocam" aria-label="{{_ "Video"}}"></i>
+		</div>
 
 		{{> options show=showOptions}}
 		<button class="toggle-options">{{optionsLink}}</button>

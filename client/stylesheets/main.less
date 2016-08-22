@@ -387,7 +387,7 @@ input:focus {
 
 		.input-wrapper {
 			padding: 6px 6px 0 6px;
-			padding-right: 30px;
+			padding-right: 60px;
 			textarea {
 				display: block;
 				padding: 6px 8px;
@@ -405,17 +405,21 @@ input:focus {
 				position: relative;
 			}
 		}
-		.send-button {
+		.buttons {
 			float: right;
 			position: relative;
-			right: 7px;
-			top: -20px;
+			right: 10px;
+			top: -22px;
 			color: @secondary-font-color;
-			cursor: pointer;
-			.transition(color .15s ease-out);
 
-			&:hover {
-				color: @primary-font-color;
+			i {
+				cursor: pointer;
+				padding: 0 2px;
+				.transition(color .15s ease-out);
+
+				&:hover {
+					color: @primary-font-color;
+				}
 			}
 		}
 		.toggle-options {
