@@ -4,18 +4,39 @@ LivechatVideoCall = new (class LivechatVideoCall {
 		this.calling = new ReactiveVar(false);
 	}
 
+	askPermissions(callback) {
+		if (Meteor.isCordova) {
+			cordova.plugins.diagnostic.requestCameraAuthorization(() => {
+				console.log('requestCameraAuthorization ->', arguments);
+				cordova.plugins.diagnostic.requestMicrophoneAuthorization(() => {
+					console.log('requestMicrophoneAuthorization ->', arguments);
+					callback(true);
+				}, (error) => {
+					console.error(error);
+				});
+			}, (error) => {
+				console.error(error);
+			});
+		} else {
+			return callback(true);
+		}
+	}
+
 	request() {
-		this.calling.set(true);
-		Meteor.call('livechat:startVideoCall', visitor.getRoom(true), (error, result) => {
-			if (error) {
-				return;
+		this.askPermissions((granted) => {
+			if (granted) {
+				this.calling.set(true);
+				Meteor.call('livechat:startVideoCall', visitor.getRoom(true), (error, result) => {
+					if (error) {
+						return;
+					}
+					visitor.subscribeToRoom(result.roomId);
+
+					// after get ok from server, start the chat
+					this.start(result.domain, result.jitsiRoom);
+				});
 			}
-			visitor.subscribeToRoom(result.roomId);
-
-			// after get ok from server, start the chat
-			this.start(result.domain, result.jitsiRoom);
 		});
-
 	}
 
 	start(domain, room) {
