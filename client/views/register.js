@@ -13,6 +13,9 @@ Template.register.helpers({
 	},
 	loggedIn() {
 		return !!Meteor.userId();
+	},
+	userName() {
+		return localStorage.getItem('name');
 	}
 });
 
@@ -61,6 +64,7 @@ Template.register.events({
 					if (error) {
 						return instance.showError(error.reason);
 					}
+					localStorage.setItem('name', guest.name);
 					start();
 				});
 			});

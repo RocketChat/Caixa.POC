@@ -10,9 +10,6 @@ LivechatVideoCall = new (class LivechatVideoCall {
 			if (error) {
 				return;
 			}
-			console.log('error ->', error);
-			console.log('result ->', result);
-
 			visitor.subscribeToRoom(result.roomId);
 
 			// after get ok from server, start the chat
@@ -31,11 +28,6 @@ LivechatVideoCall = new (class LivechatVideoCall {
 			this.api = new jitsiAPI(domain, room, $('.video-call').width(), $('.video-call').height(), $('.video-call .container').get(0), {}, interfaceConfig);
 
 			this.live.set(true);
-
-			// once the call is ok, shows toolbar buttons
-			setTimeout(() => {
-
-			}, 3000);
 
 			let logListener = (what) => {
 				console.log('Jitsi.addEventListener ->',what);

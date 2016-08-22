@@ -8,9 +8,12 @@
 			{{{welcomeMessage}}}
 		</p>
 		<form id="livechat-registration">
-			{{#unless loggedIn}}
+			{{#if loggedIn}}
+				<br>
+				<p>Olá <strong>{{userName}}</strong>, por favor, escolha uma das opções abaixo:</p>
+			{{else}}
 				<input type="text" name="name" id="guestName" placeholder="{{_ "Name"}}">
-			{{/unless}}
+			{{/if}}
 			<!-- <input type="email" name="email" id="guestEmail" placeholder="{{_ "Email"}}"> -->
 
 			<!-- {{#if hasDepartments}}
