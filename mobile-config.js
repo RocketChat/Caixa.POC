@@ -6,7 +6,8 @@ App.info({
   description: 'Caixa POC',
   author: 'Rocket.Chat',
   email: 'contact@rocket.chat',
-  website: 'https://rocket.chat'
+  website: 'https://rocket.chat',
+  version: '0.0.2'
 });
 // Set up resources such as icons and launch screens.
 App.icons({
