@@ -25,44 +25,56 @@ LivechatVideoCall = new (class LivechatVideoCall {
 	request() {
 		this.askPermissions((granted) => {
 			if (granted) {
+				$('.livechat-room').hide();
 				this.calling.set(true);
-				Meteor.call('livechat:startVideoCall', visitor.getRoom(true), (error, result) => {
-					if (error) {
-						return;
-					}
-					visitor.subscribeToRoom(result.roomId);
 
-					// after get ok from server, start the chat
-					this.start(result.domain, result.jitsiRoom);
-				});
+				// this.start('jitsi.rocket.chat', 'RocketChatd55894fdc76834211cf8584c021e1f25');
+				this.start('jitsi.rocket.chat', 'RocketChat2949ae2b4204f25693c34773f6d325d8');
+				// Meteor.call('livechat:startVideoCall', visitor.getRoom(true), (error, result) => {
+				// 	if (error) {
+				// 		return;
+				// 	}
+				// 	visitor.subscribeToRoom(result.roomId);
+
+				// 	// after get ok from server, start the chat
+				// 	this.start(result.domain, result.jitsiRoom);
+				// });
 			}
 		});
 	}
 
 	start(domain, room) {
 		Meteor.defer(() => {
-			let interfaceConfig = {};
-			// let interfaceConfig = { filmStripOnly: true };
-			interfaceConfig['TOOLBAR_BUTTONS'] = '[""]';
-			interfaceConfig['APP_NAME'] = '"Livechat"';
+			$.getScript('/jitsi/config.js');
+			$.getScript('/jitsi/utils.js');
+			$.getScript('/jitsi/do_external_connect.js');
+			$.getScript('/jitsi/interface_config.js');
+			$.getScript('/jitsi/lib-jitsi-meet.min.js');
+			$.getScript('/jitsi/app.bundle.min.js');
 
-			this.api = new jitsiAPI(domain, room, $('.video-call').width(), $('.video-call').height(), $('.video-call .container').get(0), {}, interfaceConfig);
 
-			this.live.set(true);
+			// let interfaceConfig = {};
+			// // let interfaceConfig = { filmStripOnly: true };
+			// interfaceConfig['TOOLBAR_BUTTONS'] = '[""]';
+			// interfaceConfig['APP_NAME'] = '"Livechat"';
 
-			let logListener = (what) => {
-				console.log('Jitsi.addEventListener ->',what);
-			}
+			// this.api = new jitsiAPI(domain, room, $('.video-call').width(), $('.video-call').height(), $('.video-call .container').get(0), {}, interfaceConfig);
 
-			this.api.addEventListeners({
-				incomingMessage() { logListener('incomingMessage'); },
-				outgoingMessage() { logListener('outgoingMessage'); },
-				displayNameChange() { logListener('displayNameChange'); },
-				participantJoined() { logListener('participantJoined'); },
-				participantLeft() { logListener('participantLeft'); },
-				videoConferenceJoined() { logListener('videoConferenceJoined'); },
-				videoConferenceLeft() { logListener('videoConferenceLeft'); },
-			});
+			// this.live.set(true);
+
+			// let logListener = (what) => {
+			// 	console.log('Jitsi.addEventListener ->',what);
+			// }
+
+			// this.api.addEventListeners({
+			// 	incomingMessage() { logListener('incomingMessage'); },
+			// 	outgoingMessage() { logListener('outgoingMessage'); },
+			// 	displayNameChange() { logListener('displayNameChange'); },
+			// 	participantJoined() { logListener('participantJoined'); },
+			// 	participantLeft() { logListener('participantLeft'); },
+			// 	videoConferenceJoined() { logListener('videoConferenceJoined'); },
+			// 	videoConferenceLeft() { logListener('videoConferenceLeft'); },
+			// });
 		});
 	}
 
