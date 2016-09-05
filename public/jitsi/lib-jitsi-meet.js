@@ -4743,7 +4743,7 @@ var RTCUtils = {
 					};
 				
                 self.pc_constraints = {};
-                window.addEventListener("load", function () {
+                // window.addEventListener("load", function () {
 					console.log("lib-jitsi-cordova >>> DOM ready event");
 					document.addEventListener("deviceready", function () {
 						console.log("lib-jitsi-cordova >>> deviceready event");
@@ -4785,7 +4785,7 @@ var RTCUtils = {
 						onReady(options, this.getUserMediaWithConstraints);
 						resolve();
 					 });  // End of ondeviceready.
-				}); 
+				// }); 
 			}				
 			else {
                 try {

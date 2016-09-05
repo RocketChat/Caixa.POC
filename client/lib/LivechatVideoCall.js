@@ -44,14 +44,35 @@ LivechatVideoCall = new (class LivechatVideoCall {
 	}
 
 	start(domain, room) {
-		Meteor.defer(() => {
-			$.getScript('/jitsi/config.js');
-			$.getScript('/jitsi/utils.js');
-			$.getScript('/jitsi/do_external_connect.js');
-			$.getScript('/jitsi/interface_config.js');
-			$.getScript('/jitsi/lib-jitsi-meet.min.js');
-			$.getScript('/jitsi/app.bundle.min.js');
+		var files = [
+			'/jitsi/run.js',
+			'/jitsi/fix_ios.js',
+			'/jitsi/config.js',
+			'/jitsi/utils.js',
+			'/jitsi/do_external_connect.js',
+			'/jitsi/interface_config.js',
+			'/jitsi/lib-jitsi-meet.js',
+			'/jitsi/app.bundle.min.js'
+		].reverse();
 
+		Meteor.defer(() => {
+			function consume() {
+				var file = files.pop();
+				if (!file) {
+					return;
+				}
+				console.log('will loading', file);
+				$.getScript(file)
+					.done(function() {
+						consume();
+					})
+					.fail(function( jqxhr, settings, exception, a ) {
+						window.ex = exception;
+					    console.log(jqxhr, settings, exception, a);
+					});
+			}
+			consume();
+			
 
 			// let interfaceConfig = {};
 			// // let interfaceConfig = { filmStripOnly: true };
