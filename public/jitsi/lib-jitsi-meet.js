@@ -5,8 +5,6 @@
 var logger = require("jitsi-meet-logger").getLogger(__filename);
 var RTC = require("./modules/RTC/RTC");
 var XMPPEvents = require("./service/xmpp/XMPPEvents");
-var AuthenticationEvents = require("./service/authentication/AuthenticationEvents");
-var RTCEvents = require("./service/RTC/RTCEvents");
 var EventEmitter = require("events");
 var JitsiConferenceEvents = require("./JitsiConferenceEvents");
 var JitsiConferenceErrors = require("./JitsiConferenceErrors");
@@ -15,8 +13,13 @@ var Statistics = require("./modules/statistics/statistics");
 var JitsiDTMFManager = require('./modules/DTMF/JitsiDTMFManager');
 var JitsiTrackEvents = require("./JitsiTrackEvents");
 var JitsiTrackErrors = require("./JitsiTrackErrors");
+var JitsiTrackError = require("./JitsiTrackError");
 var Settings = require("./modules/settings/Settings");
 var ComponentsVersions = require("./modules/version/ComponentsVersions");
+var GlobalOnErrorHandler = require("./modules/util/GlobalOnErrorHandler");
+var JitsiConferenceEventManager = require("./JitsiConferenceEventManager");
+var VideoType = require('./service/RTC/VideoType');
+var Transcriber = require("./modules/transcription/transcriber");
 
 /**
  * Creates a JitsiConference object with the given name and properties.
@@ -29,36 +32,18 @@ var ComponentsVersions = require("./modules/version/ComponentsVersions");
  */
 function JitsiConference(options) {
     if(!options.name || options.name.toLowerCase() !== options.name) {
-        logger.error("Invalid conference name (no conference name passed or it"
-            + "contains invalid characters like capital letters)!");
-         return;
+        var errmsg
+            = "Invalid conference name (no conference name passed or it "
+                + "contains invalid characters like capital letters)!";
+        logger.error(errmsg);
+        throw new Error(errmsg);
     }
-    this.options = options;
-    this.connection = this.options.connection;
-    this.xmpp = this.connection.xmpp;
     this.eventEmitter = new EventEmitter();
-    var confID = this.options.name  + '@' + this.xmpp.options.hosts.muc;
     this.settings = new Settings();
-    this.room = this.xmpp.createRoom(this.options.name, this.options.config,
-        this.settings);
-    this.componentsVersions = new ComponentsVersions(this.room);
-    this.room.updateDeviceAvailability(RTC.getDeviceAvailability());
-    this.rtc = new RTC(this.room, options);
-    this.statistics = new Statistics(this.xmpp, {
-        callStatsID: this.options.config.callStatsID,
-        callStatsSecret: this.options.config.callStatsSecret,
-        disableThirdPartyRequests:
-            this.options.config.disableThirdPartyRequests,
-        roomName: this.options.name
-    });
-    setupListeners(this);
-    var JitsiMeetJS = this.connection.JitsiMeetJS;
-    JitsiMeetJS._gumFailedHandler.push(function(error) {
-        this.statistics.sendGetUserMediaFailed(error);
-    }.bind(this));
-    JitsiMeetJS._globalOnErrorHandler.push(function(error) {
-        this.statistics.sendUnhandledError(error);
-    }.bind(this));
+    this.options = options;
+    this.eventManager = new JitsiConferenceEventManager(this);
+    this._init(options);
+    this.componentsVersions = new ComponentsVersions(this);
     this.participants = {};
     this.lastDominantSpeaker = null;
     this.dtmfManager = null;
@@ -73,6 +58,50 @@ function JitsiConference(options) {
         video: undefined
     };
     this.isMutedByFocus = false;
+    this.reportedAudioSSRCs = {};
+}
+
+/**
+ * Initializes the conference object properties
+ * @param options {object}
+ * @param connection {JitsiConnection} overrides this.connection
+ */
+JitsiConference.prototype._init = function (options) {
+    if(!options)
+        options = {};
+
+    // Override connection and xmpp properties (Usefull if the connection
+    // reloaded)
+    if(options.connection) {
+        this.connection = options.connection;
+        this.xmpp = this.connection.xmpp;
+        // Setup XMPP events only if we have new connection object.
+        this.eventManager.setupXMPPListeners();
+    }
+
+    this.room = this.xmpp.createRoom(this.options.name, this.options.config,
+        this.settings);
+
+    this.room.updateDeviceAvailability(RTC.getDeviceAvailability());
+
+    if(!this.rtc) {
+        this.rtc = new RTC(this, options);
+        this.eventManager.setupRTCListeners();
+    }
+
+    if(!this.statistics) {
+        this.statistics = new Statistics(this.xmpp, {
+            callStatsID: this.options.config.callStatsID,
+            callStatsSecret: this.options.config.callStatsSecret,
+            roomName: this.options.name
+        });
+    }
+
+    this.eventManager.setupChatRoomListeners();
+
+    // Always add listeners because on reload we are executing leave and the
+    // listeners are removed from statistics module.
+    this.eventManager.setupStatisticsListeners();
 }
 
 /**
@@ -95,16 +124,19 @@ JitsiConference.prototype.isJoined = function () {
  * Leaves the conference and calls onMemberLeft for every participant.
  */
 JitsiConference.prototype._leaveRoomAndRemoveParticipants = function () {
+    // remove all participants
+    this.getParticipants().forEach(function (participant) {
+        this.onMemberLeft(participant.getJid());
+    }.bind(this));
+
     // leave the conference
     if (this.room) {
         this.room.leave();
     }
 
     this.room = null;
-    // remove all participants
-    this.getParticipants().forEach(function (participant) {
-        this.onMemberLeft(participant.getJid());
-    }.bind(this));
+
+    this.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_LEFT);
 }
 /**
  * Leaves the conference.
@@ -113,6 +145,9 @@ JitsiConference.prototype._leaveRoomAndRemoveParticipants = function () {
 JitsiConference.prototype.leave = function () {
     var conference = this;
 
+    this.statistics.stopCallStats();
+    this.rtc.closeAllDataChannels();
+
     return Promise.all(
         conference.getLocalTracks().map(function (track) {
             return conference.removeTrack(track);
@@ -120,6 +155,8 @@ JitsiConference.prototype.leave = function () {
     ).then(this._leaveRoomAndRemoveParticipants.bind(this))
     .catch(function (error) {
         logger.error(error);
+        GlobalOnErrorHandler.callUnhandledRejectionHandler(
+            {promise: this, reason: error});
         // We are proceeding with leaving the conference because room.leave may
         // succeed.
         this._leaveRoomAndRemoveParticipants();
@@ -308,20 +345,54 @@ JitsiConference.prototype.setSubject = function (subject) {
 };
 
 /**
+ * Get a transcriber object for all current participants in this conference
+ * @return {Transcriber} the transcriber object
+ */
+JitsiConference.prototype.getTranscriber = function(){
+    if(this.transcriber === undefined){
+        this.transcriber = new Transcriber();
+        //add all existing local audio tracks to the transcriber
+        this.rtc.localTracks.forEach(function (localTrack) {
+            if(localTrack.isAudioTrack()){
+                this.transcriber.addTrack(localTrack);
+            }
+        }.bind(this));
+        //and all remote audio tracks
+        this.rtc.remoteTracks.forEach(function (remoteTrack){
+            if(remoteTrack.isAudioTrack()){
+                this.transcriber.addTrack(remoteTrack);
+            }
+        }.bind(this));
+    }
+    return this.transcriber;
+};
+
+/**
  * Adds JitsiLocalTrack object to the conference.
  * @param track the JitsiLocalTrack object.
  * @returns {Promise<JitsiLocalTrack>}
- * @throws will throw and error if track is video track
- * and there is already another video track in the conference.
+ * @throws {Error} if the specified track is a video track and there is already
+ * another video track in the conference.
  */
 JitsiConference.prototype.addTrack = function (track) {
-    if(track.disposed)
-    {
-        throw new Error(JitsiTrackErrors.TRACK_IS_DISPOSED);
+    if (track.disposed) {
+        return Promise.reject(
+            new JitsiTrackError(JitsiTrackErrors.TRACK_IS_DISPOSED));
     }
 
-    if (track.isVideoTrack() && this.rtc.getLocalVideoTrack()) {
-        throw new Error("cannot add second video track to the conference");
+    if (track.isVideoTrack()) {
+        // Ensure there's exactly 1 local video track in the conference.
+        var localVideoTrack = this.rtc.getLocalVideoTrack();
+        if (localVideoTrack) {
+            // Don't be excessively harsh and severe if the API client happens
+            // to attempt to add the same local video track twice.
+            if (track === localVideoTrack) {
+                return Promise.resolve(track);
+            } else {
+                return Promise.reject(new Error(
+                    "cannot add second video track to the conference"));
+            }
+        }
     }
 
     track.ssrcHandler = function (conference, ssrcMap) {
@@ -334,7 +405,19 @@ JitsiConference.prototype.addTrack = function (track) {
     this.room.addListener(XMPPEvents.SENDRECV_STREAMS_CHANGED,
         track.ssrcHandler);
 
-    return new Promise(function (resolve) {
+    if(track.isAudioTrack() || (track.isVideoTrack() &&
+        track.videoType !== VideoType.DESKTOP)) {
+        // Report active device to statistics
+        var devices = RTC.getCurrentlyAvailableMediaDevices();
+        device = devices.find(function (d) {
+            return d.kind === track.getTrack().kind + 'input'
+                && d.label === track.getTrack().label;
+        });
+        if(device)
+            Statistics.sendActiveDeviceListEvent(
+                RTC.getEventDataForActiveDevice(device));
+    }
+    return new Promise(function (resolve, reject) {
         this.room.addStream(track.getOriginalStream(), function () {
             if (track.isVideoTrack()) {
                 this.removeCommand("videoType");
@@ -346,6 +429,7 @@ JitsiConference.prototype.addTrack = function (track) {
                 });
             }
             this.rtc.addLocalTrack(track);
+
             if (track.startMuted) {
                 track.mute();
             }
@@ -363,18 +447,20 @@ JitsiConference.prototype.addTrack = function (track) {
                                    track.muteHandler);
             track.addEventListener(JitsiTrackEvents.TRACK_AUDIO_LEVEL_CHANGED,
                                    track.audioLevelHandler);
-            //FIXME: This dependacy is not necessary. This is quick fix.
+
             track._setConference(this);
 
             // send event for starting screen sharing
             // FIXME: we assume we have only one screen sharing track
             // if we change this we need to fix this check
-            if (track.isVideoTrack() && track.videoType === "desktop")
+            if (track.isVideoTrack() && track.videoType === VideoType.DESKTOP)
                 this.statistics.sendScreenSharingEvent(true);
 
             this.eventEmitter.emit(JitsiConferenceEvents.TRACK_ADDED, track);
             resolve(track);
-        }.bind(this));
+        }.bind(this), function (error) {
+            reject(error);
+        });
     }.bind(this));
 };
 
@@ -403,45 +489,53 @@ JitsiConference.prototype._fireMuteChangeEvent = function (track) {
 };
 
 /**
+ * Clear JitsiLocalTrack properties and listeners.
+ * @param track the JitsiLocalTrack object.
+ */
+JitsiConference.prototype.onTrackRemoved = function (track) {
+    track._setSSRC(null);
+    track._setConference(null);
+    this.rtc.removeLocalTrack(track);
+    track.removeEventListener(JitsiTrackEvents.TRACK_MUTE_CHANGED,
+        track.muteHandler);
+    track.removeEventListener(JitsiTrackEvents.TRACK_AUDIO_LEVEL_CHANGED,
+        track.audioLevelHandler);
+    this.room.removeListener(XMPPEvents.SENDRECV_STREAMS_CHANGED,
+        track.ssrcHandler);
+
+    // send event for stopping screen sharing
+    // FIXME: we assume we have only one screen sharing track
+    // if we change this we need to fix this check
+    if (track.isVideoTrack() && track.videoType === VideoType.DESKTOP)
+        this.statistics.sendScreenSharingEvent(false);
+
+    this.eventEmitter.emit(JitsiConferenceEvents.TRACK_REMOVED, track);
+}
+
+/**
  * Removes JitsiLocalTrack object to the conference.
  * @param track the JitsiLocalTrack object.
  * @returns {Promise}
  */
 JitsiConference.prototype.removeTrack = function (track) {
-    if(track.disposed)
-    {
-        throw new Error(JitsiTrackErrors.TRACK_IS_DISPOSED);
+    if (track.disposed) {
+        return Promise.reject(
+            new JitsiTrackError(JitsiTrackErrors.TRACK_IS_DISPOSED));
     }
 
     if(!this.room){
         if(this.rtc) {
-            this.rtc.removeLocalTrack(track);
-            this.eventEmitter.emit(JitsiConferenceEvents.TRACK_REMOVED, track);
+            this.onTrackRemoved(track);
         }
         return Promise.resolve();
     }
-    return new Promise(function (resolve) {
+    return new Promise(function (resolve, reject) {
         this.room.removeStream(track.getOriginalStream(), function(){
-            track._setSSRC(null);
-            //FIXME: This dependacy is not necessary. This is quick fix.
-            track._setConference(this);
-            this.rtc.removeLocalTrack(track);
-            track.removeEventListener(JitsiTrackEvents.TRACK_MUTE_CHANGED,
-                track.muteHandler);
-            track.removeEventListener(JitsiTrackEvents.TRACK_AUDIO_LEVEL_CHANGED,
-                track.audioLevelHandler);
-            this.room.removeListener(XMPPEvents.SENDRECV_STREAMS_CHANGED,
-                track.ssrcHandler);
-
-            // send event for stopping screen sharing
-            // FIXME: we assume we have only one screen sharing track
-            // if we change this we need to fix this check
-            if (track.isVideoTrack() && track.videoType === "desktop")
-                this.statistics.sendScreenSharingEvent(false);
-
-            this.eventEmitter.emit(JitsiConferenceEvents.TRACK_REMOVED, track);
+            this.onTrackRemoved(track);
             resolve();
-        }.bind(this), {
+        }.bind(this), function (error) {
+            reject(error);
+        }, {
             mtype: track.getType(),
             type: "remove",
             ssrc: track.ssrc});
@@ -495,23 +589,24 @@ JitsiConference.prototype.unlock = function () {
 };
 
 /**
- * Elects the participant with the given id to be the selected participant or the speaker.
- * @param id the identifier of the participant
+ * Elects the participant with the given id to be the selected participant in
+ * order to receive higher video quality (if simulcast is enabled).
+ * @param participantId the identifier of the participant
+ * @throws NetworkError or InvalidStateError or Error if the operation fails.
  */
 JitsiConference.prototype.selectParticipant = function(participantId) {
-    if (this.rtc) {
-        this.rtc.selectedEndpoint(participantId);
-    }
+    this.rtc.selectEndpoint(participantId);
 };
 
 /**
- *
- * @param id the identifier of the participant
+ * Elects the participant with the given id to be the pinned participant in
+ * order to always receive video for this participant (even when last n is
+ * enabled).
+ * @param participantId the identifier of the participant
+ * @throws NetworkError or InvalidStateError or Error if the operation fails.
  */
 JitsiConference.prototype.pinParticipant = function(participantId) {
-    if (this.rtc) {
-        this.rtc.pinEndpoint(participantId);
-    }
+    this.rtc.pinEndpoint(participantId);
 };
 
 /**
@@ -602,7 +697,11 @@ JitsiConference.prototype.onMemberLeft = function (jid) {
     var participant = this.participants[id];
     delete this.participants[id];
 
-    this.rtc.removeRemoteTracks(id);
+    var removedTracks = this.rtc.removeRemoteTracks(id);
+
+    removedTracks.forEach(function (track) {
+        this.eventEmitter.emit(JitsiConferenceEvents.TRACK_REMOVED, track);
+    }.bind(this));
 
     this.eventEmitter.emit(JitsiConferenceEvents.USER_LEFT, id, participant);
 };
@@ -631,14 +730,26 @@ JitsiConference.prototype.onDisplayNameChanged = function (jid, displayName) {
     this.eventEmitter.emit(JitsiConferenceEvents.DISPLAY_NAME_CHANGED, id, displayName);
 };
 
+/**
+ * Notifies this JitsiConference that a JitsiRemoteTrack was added (into the
+ * ChatRoom of this JitsiConference).
+ *
+ * @param {JitsiRemoteTrack} track the JitsiRemoteTrack which was added to this
+ * JitsiConference
+ */
 JitsiConference.prototype.onTrackAdded = function (track) {
     var id = track.getParticipantId();
     var participant = this.getParticipantById(id);
     if (!participant) {
         return;
     }
-    // add track to JitsiParticipant
+
+    // Add track to JitsiParticipant.
     participant._tracks.push(track);
+
+    if(this.transcriber){
+        this.transcriber.addTrack(track);
+    }
 
     var emitter = this.eventEmitter;
     track.addEventListener(
@@ -650,12 +761,100 @@ JitsiConference.prototype.onTrackAdded = function (track) {
     track.addEventListener(
         JitsiTrackEvents.TRACK_AUDIO_LEVEL_CHANGED,
         function (audioLevel) {
-            emitter.emit(JitsiConferenceEvents.TRACK_AUDIO_LEVEL_CHANGED, id, audioLevel);
+            emitter.emit(
+                JitsiConferenceEvents.TRACK_AUDIO_LEVEL_CHANGED,
+                id,
+                audioLevel);
         }
     );
 
-    this.eventEmitter.emit(JitsiConferenceEvents.TRACK_ADDED, track);
+    emitter.emit(JitsiConferenceEvents.TRACK_ADDED, track);
 };
+
+/**
+ * Handles incoming call event.
+ */
+JitsiConference.prototype.onIncomingCall =
+function (jingleSession, jingleOffer, now) {
+    if (!this.room.isFocus(jingleSession.peerjid)) {
+        // Error cause this should never happen unless something is wrong!
+        var errmsg = "Rejecting session-initiate from non-focus user: "
+                + jingleSession.peerjid;
+        GlobalOnErrorHandler.callErrorHandler(new Error(errmsg));
+        logger.error(errmsg);
+        return;
+    }
+
+    // Accept incoming call
+    this.room.setJingleSession(jingleSession);
+    this.room.connectionTimes["session.initiate"] = now;
+    // add info whether call is cross-region
+    var crossRegion = null;
+    if (window.jitsiRegionInfo)
+        crossRegion = window.jitsiRegionInfo["CrossRegion"];
+    Statistics.analytics.sendEvent("session.initiate",
+        (now - this.room.connectionTimes["muc.joined"]),
+        crossRegion);
+    try{
+        jingleSession.initialize(false /* initiator */,this.room);
+    } catch (error) {
+        GlobalOnErrorHandler.callErrorHandler(error);
+    };
+
+    this.rtc.onIncommingCall(jingleSession);
+    // Add local Tracks to the ChatRoom
+    this.rtc.localTracks.forEach(function(localTrack) {
+        var ssrcInfo = null;
+        if(localTrack.isVideoTrack() && localTrack.isMuted()) {
+            /**
+             * Handles issues when the stream is added before the peerconnection
+             * is created. The peerconnection is created when second participant
+             * enters the call. In that use case the track doesn't have
+             * information about it's ssrcs and no jingle packets are sent. That
+             * can cause inconsistent behavior later.
+             *
+             * For example:
+             * If we mute the stream and than second participant enter it's
+             * remote SDP won't include that track. On unmute we are not sending
+             * any jingle packets which will brake the unmute.
+             *
+             * In order to solve issues like the above one here we have to
+             * generate the ssrc information for the track .
+             */
+            localTrack._setSSRC(
+                this.room.generateNewStreamSSRCInfo());
+            ssrcInfo = {
+                mtype: localTrack.getType(),
+                type: "addMuted",
+                ssrc: localTrack.ssrc,
+                msid: localTrack.initialMSID
+            };
+        }
+        try {
+            this.room.addStream(
+                localTrack.getOriginalStream(), function () {}, function () {},
+                ssrcInfo, true);
+        } catch(e) {
+            GlobalOnErrorHandler.callErrorHandler(e);
+            logger.error(e);
+        }
+    }.bind(this));
+
+    jingleSession.acceptOffer(jingleOffer, null,
+        function (error) {
+            GlobalOnErrorHandler.callErrorHandler(error);
+            logger.error(
+                "Failed to accept incoming Jingle session", error);
+        }
+    );
+
+    // Start callstats as soon as peerconnection is initialized,
+    // do not wait for XMPPEvents.PEERCONNECTION_READY, as it may never
+    // happen in case if user doesn't have or denied permission to
+    // both camera and microphone.
+    this.statistics.startCallStats(jingleSession, this.settings);
+    this.statistics.startRemoteStats(jingleSession.peerconnection);
+}
 
 JitsiConference.prototype.updateDTMFSupport = function () {
     var somebodySupportsDTMF = false;
@@ -881,6 +1080,13 @@ JitsiConference.prototype.getConnectionTimes = function () {
 };
 
 /**
+ * Sets a property for the local participant.
+ */
+JitsiConference.prototype.setLocalParticipantProperty = function(name, value) {
+    this.sendCommand("jitsi_participant_" + name, {value: value});
+};
+
+/**
  * Sends the given feedback through CallStats if enabled.
  *
  * @param overallFeedback an integer between 1 and 5 indicating the
@@ -903,438 +1109,174 @@ JitsiConference.prototype.isCallstatsEnabled = function () {
     return this.statistics.isCallstatsEnabled();
 }
 
+
 /**
- * Setups the listeners needed for the conference.
- * @param conference the conference
+ * Handles track attached to container (Calls associateStreamWithVideoTag method
+ * from statistics module)
+ * @param track the track
+ * @param container the container
  */
-function setupListeners(conference) {
-    conference.xmpp.addListener(
-        XMPPEvents.CALL_INCOMING, function (jingleSession, jingleOffer, now) {
-
-        if (conference.room.isFocus(jingleSession.peerjid)) {
-            // Accept incoming call
-            conference.room.setJingleSession(jingleSession);
-            conference.room.connectionTimes["session.initiate"] = now;
-            jingleSession.initialize(false /* initiator */, conference.room);
-            conference.rtc.onIncommingCall(jingleSession);
-            jingleSession.acceptOffer(jingleOffer, null,
-                function (error) {
-                    console.error(
-                        "Failed to accept incoming Jingle session", error);
-                }
-            );
-            conference.statistics.startRemoteStats(
-                    jingleSession.peerconnection);
-        } else {
-            // Error cause this should never happen unless something is wrong !
-            logger.error(
-                "Rejecting session-initiate from non focus user: "
-                        + jingleSession.peerjid);
-        }
-    });
-
-    conference.room.addListener(XMPPEvents.REMOTE_TRACK_ADDED,
-        function (data) {
-            var track = conference.rtc.createRemoteTrack(data);
-            if (track) {
-                conference.onTrackAdded(track);
-            }
-        }
-    );
-    conference.room.addListener(XMPPEvents.REMOTE_TRACK_REMOVED,
-        function (streamId, trackId) {
-            conference.getParticipants().forEach(function(participant) {
-                var tracks = participant.getTracks();
-                for(var i = 0; i < tracks.length; i++) {
-                    if(tracks[i]
-                        && tracks[i].getStreamId() == streamId
-                        && tracks[i].getTrackId() == trackId) {
-                        var track = participant._tracks.splice(i, 1)[0];
-                        conference.eventEmitter.emit(
-                            JitsiConferenceEvents.TRACK_REMOVED, track);
-                        return;
-                    }
-                }
-            });
-        }
-    );
-    conference.rtc.addListener(RTCEvents.FAKE_VIDEO_TRACK_CREATED,
-        function (track) {
-            conference.onTrackAdded(track);
-        }
-    );
-
-    conference.room.addListener(XMPPEvents.AUDIO_MUTED_BY_FOCUS,
-        function (value) {
-            // set isMutedByFocus when setAudioMute Promise ends
-            conference.rtc.setAudioMute(value).then(
-                function() {
-                    conference.isMutedByFocus = true;
-                },
-                function() {
-                    logger.warn(
-                        "Error while audio muting due to focus request");
-                });
-        }
-    );
-
-    conference.room.addListener(XMPPEvents.SUBJECT_CHANGED, function (subject) {
-        conference.eventEmitter.emit(JitsiConferenceEvents.SUBJECT_CHANGED,
-            subject);
-    });
-
-    conference.room.addListener(XMPPEvents.MUC_JOINED, function () {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_JOINED);
-    });
-    conference.room.addListener(XMPPEvents.ROOM_JOIN_ERROR, function (pres) {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED,
-            JitsiConferenceErrors.CONNECTION_ERROR, pres);
-    });
-    conference.room.addListener(XMPPEvents.ROOM_CONNECT_ERROR, function (pres) {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED,
-            JitsiConferenceErrors.CONNECTION_ERROR, pres);
-    });
-    conference.room.addListener(XMPPEvents.ROOM_MAX_USERS_ERROR,
-    function (pres) {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED,
-            JitsiConferenceErrors.CONFERENCE_MAX_USERS, pres);
-    });
-    conference.room.addListener(XMPPEvents.PASSWORD_REQUIRED, function (pres) {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED, JitsiConferenceErrors.PASSWORD_REQUIRED, pres);
-    });
-    conference.room.addListener(XMPPEvents.AUTHENTICATION_REQUIRED, function () {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED, JitsiConferenceErrors.AUTHENTICATION_REQUIRED);
-    });
-    conference.room.addListener(XMPPEvents.BRIDGE_DOWN, function () {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED, JitsiConferenceErrors.VIDEOBRIDGE_NOT_AVAILABLE);
-    });
-    conference.room.addListener(XMPPEvents.RESERVATION_ERROR, function (code, msg) {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED, JitsiConferenceErrors.RESERVATION_ERROR, code, msg);
-    });
-    conference.room.addListener(XMPPEvents.GRACEFUL_SHUTDOWN, function () {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED, JitsiConferenceErrors.GRACEFUL_SHUTDOWN);
-    });
-    conference.room.addListener(XMPPEvents.JINGLE_FATAL_ERROR, function () {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED, JitsiConferenceErrors.JINGLE_FATAL_ERROR);
-    });
-    conference.room.addListener(XMPPEvents.MUC_DESTROYED, function (reason) {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED, JitsiConferenceErrors.CONFERENCE_DESTROYED, reason);
-    });
-    conference.room.addListener(XMPPEvents.CHAT_ERROR_RECEIVED, function (err, msg) {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_ERROR, JitsiConferenceErrors.CHAT_ERROR, err, msg);
-    });
-    conference.room.addListener(XMPPEvents.FOCUS_DISCONNECTED, function (focus, retrySec) {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED, JitsiConferenceErrors.FOCUS_DISCONNECTED, focus, retrySec);
-    });
-    conference.room.addListener(XMPPEvents.FOCUS_LEFT, function () {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED, JitsiConferenceErrors.FOCUS_LEFT);
-    });
-//    FIXME
-//    conference.room.addListener(XMPPEvents.MUC_JOINED, function () {
-//        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_LEFT);
-//    });
-
-    conference.room.addListener(XMPPEvents.KICKED, function () {
-        conference.eventEmitter.emit(JitsiConferenceEvents.KICKED);
-    });
-
-    conference.room.addListener(XMPPEvents.MUC_MEMBER_JOINED, conference.onMemberJoined.bind(conference));
-    conference.room.addListener(XMPPEvents.MUC_MEMBER_LEFT, conference.onMemberLeft.bind(conference));
-
-    conference.room.addListener(XMPPEvents.DISPLAY_NAME_CHANGED, conference.onDisplayNameChanged.bind(conference));
-
-    conference.room.addListener(XMPPEvents.LOCAL_ROLE_CHANGED, function (role) {
-        conference.eventEmitter.emit(JitsiConferenceEvents.USER_ROLE_CHANGED, conference.myUserId(), role);
-    });
-    conference.room.addListener(XMPPEvents.MUC_ROLE_CHANGED, conference.onUserRoleChanged.bind(conference));
-
-    conference.room.addListener(XMPPEvents.CONNECTION_INTERRUPTED, function () {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONNECTION_INTERRUPTED);
-    });
-
-    conference.room.addListener(XMPPEvents.RECORDER_STATE_CHANGED,
-        function (state) {
-            conference.eventEmitter.emit(
-                JitsiConferenceEvents.RECORDER_STATE_CHANGED, state);
-        });
-
-    conference.room.addListener(XMPPEvents.PHONE_NUMBER_CHANGED, function () {
-        conference.eventEmitter.emit(
-            JitsiConferenceEvents.PHONE_NUMBER_CHANGED);
-    });
-
-    conference.room.addListener(XMPPEvents.CONNECTION_RESTORED, function () {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONNECTION_RESTORED);
-    });
-    conference.room.addListener(XMPPEvents.CONFERENCE_SETUP_FAILED, function () {
-        conference.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED, JitsiConferenceErrors.SETUP_FAILED);
-    });
-
-    conference.room.addListener(AuthenticationEvents.IDENTITY_UPDATED, function (authEnabled, authIdentity) {
-        conference.authEnabled = authEnabled;
-        conference.authIdentity = authIdentity;
-        conference.eventEmitter.emit(JitsiConferenceEvents.AUTH_STATUS_CHANGED, authEnabled, authIdentity);
-    });
-
-    conference.room.addListener(XMPPEvents.MESSAGE_RECEIVED, function (jid, displayName, txt, myJid, ts) {
-        var id = Strophe.getResourceFromJid(jid);
-        conference.eventEmitter.emit(JitsiConferenceEvents.MESSAGE_RECEIVED, id, txt, ts);
-    });
-
-    conference.room.addListener(XMPPEvents.PRESENCE_STATUS, function (jid, status) {
-        var id = Strophe.getResourceFromJid(jid);
-        var participant = conference.getParticipantById(id);
-        if (!participant || participant._status === status) {
-            return;
-        }
-        participant._status = status;
-        conference.eventEmitter.emit(JitsiConferenceEvents.USER_STATUS_CHANGED, id, status);
-    });
-
-    conference.rtc.addListener(RTCEvents.DOMINANTSPEAKER_CHANGED, function (id) {
-        if(conference.lastDominantSpeaker !== id && conference.room) {
-            conference.lastDominantSpeaker = id;
-            conference.eventEmitter.emit(JitsiConferenceEvents.DOMINANT_SPEAKER_CHANGED, id);
-        }
-        if (conference.statistics && conference.myUserId() === id) {
-            // We are the new dominant speaker.
-            conference.statistics.sendDominantSpeakerEvent();
-        }
-    });
-
-    conference.rtc.addListener(RTCEvents.DATA_CHANNEL_OPEN, function () {
-        var now = window.performance.now();
-        logger.log("(TIME) data channel opened ", now);
-        conference.room.connectionTimes["data.channel.opened"] = now;
-    });
-
-    conference.rtc.addListener(RTCEvents.LASTN_CHANGED, function (oldValue, newValue) {
-        conference.eventEmitter.emit(JitsiConferenceEvents.IN_LAST_N_CHANGED, oldValue, newValue);
-    });
-
-    conference.rtc.addListener(RTCEvents.LASTN_ENDPOINT_CHANGED,
-        function (lastNEndpoints, endpointsEnteringLastN) {
-            conference.eventEmitter.emit(JitsiConferenceEvents.LAST_N_ENDPOINTS_CHANGED,
-                lastNEndpoints, endpointsEnteringLastN);
-        });
-
-    conference.xmpp.addListener(XMPPEvents.START_MUTED_FROM_FOCUS,
-        function (audioMuted, videoMuted) {
-            conference.startAudioMuted = audioMuted;
-            conference.startVideoMuted = videoMuted;
-
-            // mute existing local tracks because this is initial mute from
-            // Jicofo
-            conference.getLocalTracks().forEach(function (track) {
-                if (conference.startAudioMuted && track.isAudioTrack()) {
-                    track.mute();
-                }
-                if (conference.startVideoMuted && track.isVideoTrack()) {
-                    track.mute();
-                }
-            });
-
-            conference.eventEmitter.emit(JitsiConferenceEvents.STARTED_MUTED);
-        });
-
-    conference.room.addPresenceListener("startmuted", function (data, from) {
-        var isModerator = false;
-        if (conference.myUserId() === from && conference.isModerator()) {
-            isModerator = true;
-        } else {
-            var participant = conference.getParticipantById(from);
-            if (participant && participant.isModerator()) {
-                isModerator = true;
-            }
-        }
-
-        if (!isModerator) {
-            return;
-        }
-
-        var startAudioMuted = data.attributes.audio === 'true';
-        var startVideoMuted = data.attributes.video === 'true';
-
-        var updated = false;
-
-        if (startAudioMuted !== conference.startMutedPolicy.audio) {
-            conference.startMutedPolicy.audio = startAudioMuted;
-            updated = true;
-        }
-
-        if (startVideoMuted !== conference.startMutedPolicy.video) {
-            conference.startMutedPolicy.video = startVideoMuted;
-            updated = true;
-        }
-
-        if (updated) {
-            conference.eventEmitter.emit(
-                JitsiConferenceEvents.START_MUTED_POLICY_CHANGED,
-                conference.startMutedPolicy
-            );
-        }
-    });
-
-    conference.rtc.addListener(RTCEvents.AVAILABLE_DEVICES_CHANGED, function (devices) {
-        conference.room.updateDeviceAvailability(devices);
-    });
-    conference.room.addPresenceListener("devices", function (data, from) {
-        var isAudioAvailable = false;
-        var isVideoAvailable = false;
-        data.children.forEach(function (config) {
-            if (config.tagName === 'audio') {
-                isAudioAvailable = config.value === 'true';
-            }
-            if (config.tagName === 'video') {
-                isVideoAvailable = config.value === 'true';
-            }
-        });
-
-        var availableDevices;
-        if (conference.myUserId() === from) {
-            availableDevices = conference.availableDevices;
-        } else {
-            var participant = conference.getParticipantById(from);
-            if (!participant) {
-                return;
-            }
-
-            availableDevices = participant._availableDevices;
-        }
-
-        var updated = false;
-
-        if (availableDevices.audio !== isAudioAvailable) {
-            updated = true;
-            availableDevices.audio = isAudioAvailable;
-        }
-
-        if (availableDevices.video !== isVideoAvailable) {
-            updated = true;
-            availableDevices.video = isVideoAvailable;
-        }
-
-        if (updated) {
-            conference.eventEmitter.emit(
-                JitsiConferenceEvents.AVAILABLE_DEVICES_CHANGED,
-                from, availableDevices);
-        }
-    });
-
-    if(conference.statistics) {
-        //FIXME: Maybe remove event should not be associated with the conference.
-        conference.statistics.addAudioLevelListener(function (ssrc, level) {
-            var userId = null;
-
-            var resource = conference.rtc.getResourceBySSRC(ssrc);
-            if (!resource)
-                return;
-
-            conference.rtc.setAudioLevel(resource, level);
-        });
-        conference.statistics.addConnectionStatsListener(function (stats) {
-            var ssrc2resolution = stats.resolution;
-
-            var id2resolution = {};
-
-            // preprocess resolutions: group by user id, skip incorrect
-            // resolutions etc.
-            Object.keys(ssrc2resolution).forEach(function (ssrc) {
-                var resolution = ssrc2resolution[ssrc];
-
-                if (!resolution.width || !resolution.height ||
-                    resolution.width == -1 || resolution.height == -1) {
-                    return;
-                }
-
-                var id = conference.rtc.getResourceBySSRC(ssrc);
-                if (!id) {
-                    return;
-                }
-
-                // ssrc to resolution map for user id
-                var idResolutions = id2resolution[id] || {};
-                idResolutions[ssrc] = resolution;
-
-                id2resolution[id] = idResolutions;
-            });
-
-            stats.resolution = id2resolution;
-
-            conference.eventEmitter.emit(
-                JitsiConferenceEvents.CONNECTION_STATS, stats);
-        });
-        conference.room.addListener(XMPPEvents.DISPOSE_CONFERENCE,
-            function () {
-                conference.statistics.dispose();
-            });
-
-        conference.room.addListener(XMPPEvents.PEERCONNECTION_READY,
-            function (session) {
-                conference.statistics.startCallStats(
-                    session, conference.settings);
-            });
-
-        conference.room.addListener(XMPPEvents.CONNECTION_ICE_FAILED,
-            function (pc) {
-                conference.statistics.sendIceConnectionFailedEvent(pc);
-                conference.room.eventEmitter.emit(
-                    XMPPEvents.CONFERENCE_SETUP_FAILED);
-            });
-
-        conference.rtc.addListener(RTCEvents.TRACK_ATTACHED,
-            function(track, container) {
-                var ssrc = track.getSSRC();
-                if (!container.id || !ssrc) {
-                    return;
-                }
-                conference.statistics.associateStreamWithVideoTag(
-                    ssrc, track.isLocal(), track.getUsageLabel(), container.id);
-
-            });
-
-        conference.on(JitsiConferenceEvents.TRACK_MUTE_CHANGED,
-            function (track) {
-                if(!track.isLocal())
-                    return;
-                var type = (track.getType() === "audio")? "audio" : "video";
-                conference.statistics.sendMuteEvent(track.isMuted(), type);
-            });
-
-        conference.room.addListener(XMPPEvents.CREATE_OFFER_FAILED, function (e, pc) {
-            conference.statistics.sendCreateOfferFailed(e, pc);
-        });
-
-        conference.room.addListener(XMPPEvents.CREATE_ANSWER_FAILED, function (e, pc) {
-            conference.statistics.sendCreateAnswerFailed(e, pc);
-        });
-
-        conference.room.addListener(XMPPEvents.SET_LOCAL_DESCRIPTION_FAILED,
-            function (e, pc) {
-                conference.statistics.sendSetLocalDescFailed(e, pc);
-            }
-        );
-
-        conference.room.addListener(XMPPEvents.SET_REMOTE_DESCRIPTION_FAILED,
-            function (e, pc) {
-                conference.statistics.sendSetRemoteDescFailed(e, pc);
-            }
-        );
-
-        conference.room.addListener(XMPPEvents.ADD_ICE_CANDIDATE_FAILED,
-            function (e, pc) {
-                conference.statistics.sendAddIceCandidateFailed(e, pc);
-            }
-        );
+JitsiConference.prototype._onTrackAttach = function(track, container) {
+    var ssrc = track.getSSRC();
+    if (!container.id || !ssrc) {
+        return;
     }
+    this.statistics.associateStreamWithVideoTag(
+        ssrc, track.isLocal(), track.getUsageLabel(), container.id);
 }
 
+/**
+ * Reports detected audio problem with the media stream related to the passed
+ * ssrc.
+ * @param ssrc {string} the ssrc
+ * NOTE: all logger.log calls are there only to be able to see the info in
+ * torture
+ */
+JitsiConference.prototype._reportAudioProblem = function (ssrc) {
+    if(this.reportedAudioSSRCs[ssrc])
+        return;
+    var track = this.rtc.getRemoteTrackBySSRC(ssrc);
+    if(!track || !track.isAudioTrack())
+        return;
+
+    var id = track.getParticipantId();
+    var displayName = null;
+    if(id) {
+        var participant = this.getParticipantById(id);
+        if(participant) {
+            displayName = participant.getDisplayName();
+        }
+    }
+    this.reportedAudioSSRCs[ssrc] = true;
+    var errorContent = {
+        errMsg: "The audio is received but not played",
+        ssrc: ssrc,
+        jid: id,
+        displayName: displayName
+    };
+
+    logger.log("=================The audio is received but not played" +
+        "======================");
+    logger.log("ssrc: ", ssrc);
+    logger.log("jid: ", id);
+    logger.log("displayName: ", displayName);
+
+    var mstream = track.stream, mtrack = track.track;
+    if(mstream) {
+        logger.log("MediaStream:");
+        errorContent.MediaStream = {
+            active: mstream.active,
+            id: mstream.id
+        };
+        logger.log("active: ", mstream.active);
+        logger.log("id: ", mstream.id);
+    }
+
+    if(mtrack) {
+        logger.log("MediaStreamTrack:");
+        errorContent.MediaStreamTrack = {
+            enabled: mtrack.enabled,
+            id: mtrack.id,
+            label: mtrack.label,
+            muted: mtrack.muted
+        }
+        logger.log("enabled: ", mtrack.enabled);
+        logger.log("id: ", mtrack.id);
+        logger.log("label: ", mtrack.label);
+        logger.log("muted: ", mtrack.muted);
+    }
+
+    if(track.containers) {
+        errorContent.containers = [];
+        logger.log("Containers:");
+        track.containers.forEach(function (container) {
+            logger.log("Container:");
+            errorContent.containers.push({
+                autoplay: container.autoplay,
+                muted: container.muted,
+                src: container.src,
+                volume: container.volume,
+                id: container.id,
+                ended: container.ended,
+                paused: container.paused,
+                readyState: container.readyState
+            });
+            logger.log("autoplay: ", container.autoplay);
+            logger.log("muted: ", container.muted);
+            logger.log("src: ", container.src);
+            logger.log("volume: ", container.volume);
+            logger.log("id: ", container.id);
+            logger.log("ended: ", container.ended);
+            logger.log("paused: ", container.paused);
+            logger.log("readyState: ", container.readyState);
+        });
+    }
+
+    // Prints JSON.stringify(errorContent) to be able to see all properties of
+    // errorContent from torture
+    logger.error("Audio problem detected. The audio is received but not played",
+        errorContent);
+
+    delete errorContent.displayName;
+
+    this.statistics.sendDetectedAudioProblem(
+        new Error(JSON.stringify(errorContent)));
+};
+
+/**
+ * Logs an "application log" message.
+ * @param message {string} The message to log. Note that while this can be a
+ * generic string, the convention used by lib-jitsi-meet and jitsi-meet is to
+ * log valid JSON strings, with an "id" field used for distinguishing between
+ * message types. E.g.: {id: "recorder_status", status: "off"}
+ */
+JitsiConference.prototype.sendApplicationLog = function(message) {
+    Statistics.sendLog(message);
+};
+
+/**
+ * Checks if the user identified by given <tt>mucJid</tt> is the conference
+ * focus.
+ * @param mucJid the full MUC address of the user to be checked.
+ * @returns {boolean} <tt>true</tt> if MUC user is the conference focus.
+ */
+JitsiConference.prototype._isFocus = function (mucJid) {
+    return this.room.isFocus(mucJid);
+};
+
+/**
+ * Fires CONFERENCE_FAILED event with INCOMPATIBLE_SERVER_VERSIONS parameter
+ */
+JitsiConference.prototype._fireIncompatibleVersionsEvent = function () {
+    this.eventEmitter.emit(JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.INCOMPATIBLE_SERVER_VERSIONS);
+};
+
+/**
+ * Sends message via the datachannels.
+ * @param to {string} the id of the endpoint that should receive the message.
+ * If "" the message will be sent to all participants.
+ * @param payload {object} the payload of the message.
+ * @throws NetworkError or InvalidStateError or Error if the operation fails.
+ */
+JitsiConference.prototype.sendEndpointMessage = function (to, payload) {
+    this.rtc.sendDataChannelMessage(to, payload);
+}
+
+/**
+ * Sends broadcast message via the datachannels.
+ * @param payload {object} the payload of the message.
+ * @throws NetworkError or InvalidStateError or Error if the operation fails.
+ */
+JitsiConference.prototype.broadcastEndpointMessage = function (payload) {
+    this.sendEndpointMessage("", payload);
+}
 
 module.exports = JitsiConference;
 
 }).call(this,"/JitsiConference.js")
 
-},{"./JitsiConferenceErrors":2,"./JitsiConferenceEvents":3,"./JitsiParticipant":8,"./JitsiTrackErrors":10,"./JitsiTrackEvents":11,"./modules/DTMF/JitsiDTMFManager":12,"./modules/RTC/RTC":17,"./modules/settings/Settings":23,"./modules/statistics/statistics":27,"./modules/version/ComponentsVersions":31,"./service/RTC/RTCEvents":130,"./service/authentication/AuthenticationEvents":133,"./service/xmpp/XMPPEvents":136,"events":54,"jitsi-meet-logger":82}],2:[function(require,module,exports){
+},{"./JitsiConferenceErrors":2,"./JitsiConferenceEventManager":3,"./JitsiConferenceEvents":4,"./JitsiParticipant":11,"./JitsiTrackError":13,"./JitsiTrackErrors":14,"./JitsiTrackEvents":15,"./modules/DTMF/JitsiDTMFManager":16,"./modules/RTC/RTC":21,"./modules/settings/Settings":27,"./modules/statistics/statistics":32,"./modules/transcription/transcriber":35,"./modules/util/GlobalOnErrorHandler":41,"./modules/version/ComponentsVersions":45,"./service/RTC/VideoType":150,"./service/xmpp/XMPPEvents":154,"events":63,"jitsi-meet-logger":68}],2:[function(require,module,exports){
 /**
  * Enumeration with the errors for the conference.
  * @type {{string: string}}
@@ -1396,7 +1338,12 @@ var JitsiConferenceErrors = {
     /**
      * Indicates that max users limit has been reached.
      */
-    CONFERENCE_MAX_USERS: "conference.max_users"
+    CONFERENCE_MAX_USERS: "conference.max_users",
+    /**
+     * Indicates that the versions of the server side components are
+     * incompatible with the client side.
+     */
+    INCOMPATIBLE_SERVER_VERSIONS: "conference.incompatible_server_versions"
     /**
      * Many more errors TBD here.
      */
@@ -1405,17 +1352,604 @@ var JitsiConferenceErrors = {
 module.exports = JitsiConferenceErrors;
 
 },{}],3:[function(require,module,exports){
+(function (__filename){
+/* global Strophe */
+var logger = require("jitsi-meet-logger").getLogger(__filename);
+var EventEmitterForwarder = require("./modules/util/EventEmitterForwarder");
+var XMPPEvents = require("./service/xmpp/XMPPEvents");
+var RTCEvents = require("./service/RTC/RTCEvents");
+var JitsiConferenceEvents = require("./JitsiConferenceEvents");
+var JitsiConferenceErrors = require("./JitsiConferenceErrors");
+var AuthenticationEvents =
+    require("./service/authentication/AuthenticationEvents");
+var Statistics = require("./modules/statistics/statistics");
+var MediaType = require("./service/RTC/MediaType");
+
+/**
+ * Setups all event listeners related to conference
+ * @param conference {JitsiConference} the conference
+ */
+function JitsiConferenceEventManager(conference) {
+    this.conference = conference;
+
+    //Listeners related to the conference only
+    conference.on(JitsiConferenceEvents.TRACK_MUTE_CHANGED,
+        function (track) {
+            if(!track.isLocal() || !conference.statistics)
+                return;
+            conference.statistics.sendMuteEvent(track.isMuted(),
+                track.getType());
+        });
+}
+
+/**
+ * Setups event listeners related to conference.chatRoom
+ */
+JitsiConferenceEventManager.prototype.setupChatRoomListeners = function () {
+    var conference = this.conference;
+    var chatRoom = conference.room;
+    this.chatRoomForwarder = new EventEmitterForwarder(chatRoom,
+        this.conference.eventEmitter);
+
+    chatRoom.addListener(XMPPEvents.ICE_RESTARTING, function () {
+        // All data channels have to be closed, before ICE restart
+        // otherwise Chrome will not trigger "opened" event for the channel
+        // established with the new bridge
+        conference.rtc.closeAllDataChannels();
+    });
+
+    chatRoom.addListener(XMPPEvents.REMOTE_TRACK_ADDED,
+        function (data) {
+            var track = conference.rtc.createRemoteTrack(data);
+            if (track) {
+                conference.onTrackAdded(track);
+            }
+        }
+    );
+    chatRoom.addListener(XMPPEvents.REMOTE_TRACK_REMOVED,
+        function (streamId, trackId) {
+            conference.getParticipants().forEach(function(participant) {
+                var tracks = participant.getTracks();
+                for(var i = 0; i < tracks.length; i++) {
+                    if(tracks[i]
+                        && tracks[i].getStreamId() == streamId
+                        && tracks[i].getTrackId() == trackId) {
+                        var track = participant._tracks.splice(i, 1)[0];
+
+                        conference.rtc.removeRemoteTrack(
+                            participant.getId(), track.getType());
+
+                        conference.eventEmitter.emit(
+                            JitsiConferenceEvents.TRACK_REMOVED, track);
+
+                        if(conference.transcriber){
+                            conference.transcriber.removeTrack(track);
+                        }
+
+                        return;
+                    }
+                }
+            });
+        }
+    );
+
+    chatRoom.addListener(XMPPEvents.AUDIO_MUTED_BY_FOCUS,
+        function (value) {
+            // set isMutedByFocus when setAudioMute Promise ends
+            conference.rtc.setAudioMute(value).then(
+                function() {
+                    conference.isMutedByFocus = true;
+                },
+                function() {
+                    logger.warn(
+                        "Error while audio muting due to focus request");
+                });
+        }
+    );
+
+    this.chatRoomForwarder.forward(XMPPEvents.SUBJECT_CHANGED,
+        JitsiConferenceEvents.SUBJECT_CHANGED);
+
+    this.chatRoomForwarder.forward(XMPPEvents.MUC_JOINED,
+        JitsiConferenceEvents.CONFERENCE_JOINED);
+    // send some analytics events
+    chatRoom.addListener(XMPPEvents.MUC_JOINED,
+        function ()
+        {
+            for (var ckey in chatRoom.connectionTimes){
+                var cvalue = chatRoom.connectionTimes[ckey];
+                Statistics.analytics.sendEvent('conference.' + ckey, cvalue);
+            }
+            for (var xkey in chatRoom.xmpp.connectionTimes){
+                var xvalue = chatRoom.xmpp.connectionTimes[xkey];
+                Statistics.analytics.sendEvent('xmpp.' + xkey, xvalue);
+            }
+        });
+
+    this.chatRoomForwarder.forward(XMPPEvents.ROOM_JOIN_ERROR,
+        JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.CONNECTION_ERROR);
+
+    this.chatRoomForwarder.forward(XMPPEvents.ROOM_CONNECT_ERROR,
+        JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.CONNECTION_ERROR);
+
+    this.chatRoomForwarder.forward(XMPPEvents.ROOM_MAX_USERS_ERROR,
+        JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.CONFERENCE_MAX_USERS);
+
+    this.chatRoomForwarder.forward(XMPPEvents.PASSWORD_REQUIRED,
+        JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.PASSWORD_REQUIRED);
+
+    this.chatRoomForwarder.forward(XMPPEvents.AUTHENTICATION_REQUIRED,
+        JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.AUTHENTICATION_REQUIRED);
+
+    this.chatRoomForwarder.forward(XMPPEvents.BRIDGE_DOWN,
+        JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.VIDEOBRIDGE_NOT_AVAILABLE);
+    chatRoom.addListener(XMPPEvents.BRIDGE_DOWN,
+        function (){
+            Statistics.analytics.sendEvent('conference.bridgeDown');
+        });
+
+    this.chatRoomForwarder.forward(XMPPEvents.RESERVATION_ERROR,
+        JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.RESERVATION_ERROR);
+
+    this.chatRoomForwarder.forward(XMPPEvents.GRACEFUL_SHUTDOWN,
+        JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.GRACEFUL_SHUTDOWN);
+
+    chatRoom.addListener(XMPPEvents.JINGLE_FATAL_ERROR,
+        function (session, error) {
+            conference.eventEmitter.emit(
+                JitsiConferenceEvents.CONFERENCE_FAILED,
+                JitsiConferenceErrors.JINGLE_FATAL_ERROR, error);
+        });
+
+    chatRoom.addListener(XMPPEvents.CONNECTION_ICE_FAILED,
+        function (pc) {
+            chatRoom.eventEmitter.emit(
+                XMPPEvents.CONFERENCE_SETUP_FAILED,
+                new Error("ICE fail"));
+        });
+
+    this.chatRoomForwarder.forward(XMPPEvents.MUC_DESTROYED,
+        JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.CONFERENCE_DESTROYED);
+
+    this.chatRoomForwarder.forward(XMPPEvents.CHAT_ERROR_RECEIVED,
+        JitsiConferenceEvents.CONFERENCE_ERROR,
+        JitsiConferenceErrors.CHAT_ERROR);
+
+    this.chatRoomForwarder.forward(XMPPEvents.FOCUS_DISCONNECTED,
+        JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.FOCUS_DISCONNECTED);
+
+    chatRoom.addListener(XMPPEvents.FOCUS_LEFT,
+        function () {
+            Statistics.analytics.sendEvent('conference.focusLeft');
+            conference.eventEmitter.emit(
+                JitsiConferenceEvents.CONFERENCE_FAILED,
+                JitsiConferenceErrors.FOCUS_LEFT);
+        });
+
+    var eventLogHandler = function (reason) {
+        Statistics.sendEventToAll("conference.error." + reason);
+    };
+    chatRoom.addListener(XMPPEvents.SESSION_ACCEPT_TIMEOUT,
+        eventLogHandler.bind(null, "sessionAcceptTimeout"));
+
+    this.chatRoomForwarder.forward(XMPPEvents.CONNECTION_INTERRUPTED,
+        JitsiConferenceEvents.CONNECTION_INTERRUPTED);
+    chatRoom.addListener(XMPPEvents.CONNECTION_INTERRUPTED,
+        function () {
+            Statistics.analytics.sendEvent('connection.interrupted');
+        });
+
+    this.chatRoomForwarder.forward(XMPPEvents.RECORDER_STATE_CHANGED,
+        JitsiConferenceEvents.RECORDER_STATE_CHANGED);
+
+    this.chatRoomForwarder.forward(XMPPEvents.PHONE_NUMBER_CHANGED,
+        JitsiConferenceEvents.PHONE_NUMBER_CHANGED);
+
+    this.chatRoomForwarder.forward(XMPPEvents.CONNECTION_RESTORED,
+        JitsiConferenceEvents.CONNECTION_RESTORED);
+
+    this.chatRoomForwarder.forward(XMPPEvents.CONFERENCE_SETUP_FAILED,
+        JitsiConferenceEvents.CONFERENCE_FAILED,
+        JitsiConferenceErrors.SETUP_FAILED);
+
+    chatRoom.setParticipantPropertyListener(function (node, from) {
+        var participant = conference.getParticipantById(from);
+        if (!participant) {
+            return;
+        }
+
+        participant.setProperty(
+            node.tagName.substring("jitsi_participant_".length),
+            node.value);
+    });
+
+    this.chatRoomForwarder.forward(XMPPEvents.KICKED,
+        JitsiConferenceEvents.KICKED);
+    chatRoom.addListener(XMPPEvents.KICKED,
+        function () {
+            conference.room = null;
+            conference.leave.bind(conference);
+        });
+
+    this.chatRoomForwarder.forward(XMPPEvents.MUC_LOCK_CHANGED,
+        JitsiConferenceEvents.LOCK_STATE_CHANGED);
+
+    chatRoom.addListener(XMPPEvents.MUC_MEMBER_JOINED,
+        conference.onMemberJoined.bind(conference));
+    chatRoom.addListener(XMPPEvents.MUC_MEMBER_LEFT,
+        conference.onMemberLeft.bind(conference));
+
+    chatRoom.addListener(XMPPEvents.DISPLAY_NAME_CHANGED,
+        conference.onDisplayNameChanged.bind(conference));
+
+    chatRoom.addListener(XMPPEvents.LOCAL_ROLE_CHANGED, function (role) {
+        conference.eventEmitter.emit(JitsiConferenceEvents.USER_ROLE_CHANGED,
+            conference.myUserId(), role);
+
+        // log all events for the recorder operated by the moderator
+        if (conference.statistics && conference.isModerator()) {
+            conference.on(JitsiConferenceEvents.RECORDER_STATE_CHANGED,
+                function (status, error) {
+                    var logObject = {
+                        id: "recorder_status",
+                        status: status
+                    };
+                    if (error) {
+                        logObject.error = error;
+                    }
+                    Statistics.sendLog(JSON.stringify(logObject));
+                });
+        }
+    });
+
+    chatRoom.addListener(XMPPEvents.MUC_ROLE_CHANGED,
+        conference.onUserRoleChanged.bind(conference));
+
+    chatRoom.addListener(AuthenticationEvents.IDENTITY_UPDATED,
+        function (authEnabled, authIdentity) {
+            conference.authEnabled = authEnabled;
+            conference.authIdentity = authIdentity;
+            conference.eventEmitter.emit(
+                JitsiConferenceEvents.AUTH_STATUS_CHANGED, authEnabled,
+                authIdentity);
+        });
+
+    chatRoom.addListener(XMPPEvents.MESSAGE_RECEIVED,
+        function (jid, displayName, txt, myJid, ts) {
+            var id = Strophe.getResourceFromJid(jid);
+            conference.eventEmitter.emit(JitsiConferenceEvents.MESSAGE_RECEIVED,
+                id, txt, ts);
+        });
+
+    chatRoom.addListener(XMPPEvents.PRESENCE_STATUS,
+        function (jid, status) {
+            var id = Strophe.getResourceFromJid(jid);
+            var participant = conference.getParticipantById(id);
+            if (!participant || participant._status === status) {
+                return;
+            }
+            participant._status = status;
+            conference.eventEmitter.emit(
+                JitsiConferenceEvents.USER_STATUS_CHANGED, id, status);
+        });
+
+    conference.room.addListener(XMPPEvents.LOCAL_UFRAG_CHANGED,
+        function (ufrag) {
+            Statistics.sendLog(
+                JSON.stringify({id: "local_ufrag", value: ufrag}));
+        });
+    conference.room.addListener(XMPPEvents.REMOTE_UFRAG_CHANGED,
+        function (ufrag) {
+            Statistics.sendLog(
+                JSON.stringify({id: "remote_ufrag", value: ufrag}));
+        });
+
+    chatRoom.addPresenceListener("startmuted", function (data, from) {
+        var isModerator = false;
+        if (conference.myUserId() === from && conference.isModerator()) {
+            isModerator = true;
+        } else {
+            var participant = conference.getParticipantById(from);
+            if (participant && participant.isModerator()) {
+                isModerator = true;
+            }
+        }
+
+        if (!isModerator) {
+            return;
+        }
+
+        var startAudioMuted = data.attributes.audio === 'true';
+        var startVideoMuted = data.attributes.video === 'true';
+
+        var updated = false;
+
+        if (startAudioMuted !== conference.startMutedPolicy.audio) {
+            conference.startMutedPolicy.audio = startAudioMuted;
+            updated = true;
+        }
+
+        if (startVideoMuted !== conference.startMutedPolicy.video) {
+            conference.startMutedPolicy.video = startVideoMuted;
+            updated = true;
+        }
+
+        if (updated) {
+            conference.eventEmitter.emit(
+                JitsiConferenceEvents.START_MUTED_POLICY_CHANGED,
+                conference.startMutedPolicy
+            );
+        }
+    });
+
+    chatRoom.addPresenceListener("videomuted", function (values, from) {
+        conference.rtc.handleRemoteTrackMute(MediaType.VIDEO,
+            values.value == "true", from);
+    });
+
+    chatRoom.addPresenceListener("audiomuted", function (values, from) {
+        conference.rtc.handleRemoteTrackMute(MediaType.AUDIO,
+            values.value == "true", from);
+    });
+
+    chatRoom.addPresenceListener("videoType", function(data, from) {
+        conference.rtc.handleRemoteTrackVideoTypeChanged(data.value, from);
+    });
+
+    chatRoom.addPresenceListener("devices", function (data, from) {
+        var isAudioAvailable = false;
+        var isVideoAvailable = false;
+        data.children.forEach(function (config) {
+            if (config.tagName === 'audio') {
+                isAudioAvailable = config.value === 'true';
+            }
+            if (config.tagName === 'video') {
+                isVideoAvailable = config.value === 'true';
+            }
+        });
+
+        var availableDevices;
+        if (conference.myUserId() === from) {
+            availableDevices = conference.availableDevices;
+        } else {
+            var participant = conference.getParticipantById(from);
+            if (!participant) {
+                return;
+            }
+
+            availableDevices = participant._availableDevices;
+        }
+
+        var updated = false;
+
+        if (availableDevices.audio !== isAudioAvailable) {
+            updated = true;
+            availableDevices.audio = isAudioAvailable;
+        }
+
+        if (availableDevices.video !== isVideoAvailable) {
+            updated = true;
+            availableDevices.video = isVideoAvailable;
+        }
+
+        if (updated) {
+            conference.eventEmitter.emit(
+                JitsiConferenceEvents.AVAILABLE_DEVICES_CHANGED,
+                from, availableDevices);
+        }
+    });
+
+    if(conference.statistics) {
+        chatRoom.addListener(XMPPEvents.DISPOSE_CONFERENCE,
+            function () {
+                conference.statistics.dispose();
+            });
+
+        chatRoom.addListener(XMPPEvents.CONNECTION_ICE_FAILED,
+            function (pc) {
+                conference.statistics.sendIceConnectionFailedEvent(pc);
+            });
+
+        chatRoom.addListener(XMPPEvents.CREATE_OFFER_FAILED,
+            function (e, pc) {
+                conference.statistics.sendCreateOfferFailed(e, pc);
+            });
+
+        chatRoom.addListener(XMPPEvents.CREATE_ANSWER_FAILED,
+            function (e, pc) {
+                conference.statistics.sendCreateAnswerFailed(e, pc);
+            });
+
+        chatRoom.addListener(XMPPEvents.SET_LOCAL_DESCRIPTION_FAILED,
+            function (e, pc) {
+                conference.statistics.sendSetLocalDescFailed(e, pc);
+            });
+
+        chatRoom.addListener(XMPPEvents.SET_REMOTE_DESCRIPTION_FAILED,
+            function (e, pc) {
+                conference.statistics.sendSetRemoteDescFailed(e, pc);
+            });
+
+        chatRoom.addListener(XMPPEvents.ADD_ICE_CANDIDATE_FAILED,
+            function (e, pc) {
+                conference.statistics.sendAddIceCandidateFailed(e, pc);
+            });
+    }
+};
+
+/**
+ * Setups event listeners related to conference.rtc
+ */
+JitsiConferenceEventManager.prototype.setupRTCListeners = function () {
+    var conference = this.conference;
+
+    this.rtcForwarder = new EventEmitterForwarder(conference.rtc,
+        this.conference.eventEmitter);
+
+    conference.rtc.addListener(RTCEvents.DOMINANTSPEAKER_CHANGED,
+        function (id) {
+            if(conference.lastDominantSpeaker !== id && conference.room) {
+                conference.lastDominantSpeaker = id;
+                conference.eventEmitter.emit(
+                    JitsiConferenceEvents.DOMINANT_SPEAKER_CHANGED, id);
+            }
+            if (conference.statistics && conference.myUserId() === id) {
+                // We are the new dominant speaker.
+                conference.statistics.sendDominantSpeakerEvent();
+            }
+        });
+
+    conference.rtc.addListener(RTCEvents.DATA_CHANNEL_OPEN, function () {
+        var now = window.performance.now();
+        logger.log("(TIME) data channel opened ", now);
+        conference.room.connectionTimes["data.channel.opened"] = now;
+        Statistics.analytics.sendEvent('conference.dataChannel.open', now);
+    });
+
+    this.rtcForwarder.forward(RTCEvents.LASTN_CHANGED,
+        JitsiConferenceEvents.IN_LAST_N_CHANGED);
+
+    this.rtcForwarder.forward(RTCEvents.LASTN_ENDPOINT_CHANGED,
+        JitsiConferenceEvents.LAST_N_ENDPOINTS_CHANGED);
+
+    conference.rtc.addListener(RTCEvents.AVAILABLE_DEVICES_CHANGED,
+        function (devices) {
+            conference.room.updateDeviceAvailability(devices);
+        });
+
+    conference.rtc.addListener(RTCEvents.ENDPOINT_MESSAGE_RECEIVED,
+        function (from, payload) {
+            conference.eventEmitter.emit(
+                JitsiConferenceEvents.ENDPOINT_MESSAGE_RECEIVED,
+                conference.getParticipantById(from), payload);
+        });
+};
+
+/**
+ * Setups event listeners related to conference.xmpp
+ */
+JitsiConferenceEventManager.prototype.setupXMPPListeners = function () {
+    var conference = this.conference;
+    conference.xmpp.addListener(
+        XMPPEvents.CALL_INCOMING, conference.onIncomingCall.bind(conference));
+
+    conference.xmpp.addListener(XMPPEvents.START_MUTED_FROM_FOCUS,
+        function (audioMuted, videoMuted) {
+            conference.startAudioMuted = audioMuted;
+            conference.startVideoMuted = videoMuted;
+
+            // mute existing local tracks because this is initial mute from
+            // Jicofo
+            conference.getLocalTracks().forEach(function (track) {
+                switch (track.getType()) {
+                    case MediaType.AUDIO:
+                        conference.startAudioMuted && track.mute();
+                        break;
+                    case MediaType.VIDEO:
+                        conference.startVideoMuted && track.mute();
+                        break;
+                }
+            });
+
+            conference.eventEmitter.emit(JitsiConferenceEvents.STARTED_MUTED);
+        });
+};
+
+/**
+ * Setups event listeners related to conference.statistics
+ */
+JitsiConferenceEventManager.prototype.setupStatisticsListeners = function () {
+    var conference = this.conference;
+    if(!conference.statistics)
+        return;
+
+    conference.statistics.addAudioLevelListener(function (ssrc, level) {
+        var resource = conference.rtc.getResourceBySSRC(ssrc);
+        if (!resource)
+            return;
+
+        conference.rtc.setAudioLevel(resource, level);
+    });
+    conference.statistics.addConnectionStatsListener(function (stats) {
+        var ssrc2resolution = stats.resolution;
+
+        var id2resolution = {};
+
+        // preprocess resolutions: group by user id, skip incorrect
+        // resolutions etc.
+        Object.keys(ssrc2resolution).forEach(function (ssrc) {
+            var resolution = ssrc2resolution[ssrc];
+
+            if (!resolution.width || !resolution.height ||
+                resolution.width == -1 || resolution.height == -1) {
+                return;
+            }
+
+            var id = conference.rtc.getResourceBySSRC(ssrc);
+            if (!id) {
+                return;
+            }
+
+            // ssrc to resolution map for user id
+            var idResolutions = id2resolution[id] || {};
+            idResolutions[ssrc] = resolution;
+
+            id2resolution[id] = idResolutions;
+        });
+
+        stats.resolution = id2resolution;
+
+        conference.eventEmitter.emit(
+            JitsiConferenceEvents.CONNECTION_STATS, stats);
+    });
+
+    conference.statistics.addAudioProblemListener(function (ssrc) {
+        conference._reportAudioProblem(ssrc);
+    });
+
+    conference.statistics.addByteSentStatsListener(function (stats) {
+        conference.getLocalTracks().forEach(function (track) {
+            var ssrc = track.getSSRC();
+            if(!track.isAudioTrack() || !ssrc || !stats.hasOwnProperty(ssrc))
+                return;
+
+            track._setByteSent(stats[ssrc]);
+        });
+    });
+};
+
+module.exports = JitsiConferenceEventManager;
+
+}).call(this,"/JitsiConferenceEventManager.js")
+
+},{"./JitsiConferenceErrors":2,"./JitsiConferenceEvents":4,"./modules/statistics/statistics":32,"./modules/util/EventEmitterForwarder":40,"./service/RTC/MediaType":147,"./service/RTC/RTCEvents":148,"./service/authentication/AuthenticationEvents":151,"./service/xmpp/XMPPEvents":154,"jitsi-meet-logger":68}],4:[function(require,module,exports){
 /**
  * Enumeration with the events for the conference.
  * @type {{string: string}}
  */
 var JitsiConferenceEvents = {
     /**
-     * A new media track was added to the conference.
+     * A new media track was added to the conference. The event provides the
+     * following parameters to its listeners:
+     *
+     * @param {JitsiTrack} track the added JitsiTrack
      */
     TRACK_ADDED: "conference.trackAdded",
     /**
-     * The media track was removed from the conference.
+     * The media track was removed from the conference. The event provides the
+     * following parameters to its listeners:
+     *
+     * @param {JitsiTrack} track the removed JitsiTrack
      */
     TRACK_REMOVED: "conference.trackRemoved",
     /**
@@ -1531,37 +2065,62 @@ var JitsiConferenceEvents = {
     /**
      * Indicates that authentication status changed.
      */
-    AUTH_STATUS_CHANGED: "conference.auth_status_changed"
+    AUTH_STATUS_CHANGED: "conference.auth_status_changed",
+    /**
+     * Indicates that a the value of a specific property of a specific
+     * participant has changed.
+     */
+    PARTICIPANT_PROPERTY_CHANGED: "conference.participant_property_changed",
+    /**
+     * Indicates that a message from another participant is received on
+     * data channel.
+     */
+    ENDPOINT_MESSAGE_RECEIVED: "conference.endpoint_message_received",
+    /**
+     * Indicates that the room has been locked or unlocked.
+     */
+    LOCK_STATE_CHANGED: "conference.lock_state_changed"
 };
 
 module.exports = JitsiConferenceEvents;
 
-},{}],4:[function(require,module,exports){
+},{}],5:[function(require,module,exports){
 var JitsiConference = require("./JitsiConference");
 var XMPP = require("./modules/xmpp/xmpp");
+var JitsiConnectionEvents = require("./JitsiConnectionEvents");
+var JitsiConnectionErrors = require("./JitsiConnectionErrors");
+var Statistics = require("./modules/statistics/statistics");
 
 /**
  * Creates new connection object for the Jitsi Meet server side video conferencing service. Provides access to the
  * JitsiConference interface.
- * @param JitsiMeetJS the JitsiMeetJS instance which is initializing the new
- * JitsiConnection instance
  * @param appID identification for the provider of Jitsi Meet video conferencing services.
  * @param token the JWT token used to authenticate with the server(optional)
  * @param options Object with properties / settings related to connection with the server.
  * @constructor
  */
-function JitsiConnection(JitsiMeetJS, appID, token, options) {
-    /**
-     * The {JitsiMeetJS} instance which has initialized this {JitsiConnection}
-     * instance.
-     * @public
-     */
-    this.JitsiMeetJS = JitsiMeetJS;
+function JitsiConnection(appID, token, options) {
     this.appID = appID;
     this.token = token;
     this.options = options;
     this.xmpp = new XMPP(options, token);
     this.conferences = {};
+
+    this.addEventListener(JitsiConnectionEvents.CONNECTION_FAILED,
+        function (errType, msg) {
+            // sends analytics and callstats event
+            Statistics.sendEventToAll('connection.failed.' + errType, msg);
+        }.bind(this));
+
+    this.addEventListener(JitsiConnectionEvents.CONNECTION_DISCONNECTED,
+        function (msg) {
+            // we can see disconnects from normal tab closing of the browser
+            // and then there are no msgs, but we want to log only disconnects
+            // when there is real error
+            if(msg)
+                Statistics.analytics.sendEvent(
+                    'connection.disconnected.' + msg);
+        });
 }
 
 /**
@@ -1650,7 +2209,7 @@ JitsiConnection.prototype.getConnectionTimes = function () {
 
 module.exports = JitsiConnection;
 
-},{"./JitsiConference":1,"./modules/xmpp/xmpp":47}],5:[function(require,module,exports){
+},{"./JitsiConference":1,"./JitsiConnectionErrors":6,"./JitsiConnectionEvents":7,"./modules/statistics/statistics":32,"./modules/xmpp/xmpp":61}],6:[function(require,module,exports){
 /**
  * Enumeration with the errors for the connection.
  * @type {{string: string}}
@@ -1673,7 +2232,7 @@ var JitsiConnectionErrors = {
 
 module.exports = JitsiConnectionErrors;
 
-},{}],6:[function(require,module,exports){
+},{}],7:[function(require,module,exports){
 /**
  * Enumeration with the events for the connection.
  * @type {{string: string}}
@@ -1711,16 +2270,189 @@ var JitsiConnnectionEvents = {
 
 module.exports = JitsiConnnectionEvents;
 
-},{}],7:[function(require,module,exports){
+},{}],8:[function(require,module,exports){
+var EventEmitter = require("events");
+var RTCEvents = require('./service/RTC/RTCEvents');
+var RTC = require("./modules/RTC/RTC");
+var MediaType = require('./service/RTC/MediaType');
+var JitsiMediaDevicesEvents = require('./JitsiMediaDevicesEvents');
+var Statistics = require("./modules/statistics/statistics");
+
+var eventEmitter = new EventEmitter();
+
+RTC.addListener(RTCEvents.DEVICE_LIST_CHANGED,
+    function (devices) {
+        eventEmitter.emit(JitsiMediaDevicesEvents.DEVICE_LIST_CHANGED, devices);
+    });
+
+RTC.addListener(RTCEvents.DEVICE_LIST_AVAILABLE,
+    function (devices) {
+        // log output device
+        logOutputDevice(
+            JitsiMediaDevices.getAudioOutputDevice(),
+            devices);
+    });
+
+/**
+ * Gathers data and sends it to statistics.
+ * @param deviceID the device id to log
+ * @param devices list of devices
+ */
+function logOutputDevice (deviceID, devices) {
+    var device = devices.find(function (d) {
+        return d.kind === 'audiooutput' && d.deviceId === deviceID;
+    });
+
+    if (device) {
+        Statistics.sendActiveDeviceListEvent(
+            RTC.getEventDataForActiveDevice(device));
+    }
+}
+
+var JitsiMediaDevices = {
+    /**
+     * Executes callback with list of media devices connected.
+     * @param {function} callback
+     */
+    enumerateDevices: function (callback) {
+        RTC.enumerateDevices(callback);
+    },
+    /**
+     * Checks if its possible to enumerate available cameras/micropones.
+     * @returns {Promise<boolean>} a Promise which will be resolved only once
+     * the WebRTC stack is ready, either with true if the device listing is
+     * available available or with false otherwise.
+     */
+    isDeviceListAvailable: function () {
+        return RTC.isDeviceListAvailable();
+    },
+    /**
+     * Returns true if changing the input (camera / microphone) or output
+     * (audio) device is supported and false if not.
+     * @param {string} [deviceType] - type of device to change. Default is
+     *      undefined or 'input', 'output' - for audio output device change.
+     * @returns {boolean} true if available, false otherwise.
+     */
+    isDeviceChangeAvailable: function (deviceType) {
+        return RTC.isDeviceChangeAvailable(deviceType);
+    },
+    /**
+     * Returns true if user granted permission to media devices.
+     * @param {'audio'|'video'} [type] - type of devices to check,
+     *      undefined stands for both 'audio' and 'video' together
+     * @returns {boolean}
+     */
+    isDevicePermissionGranted: function (type) {
+        var permissions = RTC.getDeviceAvailability();
+
+        switch(type) {
+            case MediaType.VIDEO:
+                return permissions.video === true;
+            case MediaType.AUDIO:
+                return permissions.audio === true;
+            default:
+                return permissions.video === true && permissions.audio === true;
+        }
+    },
+    /**
+     * Returns currently used audio output device id, 'default' stands
+     * for default device
+     * @returns {string}
+     */
+    getAudioOutputDevice: function () {
+        return RTC.getAudioOutputDevice();
+    },
+    /**
+     * Sets current audio output device.
+     * @param {string} deviceId - id of 'audiooutput' device from
+     *      navigator.mediaDevices.enumerateDevices(), 'default' is for
+     *      default device
+     * @returns {Promise} - resolves when audio output is changed, is rejected
+     *      otherwise
+     */
+    setAudioOutputDevice: function (deviceId) {
+
+        var availableDevices = RTC.getCurrentlyAvailableMediaDevices();
+        if (availableDevices && availableDevices.length > 0)
+        {
+            // if we have devices info report device to stats
+            // normally this will not happen on startup as this method is called
+            // too early. This will happen only on user selection of new device
+            logOutputDevice(deviceId, RTC.getCurrentlyAvailableMediaDevices());
+        }
+
+        return RTC.setAudioOutputDevice(deviceId);
+    },
+    /**
+     * Adds an event handler.
+     * @param {string} event - event name
+     * @param {function} handler - event handler
+     */
+    addEventListener: function (event, handler) {
+        eventEmitter.addListener(event, handler);
+    },
+    /**
+     * Removes event handler.
+     * @param {string} event - event name
+     * @param {function} handler - event handler
+     */
+    removeEventListener: function (event, handler) {
+        eventEmitter.removeListener(event, handler);
+    },
+    /**
+     * Emits an event.
+     * @param {string} event - event name
+     */
+    emitEvent: function (event) {
+        eventEmitter.emit.apply(eventEmitter, arguments);
+    }
+};
+
+module.exports = JitsiMediaDevices;
+},{"./JitsiMediaDevicesEvents":9,"./modules/RTC/RTC":21,"./modules/statistics/statistics":32,"./service/RTC/MediaType":147,"./service/RTC/RTCEvents":148,"events":63}],9:[function(require,module,exports){
+/**
+ * Enumeration with the events for the media devices.
+ * @type {{string: string}}
+ */
+var JitsiMediaDevicesEvents = {
+    /**
+     * Indicates that the list of available media devices has been changed. The
+     * event provides the following parameters to its listeners:
+     *
+     * @param {MediaDeviceInfo[]} devices - array of MediaDeviceInfo or
+     *  MediaDeviceInfo-like objects that are currently connected.
+     *  @see https://developer.mozilla.org/en-US/docs/Web/API/MediaDeviceInfo
+     */
+    DEVICE_LIST_CHANGED: "mediaDevices.devicechange",
+    /**
+     * Indicates that the environment is currently showing permission prompt to
+     * access camera and/or microphone. The event provides the following
+     * parameters to its listeners:
+     *
+     * @param {'chrome'|'opera'|'firefox'|'iexplorer'|'safari'|'nwjs'
+     *      |'react-native'|'android'} environmentType - type of browser or
+     *      other execution environment.
+     */
+    PERMISSION_PROMPT_IS_SHOWN: "mediaDevices.permissionPromptIsShown"
+};
+
+module.exports = JitsiMediaDevicesEvents;
+
+},{}],10:[function(require,module,exports){
 (function (__filename){
 var logger = require("jitsi-meet-logger").getLogger(__filename);
+var AuthUtil = require("./modules/util/AuthUtil");
 var JitsiConnection = require("./JitsiConnection");
+var JitsiMediaDevices = require("./JitsiMediaDevices");
 var JitsiConferenceEvents = require("./JitsiConferenceEvents");
 var JitsiConnectionEvents = require("./JitsiConnectionEvents");
+var JitsiMediaDevicesEvents = require('./JitsiMediaDevicesEvents');
 var JitsiConnectionErrors = require("./JitsiConnectionErrors");
 var JitsiConferenceErrors = require("./JitsiConferenceErrors");
 var JitsiTrackEvents = require("./JitsiTrackEvents");
 var JitsiTrackErrors = require("./JitsiTrackErrors");
+var JitsiTrackError = require("./JitsiTrackError");
+var JitsiRecorderErrors = require("./JitsiRecorderErrors");
 var Logger = require("jitsi-meet-logger");
 var MediaType = require("./service/RTC/MediaType");
 var RTC = require("./modules/RTC/RTC");
@@ -1728,6 +2460,12 @@ var RTCUIHelper = require("./modules/RTC/RTCUIHelper");
 var Statistics = require("./modules/statistics/statistics");
 var Resolutions = require("./service/RTC/Resolutions");
 var ScriptUtil = require("./modules/util/ScriptUtil");
+var GlobalOnErrorHandler = require("./modules/util/GlobalOnErrorHandler");
+var RTCBrowserType = require("./modules/RTC/RTCBrowserType");
+
+// The amount of time to wait until firing
+// JitsiMediaDevicesEvents.PERMISSION_PROMPT_IS_SHOWN event
+var USER_MEDIA_PERMISSION_PROMPT_TIMEOUT = 500;
 
 function getLowerResolution(resolution) {
     if(!Resolutions[resolution])
@@ -1746,52 +2484,85 @@ function getLowerResolution(resolution) {
 }
 
 /**
+ * Checks the available devices in options and concatenate the data to the
+ * name, which will be used as analytics event name. Adds resolution for the
+ * devices.
+ * @param name name of event
+ * @param options gum options
+ * @returns {*}
+ */
+function addDeviceTypeToAnalyticsEvent(name, options) {
+    if (options.devices.indexOf("audio") !== -1) {
+        name += ".audio";
+    }
+    if (options.devices.indexOf("desktop") !== -1) {
+        name += ".desktop";
+    }
+    if (options.devices.indexOf("video") !== -1) {
+        // we have video add resolution
+        name += ".video." + options.resolution;
+    }
+
+    return name;
+}
+
+/**
  * Namespace for the interface of Jitsi Meet Library.
  */
 var LibJitsiMeet = {
 
     version: 'development',
 
+    JitsiConnection: JitsiConnection,
     events: {
         conference: JitsiConferenceEvents,
         connection: JitsiConnectionEvents,
-        track: JitsiTrackEvents
+        track: JitsiTrackEvents,
+        mediaDevices: JitsiMediaDevicesEvents
     },
     errors: {
         conference: JitsiConferenceErrors,
         connection: JitsiConnectionErrors,
+        recorder: JitsiRecorderErrors,
         track: JitsiTrackErrors
     },
+    errorTypes: {
+        JitsiTrackError: JitsiTrackError
+    },
     logLevels: Logger.levels,
-    /**
-     * Array of functions that will receive the GUM error.
-     */
-    _gumFailedHandler: [],
+    mediaDevices: JitsiMediaDevices,
+    analytics: null,
     init: function (options) {
-        Statistics.audioLevelsEnabled = !options.disableAudioLevels || true;
+        var logObject, attr;
+        Statistics.init(options);
+        this.analytics = Statistics.analytics;
 
         if (options.enableWindowOnErrorHandler) {
-            // if an old handler exists also fire its events
-            var oldOnErrorHandler = window.onerror;
-            window.onerror = function (message, source, lineno, colno, error) {
+            GlobalOnErrorHandler.addHandler(
+                this.getGlobalOnErrorHandler.bind(this));
+        }
 
-                this.getGlobalOnErrorHandler(
-                    message, source, lineno, colno, error);
+        // Log deployment-specific information, if available.
+        if (window.jitsiRegionInfo
+            && Object.keys(window.jitsiRegionInfo).length > 0) {
+            logObject = {};
+            for (attr in window.jitsiRegionInfo) {
+                if (window.jitsiRegionInfo.hasOwnProperty(attr)) {
+                    logObject[attr] = window.jitsiRegionInfo[attr];
+                }
+            }
 
-                if (oldOnErrorHandler)
-                    oldOnErrorHandler(message, source, lineno, colno, error);
-            }.bind(this);
+            logObject.id = "deployment_info";
+            Statistics.sendLog(JSON.stringify(logObject));
+        }
 
-            // if an old handler exists also fire its events
-            var oldOnUnhandledRejection = window.onunhandledrejection;
-            window.onunhandledrejection = function(event) {
-
-                this.getGlobalOnErrorHandler(
-                    null, null, null, null, event.reason);
-
-                if(oldOnUnhandledRejection)
-                    oldOnUnhandledRejection(event);
-            }.bind(this);
+        if(this.version) {
+            logObject = {
+                id: "component_version",
+                component: "lib-jitsi-meet",
+                version: this.version
+            }
+            Statistics.sendLog(JSON.stringify(logObject));
         }
 
         return RTC.init(options || {});
@@ -1817,13 +2588,62 @@ var LibJitsiMeet = {
      * will be returned trough the Promise, otherwise JitsiTrack objects will be returned.
      * @param {string} options.cameraDeviceId
      * @param {string} options.micDeviceId
+     * @param {object} options.desktopSharingExtensionExternalInstallation -
+     * enables external installation process for desktop sharing extension if
+     * the inline installation is not posible. The following properties should
+     * be provided:
+     * @param {intiger} interval - the interval (in ms) for
+     * checking whether the desktop sharing extension is installed or not
+     * @param {Function} checkAgain - returns boolean. While checkAgain()==true
+     * createLocalTracks will wait and check on every "interval" ms for the
+     * extension. If the desktop extension is not install and checkAgain()==true
+     * createLocalTracks will finish with rejected Promise.
+     * @param {Function} listener - The listener will be called to notify the
+     * user of lib-jitsi-meet that createLocalTracks is starting external
+     * extension installation process.
+     * NOTE: If the inline installation process is not possible and external
+     * installation is enabled the listener property will be called to notify
+     * the start of external installation process. After that createLocalTracks
+     * will start to check for the extension on every interval ms until the
+     * plugin is installed or until checkAgain return false. If the extension
+     * is found createLocalTracks will try to get the desktop sharing track and
+     * will finish the execution. If checkAgain returns false, createLocalTracks
+     * will finish the execution with rejected Promise.
+     *
+     * @param {boolean} (firePermissionPromptIsShownEvent) - if event
+     *      JitsiMediaDevicesEvents.PERMISSION_PROMPT_IS_SHOWN should be fired
      * @returns {Promise.<{Array.<JitsiTrack>}, JitsiConferenceError>}
      *     A promise that returns an array of created JitsiTracks if resolved,
      *     or a JitsiConferenceError if rejected.
      */
-    createLocalTracks: function (options) {
-        return RTC.obtainAudioAndVideoPermissions(options || {}).then(
-            function(tracks) {
+    createLocalTracks: function (options, firePermissionPromptIsShownEvent) {
+        var promiseFulfilled = false;
+
+        if (firePermissionPromptIsShownEvent === true) {
+            window.setTimeout(function () {
+                if (!promiseFulfilled) {
+                    JitsiMediaDevices.emitEvent(
+                        JitsiMediaDevicesEvents.PERMISSION_PROMPT_IS_SHOWN,
+                        RTCBrowserType.getBrowserName());
+                }
+            }, USER_MEDIA_PERMISSION_PROMPT_TIMEOUT);
+        }
+
+        if(!window.connectionTimes)
+            window.connectionTimes = {};
+        window.connectionTimes["obtainPermissions.start"] =
+            window.performance.now();
+
+        return RTC.obtainAudioAndVideoPermissions(options || {})
+            .then(function(tracks) {
+                promiseFulfilled = true;
+
+                window.connectionTimes["obtainPermissions.end"] =
+                    window.performance.now();
+
+                Statistics.analytics.sendEvent(addDeviceTypeToAnalyticsEvent(
+                    "getUserMedia.success", options), options);
+
                 if(!RTC.options.disableAudioLevels)
                     for(var i = 0; i < tracks.length; i++) {
                         var track = tracks[i];
@@ -1838,32 +2658,76 @@ var LibJitsiMeet = {
                                 });
                         }
                     }
+
                 return tracks;
             }).catch(function (error) {
-                this._gumFailedHandler.forEach(function (handler) {
-                    handler(error);
-                });
-                if(!this._gumFailedHandler.length)
-                    Statistics.sendGetUserMediaFailed(error);
-                if(error === JitsiTrackErrors.UNSUPPORTED_RESOLUTION) {
-                    var oldResolution = options.resolution || '360';
-                    var newResolution = getLowerResolution(oldResolution);
-                    if(newResolution === null)
-                        return Promise.reject(error);
-                    options.resolution = newResolution;
-                    logger.debug("Retry createLocalTracks with resolution",
-                                newResolution);
-                    return LibJitsiMeet.createLocalTracks(options);
+                promiseFulfilled = true;
+
+                if(error.name === JitsiTrackErrors.UNSUPPORTED_RESOLUTION) {
+                    var oldResolution = options.resolution || '360',
+                        newResolution = getLowerResolution(oldResolution);
+
+                    if (newResolution !== null) {
+                        options.resolution = newResolution;
+
+                        logger.debug("Retry createLocalTracks with resolution",
+                            newResolution);
+
+                        Statistics.analytics.sendEvent(
+                            "getUserMedia.fail.resolution." + oldResolution);
+
+                        return LibJitsiMeet.createLocalTracks(options);
+                    }
                 }
+
+                if (JitsiTrackErrors.CHROME_EXTENSION_USER_CANCELED ===
+                        error.name) {
+                    // User cancelled action is not really an error, so only
+                    // log it as an event to avoid having conference classified
+                    // as partially failed
+                    var logObject = {
+                        id: "chrome_extension_user_canceled",
+                        message: error.message
+                    };
+                    Statistics.sendLog(JSON.stringify(logObject));
+                    Statistics.analytics.sendEvent(
+                        "getUserMedia.userCancel.extensionInstall");
+                } else if (JitsiTrackErrors.NOT_FOUND === error.name) {
+                    // logs not found devices with just application log to cs
+                    var logObject = {
+                        id: "usermedia_missing_device",
+                        status: error.gum.devices
+                    };
+                    Statistics.sendLog(JSON.stringify(logObject));
+                    Statistics.analytics.sendEvent(
+                        "getUserMedia.deviceNotFound."
+                            + error.gum.devices.join('.'));
+                } else {
+                    // Report gUM failed to the stats
+                    Statistics.sendGetUserMediaFailed(error);
+                    Statistics.analytics.sendEvent(
+                        addDeviceTypeToAnalyticsEvent(
+                            "getUserMedia.failed", options) + '.' + error.name,
+                        options);
+                }
+
+                window.connectionTimes["obtainPermissions.end"] =
+                    window.performance.now();
+
                 return Promise.reject(error);
             }.bind(this));
     },
     /**
      * Checks if its possible to enumerate available cameras/micropones.
-     * @returns {boolean} true if available, false otherwise.
+     * @returns {Promise<boolean>} a Promise which will be resolved only once
+     * the WebRTC stack is ready, either with true if the device listing is
+     * available available or with false otherwise.
+     * @deprecated use JitsiMeetJS.mediaDevices.isDeviceListAvailable instead
      */
     isDeviceListAvailable: function () {
-        return RTC.isDeviceListAvailable();
+        logger.warn('This method is deprecated, use ' +
+            'JitsiMeetJS.mediaDevices.isDeviceListAvailable instead');
+        return this.mediaDevices.isDeviceListAvailable();
     },
     /**
      * Returns true if changing the input (camera / microphone) or output
@@ -1871,35 +2735,23 @@ var LibJitsiMeet = {
      * @params {string} [deviceType] - type of device to change. Default is
      *      undefined or 'input', 'output' - for audio output device change.
      * @returns {boolean} true if available, false otherwise.
+     * @deprecated use JitsiMeetJS.mediaDevices.isDeviceChangeAvailable instead
      */
     isDeviceChangeAvailable: function (deviceType) {
-        return RTC.isDeviceChangeAvailable(deviceType);
+        logger.warn('This method is deprecated, use ' +
+            'JitsiMeetJS.mediaDevices.isDeviceChangeAvailable instead');
+        return this.mediaDevices.isDeviceChangeAvailable(deviceType);
     },
     /**
-     * Returns currently used audio output device id, '' stands for default
-     * device
-     * @returns {string}
+     * Executes callback with list of media devices connected.
+     * @param {function} callback
+     * @deprecated use JitsiMeetJS.mediaDevices.enumerateDevices instead
      */
-    getAudioOutputDevice: function () {
-        return RTC.getAudioOutputDevice();
-    },
-    /**
-     * Sets current audio output device.
-     * @param {string} deviceId - id of 'audiooutput' device from
-     *      navigator.mediaDevices.enumerateDevices(), '' is for default device
-     * @returns {Promise} - resolves when audio output is changed, is rejected
-     *      otherwise
-     */
-    setAudioOutputDevice: function (deviceId) {
-        return RTC.setAudioOutputDevice(deviceId);
-    },
     enumerateDevices: function (callback) {
-        RTC.enumerateDevices(callback);
+        logger.warn('This method is deprecated, use ' +
+            'JitsiMeetJS.mediaDevices.enumerateDevices instead');
+        this.mediaDevices.enumerateDevices(callback);
     },
-    /**
-     * Array of functions that will receive the unhandled errors.
-     */
-    _globalOnErrorHandler: [],
     /**
      * @returns function that can be used to be attached to window.onerror and
      * if options.enableWindowOnErrorHandler is enabled returns
@@ -1907,20 +2759,13 @@ var LibJitsiMeet = {
      * (function(message, source, lineno, colno, error)).
      */
     getGlobalOnErrorHandler: function (message, source, lineno, colno, error) {
-        console.error(
+        logger.error(
             'UnhandledError: ' + message,
             'Script: ' + source,
             'Line: ' + lineno,
             'Column: ' + colno,
             'StackTrace: ', error);
-        var globalOnErrorHandler = this._globalOnErrorHandler;
-        if (globalOnErrorHandler.length) {
-          globalOnErrorHandler.forEach(function (handler) {
-              handler(error);
-          });
-        } else {
-            Statistics.sendUnhandledError(error);
-        }
+        Statistics.reportGlobalError(error);
     },
 
     /**
@@ -1929,18 +2774,10 @@ var LibJitsiMeet = {
      */
     util: {
         ScriptUtil: ScriptUtil,
-        RTCUIHelper: RTCUIHelper
+        RTCUIHelper: RTCUIHelper,
+        AuthUtil: AuthUtil
     }
 };
-
-// XXX JitsiConnection or the instances it initializes and is associated with
-// (e.g. JitsiConference) may need a reference to LibJitsiMeet (aka
-// JitsiMeetJS). An approach could be to declare LibJitsiMeet global (which is
-// what we do in Jitsi Meet) but that could be seen as not such a cool decision
-// certainly looks even worse within the lib-jitsi-meet library itself. That's
-// why the decision is to provide LibJitsiMeet as a parameter of
-// JitsiConnection.
-LibJitsiMeet.JitsiConnection = JitsiConnection.bind(null, LibJitsiMeet);
 
 //Setups the promise object.
 window.Promise = window.Promise || require("es6-promise").Promise;
@@ -1949,8 +2786,9 @@ module.exports = LibJitsiMeet;
 
 }).call(this,"/JitsiMeetJS.js")
 
-},{"./JitsiConferenceErrors":2,"./JitsiConferenceEvents":3,"./JitsiConnection":4,"./JitsiConnectionErrors":5,"./JitsiConnectionEvents":6,"./JitsiTrackErrors":10,"./JitsiTrackEvents":11,"./modules/RTC/RTC":17,"./modules/RTC/RTCUIHelper":19,"./modules/statistics/statistics":27,"./modules/util/ScriptUtil":29,"./service/RTC/MediaType":129,"./service/RTC/Resolutions":131,"es6-promise":75,"jitsi-meet-logger":82}],8:[function(require,module,exports){
+},{"./JitsiConferenceErrors":2,"./JitsiConferenceEvents":4,"./JitsiConnection":5,"./JitsiConnectionErrors":6,"./JitsiConnectionEvents":7,"./JitsiMediaDevices":8,"./JitsiMediaDevicesEvents":9,"./JitsiRecorderErrors":12,"./JitsiTrackError":13,"./JitsiTrackErrors":14,"./JitsiTrackEvents":15,"./modules/RTC/RTC":21,"./modules/RTC/RTCBrowserType":22,"./modules/RTC/RTCUIHelper":23,"./modules/statistics/statistics":32,"./modules/util/AuthUtil":39,"./modules/util/GlobalOnErrorHandler":41,"./modules/util/ScriptUtil":43,"./service/RTC/MediaType":147,"./service/RTC/Resolutions":149,"es6-promise":66,"jitsi-meet-logger":68}],11:[function(require,module,exports){
 /* global Strophe */
+var JitsiConferenceEvents = require('./JitsiConferenceEvents');
 
 /**
  * Represents a participant in (a member of) a conference.
@@ -1973,6 +2811,7 @@ function JitsiParticipant(jid, conference, displayName, isHidden){
         video: undefined
     };
     this._isHidden = isHidden;
+    this._properties = {};
 }
 
 /**
@@ -1980,6 +2819,33 @@ function JitsiParticipant(jid, conference, displayName, isHidden){
  */
 JitsiParticipant.prototype.getConference = function() {
     return this._conference;
+};
+
+/**
+ * Gets the value of a property of this participant.
+ */
+JitsiParticipant.prototype.getProperty = function(name) {
+    return this._properties[name];
+};
+
+/**
+ * Sets the value of a property of this participant, and fires an event if the
+ * value has changed.
+ * @name the name of the property.
+ * @value the value to set.
+ */
+JitsiParticipant.prototype.setProperty = function(name, value) {
+    var oldValue = this._properties[name];
+    this._properties[name] = value;
+
+    if (value !== oldValue) {
+        this._conference.eventEmitter.emit(
+            JitsiConferenceEvents.PARTICIPANT_PROPERTY_CHANGED,
+            this,
+            name,
+            oldValue,
+            value);
+    }
 };
 
 /**
@@ -2133,7 +2999,7 @@ JitsiParticipant.prototype.supportsDTMF = function () {
 
 module.exports = JitsiParticipant;
 
-},{}],9:[function(require,module,exports){
+},{"./JitsiConferenceEvents":4}],12:[function(require,module,exports){
 /**
  * Enumeration with the errors for the conference.
  * @type {{string: string}}
@@ -2145,6 +3011,11 @@ var JitsiRecorderErrors = {
     RECORDER_UNAVAILABLE: "recorder.unavailable",
 
     /**
+     * Indicates that all available recorders are currently busy.
+     */
+    RECORDER_BUSY: "recorder.busy",
+
+    /**
      * Indicates that the authentication token is missing.
      */
     NO_TOKEN: "recorder.noToken",
@@ -2154,65 +3025,229 @@ var JitsiRecorderErrors = {
      */
     STATE_CHANGE_FAILED: "recorder.stateChangeFailed",
 
+    /**
+     * Indicates an invalid state.
+     */
+    INVALID_STATE: "recorder.invalidState"
 };
 
 module.exports = JitsiRecorderErrors;
 
-},{}],10:[function(require,module,exports){
-(function (__filename){
-var logger = require("jitsi-meet-logger").getLogger(__filename);
+},{}],13:[function(require,module,exports){
+var JitsiTrackErrors = require("./JitsiTrackErrors");
 
+var TRACK_ERROR_TO_MESSAGE_MAP = {};
+
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.UNSUPPORTED_RESOLUTION]
+    = "Video resolution is not supported: ";
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.FIREFOX_EXTENSION_NEEDED]
+    = "Firefox extension is not installed";
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.CHROME_EXTENSION_INSTALLATION_ERROR]
+    = "Failed to install Chrome extension";
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.CHROME_EXTENSION_USER_CANCELED]
+    = "User canceled Chrome's screen sharing prompt";
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.CHROME_EXTENSION_GENERIC_ERROR]
+    = "Unknown error from Chrome extension";
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.GENERAL]
+    = "Generic getUserMedia error";
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.PERMISSION_DENIED]
+    = "User denied permission to use device(s): ";
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.NOT_FOUND]
+    = "Requested device(s) was/were not found: ";
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.CONSTRAINT_FAILED]
+    = "Constraint could not be satisfied: ";
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.TRACK_IS_DISPOSED]
+    = "Track has been already disposed";
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.TRACK_NO_STREAM_FOUND]
+    = "Track does not have an associated Media Stream";
+TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.TRACK_MUTE_UNMUTE_IN_PROGRESS]
+    = "Track mute/unmute process is currently in progress";
+
+/**
+ * Object representing error that happened to a JitsiTrack. Can represent
+ * various types of errors. For error descriptions (@see JitsiTrackErrors).
+ * @constructor
+ * @extends Error
+ * @param {Object|string} error - error object or error name
+ * @param {Object|string} (options) - getUserMedia constraints object or error
+ *      message
+ * @param {('audio'|'video'|'desktop'|'screen'|'audiooutput')[]} (devices) -
+ *      list of getUserMedia requested devices
+ */
+function JitsiTrackError(error, options, devices) {
+    if (typeof error === "object" && typeof error.name !== "undefined") {
+        /**
+         * Additional information about original getUserMedia error
+         * and constraints.
+         * @type {{
+         *          error: Object,
+         *          constraints: Object,
+         *          devices: Array.<'audio'|'video'|'desktop'|'screen'>
+         *      }}
+         */
+        this.gum = {
+            error: error,
+            constraints: options,
+            devices: devices && Array.isArray(devices)
+                ? devices.slice(0)
+                : undefined
+        };
+
+        switch (error.name) {
+            case "PermissionDeniedError":
+            case "SecurityError":
+                this.name = JitsiTrackErrors.PERMISSION_DENIED;
+                this.message = TRACK_ERROR_TO_MESSAGE_MAP[
+                        JitsiTrackErrors.PERMISSION_DENIED]
+                        + (this.gum.devices || []).join(", ");
+                break;
+            case "DevicesNotFoundError":
+            case "NotFoundError":
+                this.name = JitsiTrackErrors.NOT_FOUND;
+                this.message = TRACK_ERROR_TO_MESSAGE_MAP[
+                        JitsiTrackErrors.NOT_FOUND]
+                        + (this.gum.devices || []).join(", ");
+                break;
+            case "ConstraintNotSatisfiedError":
+            case "OverconstrainedError":
+                var constraintName = error.constraintName;
+
+                if (options && options.video
+                    && (devices || []).indexOf('video') > -1
+                    &&
+                    (constraintName === "minWidth" ||
+                        constraintName === "maxWidth" ||
+                        constraintName === "minHeight" ||
+                        constraintName === "maxHeight" ||
+                        constraintName === "width" ||
+                        constraintName === "height")) {
+                    this.name = JitsiTrackErrors.UNSUPPORTED_RESOLUTION;
+                    this.message = TRACK_ERROR_TO_MESSAGE_MAP[
+                            JitsiTrackErrors.UNSUPPORTED_RESOLUTION] +
+                        getResolutionFromFailedConstraint(constraintName,
+                            options);
+                } else {
+                    this.name = JitsiTrackErrors.CONSTRAINT_FAILED;
+                    this.message = TRACK_ERROR_TO_MESSAGE_MAP[
+                            JitsiTrackErrors.CONSTRAINT_FAILED] +
+                        error.constraintName;
+                }
+                break;
+            default:
+                this.name = JitsiTrackErrors.GENERAL;
+                this.message = error.message ||
+                    TRACK_ERROR_TO_MESSAGE_MAP[JitsiTrackErrors.GENERAL];
+                break;
+        }
+    } else if (typeof error === "string") {
+        if (TRACK_ERROR_TO_MESSAGE_MAP[error]) {
+            this.name = error;
+            this.message = options || TRACK_ERROR_TO_MESSAGE_MAP[error];
+        } else {
+            // this is some generic error that do not fit any of our pre-defined
+            // errors, so don't give it any specific name, just store message
+            this.message = error;
+        }
+    } else {
+        throw new Error("Invalid arguments");
+    }
+
+    this.stack = error.stack || (new Error()).stack;
+}
+
+JitsiTrackError.prototype = Object.create(Error.prototype);
+JitsiTrackError.prototype.constructor = JitsiTrackError;
+
+/**
+ * Gets failed resolution constraint from corresponding object.
+ * @param {string} failedConstraintName
+ * @param {Object} constraints
+ * @returns {string|number}
+ */
+function getResolutionFromFailedConstraint(failedConstraintName, constraints) {
+    if (constraints && constraints.video && constraints.video.mandatory) {
+        if (failedConstraintName === "width") {
+            return constraints.video.mandatory.minWidth;
+        } else if (failedConstraintName === "height") {
+            return constraints.video.mandatory.minHeight;
+        } else {
+            return constraints.video.mandatory[failedConstraintName] || "";
+        }
+    }
+
+    return "";
+}
+
+module.exports = JitsiTrackError;
+
+},{"./JitsiTrackErrors":14}],14:[function(require,module,exports){
+/**
+ * Enumeration with the errors for the JitsiTrack objects.
+ * @type {{string: string}}
+ */
 module.exports = {
     /**
-     * Returns JitsiTrackErrors based on the error object passed by GUM
-     * @param error the error
-     * @param {Array} devices Array with the requested devices
+     * An error which indicates that requested video resolution is not supported
+     * by a webcam.
      */
-    parseError: function (error, devices) {
-        if (typeof error === "object") {
-          var constraintName = error.constraintName;
-          var name;
-          if (constraintName
-                  && (name = error.name)
-                  && (name == "ConstraintNotSatisfiedError"
-                      || name == "OverconstrainedError")
-                  && (constraintName == "minWidth"
-                      || constraintName == "maxWidth"
-                      || constraintName == "minHeight"
-                      || constraintName == "maxHeight"
-                      || constraintName == "width"
-                      || constraintName == "height")
-                  && (devices || []).indexOf("video") !== -1) {
-              return this.UNSUPPORTED_RESOLUTION;
-          }
-          if (error.type === "jitsiError") {
-              return error.errorObject;
-          }
-        }
-        // XXX We're about to lose the details represented by error and devices
-        // (because we're about to generalize them to GENERAL). At the very
-        // least log the details.
-        logger.error('Parsing error into ' + this.GENERAL + ': ' + error);
-        return this.GENERAL;
-    },
     UNSUPPORTED_RESOLUTION: "gum.unsupported_resolution",
     /**
-     * An event which indicates that the jidesha extension for Firefox is
+     * An error which indicates that the jidesha extension for Firefox is
      * needed to proceed with screen sharing, and that it is not installed.
      */
     FIREFOX_EXTENSION_NEEDED: "gum.firefox_extension_needed",
+    /**
+     * An error which indicates that the jidesha extension for Chrome is
+     * failed to install.
+     */
     CHROME_EXTENSION_INSTALLATION_ERROR:
         "gum.chrome_extension_installation_error",
+    /**
+     * An error which indicates that user canceled screen sharing window
+     * selection dialog in jidesha extension for Chrome.
+     */
     CHROME_EXTENSION_USER_CANCELED:
         "gum.chrome_extension_user_canceled",
+    /**
+     * Generic error for jidesha extension for Chrome.
+     */
+    CHROME_EXTENSION_GENERIC_ERROR:
+        "gum.chrome_extension_generic_error",
+    /**
+     * Generic getUserMedia error.
+     */
     GENERAL: "gum.general",
+    /**
+     * An error which indicates that user denied permission to share requested
+     * device.
+     */
+    PERMISSION_DENIED: "gum.permission_denied",
+    /**
+     * An error which indicates that requested device was not found.
+     */
+    NOT_FOUND: "gum.not_found",
+    /**
+     * An error which indicates that some of requested constraints in
+     * getUserMedia call were not satisfied.
+     */
+    CONSTRAINT_FAILED: "gum.constraint_failed",
+    /**
+     * An error which indicates that track has been already disposed and cannot
+     * be longer used.
+     */
     TRACK_IS_DISPOSED: "track.track_is_disposed",
+    /**
+     * An error which indicates that track has no MediaStream associated.
+     */
+    TRACK_NO_STREAM_FOUND: "track.no_stream_found",
+    /**
+     * An error which indicates that track is currently in progress of muting or
+     * unmuting itself.
+     */
     TRACK_MUTE_UNMUTE_IN_PROGRESS: "track.mute_unmute_inprogress"
 };
 
-}).call(this,"/JitsiTrackErrors.js")
-
-},{"jitsi-meet-logger":82}],11:[function(require,module,exports){
+},{}],15:[function(require,module,exports){
 var JitsiTrackEvents = {
     /**
      * A media track mute status was changed.
@@ -2233,12 +3268,16 @@ var JitsiTrackEvents = {
     /**
      * The audio output of the track was changed.
      */
-    TRACK_AUDIO_OUTPUT_CHANGED: "track.audioOutputChanged"
+    TRACK_AUDIO_OUTPUT_CHANGED: "track.audioOutputChanged",
+    /**
+     * Detects that no audio have been sent.
+     */
+    TRACK_AUDIO_NOT_WORKING: "track.audioNotWorking"
 };
 
 module.exports = JitsiTrackEvents;
 
-},{}],12:[function(require,module,exports){
+},{}],16:[function(require,module,exports){
 (function (__filename){
 var logger = require("jitsi-meet-logger").getLogger(__filename);
 
@@ -2259,7 +3298,7 @@ JitsiDTMFManager.prototype.sendTones = function (tones, duration, pause) {
 
 }).call(this,"/modules/DTMF/JitsiDTMFManager.js")
 
-},{"jitsi-meet-logger":82}],13:[function(require,module,exports){
+},{"jitsi-meet-logger":68}],17:[function(require,module,exports){
 (function (__filename){
 /* global config, APP, Strophe */
 
@@ -2268,6 +3307,7 @@ JitsiDTMFManager.prototype.sendTones = function (tones, duration, pause) {
 
 var logger = require("jitsi-meet-logger").getLogger(__filename);
 var RTCEvents = require("../../service/RTC/RTCEvents");
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 
 
 /**
@@ -2313,7 +3353,7 @@ function DataChannels(peerConnection, emitter) {
 DataChannels.prototype.onDataChannel = function (event) {
     var dataChannel = event.channel;
     var self = this;
-    var lastSelectedEndpoint = null;
+    var selectedEndpoint = null;
 
     dataChannel.onopen = function () {
         logger.info("Data channel opened by the Videobridge!", dataChannel);
@@ -2330,10 +3370,22 @@ DataChannels.prototype.onDataChannel = function (event) {
         // selections so that it can do adaptive simulcast,
         // we want the notification to trigger even if userJid is undefined,
         // or null.
-        self.handleSelectedEndpointEvent(self.lastSelectedEndpoint);
+        // XXX why do we not do the same for pinned endpoints?
+        try {
+            self.sendSelectedEndpointMessage(self.selectedEndpoint);
+        } catch (error) {
+            GlobalOnErrorHandler.callErrorHandler(error);
+            logger.error("Cannot sendSelectedEndpointMessage ",
+                self.selectedEndpoint, ". Error: ", error);
+        }
     };
 
     dataChannel.onerror = function (error) {
+        var e = new Error("Data Channel Error:" + error);
+        // FIXME: this one seems to be generated a bit too often right now
+        // so we are temporarily commenting it before we have more clarity
+        // on which of the errors we absolutely need to report
+        //GlobalOnErrorHandler.callErrorHandler(e);
         logger.error("Data Channel Error:", error, dataChannel);
     };
 
@@ -2346,10 +3398,12 @@ DataChannels.prototype.onDataChannel = function (event) {
             obj = JSON.parse(data);
         }
         catch (e) {
+            GlobalOnErrorHandler.callErrorHandler(e);
             logger.error(
                 "Failed to parse data channel message as JSON: ",
                 data,
-                dataChannel);
+                dataChannel,
+                e);
         }
         if (('undefined' !== typeof(obj)) && (null !== obj)) {
             var colibriClass = obj.colibriClass;
@@ -2400,6 +3454,10 @@ DataChannels.prototype.onDataChannel = function (event) {
                     lastNEndpoints, endpointsEnteringLastN, obj);
                 self.eventEmitter.emit(RTCEvents.LASTN_ENDPOINT_CHANGED,
                     lastNEndpoints, endpointsEnteringLastN, obj);
+            } else if("EndpointMessage" === colibriClass) {
+                self.eventEmitter.emit(
+                    RTCEvents.ENDPOINT_MESSAGE_RECEIVED, obj.from,
+                    obj.msgPayload);
             }
             else {
                 logger.debug("Data channel JSON-formatted message: ", obj);
@@ -2421,22 +3479,49 @@ DataChannels.prototype.onDataChannel = function (event) {
     this._dataChannels.push(dataChannel);
 };
 
-DataChannels.prototype.handleSelectedEndpointEvent = function (userResource) {
-    this.lastSelectedEndpoint = userResource;
-    this._onXXXEndpointChanged("selected", userResource);
-}
+/**
+ * Closes all currently opened data channels.
+ */
+DataChannels.prototype.closeAllChannels = function () {
+    this._dataChannels.forEach(function (dc){
+        // the DC will be removed from the array on 'onclose' event
+        dc.close();
+    });
+};
 
-DataChannels.prototype.handlePinnedEndpointEvent = function (userResource) {
-    this._onXXXEndpointChanged("pinnned", userResource);
-}
+/**
+ * Sends a "selected endpoint changed" message via the data channel.
+ * @param endpointId {string} the id of the selected endpoint
+ * @throws NetworkError or InvalidStateError from RTCDataChannel#send (@see
+ * {@link https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/send})
+ * or Error with "No opened data channels found!" message.
+ */
+DataChannels.prototype.sendSelectedEndpointMessage = function (endpointId) {
+    this.selectedEndpoint = endpointId;
+    this._onXXXEndpointChanged("selected", endpointId);
+};
+
+/**
+ * Sends a "pinned endpoint changed" message via the data channel.
+ * @param endpointId {string} the id of the pinned endpoint
+ * @throws NetworkError or InvalidStateError from RTCDataChannel#send (@see
+ * {@link https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/send})
+ * or Error with "No opened data channels found!" message.
+ */
+DataChannels.prototype.sendPinnedEndpointMessage = function (endpointId) {
+    this._onXXXEndpointChanged("pinned", endpointId);
+};
 
 /**
  * Notifies Videobridge about a change in the value of a specific
- * endpoint-related property such as selected endpoint and pinnned endpoint.
+ * endpoint-related property such as selected endpoint and pinned endpoint.
  *
  * @param xxx the name of the endpoint-related property whose value changed
  * @param userResource the new value of the endpoint-related property after the
  * change
+ * @throws NetworkError or InvalidStateError from RTCDataChannel#send (@see
+ * {@link https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/send})
+ * or Error with "No opened data channels found!" message.
  */
 DataChannels.prototype._onXXXEndpointChanged = function (xxx, userResource) {
     // Derive the correct words from xxx such as selected and Selected, pinned
@@ -2445,35 +3530,22 @@ DataChannels.prototype._onXXXEndpointChanged = function (xxx, userResource) {
     var tail = xxx.substring(1);
     var lower = head.toLowerCase() + tail;
     var upper = head.toUpperCase() + tail;
+    logger.log(
+            'sending ' + lower
+                + ' endpoint changed notification to the bridge: ',
+            userResource);
+
+    var jsonObject = {};
+
+    jsonObject.colibriClass = (upper + 'EndpointChangedEvent');
+    jsonObject[lower + "Endpoint"]
+        = (userResource ? userResource : null);
+
+    this.send(jsonObject);
 
     // Notify Videobridge about the specified endpoint change.
-    console.log(lower + ' endpoint changed: ', userResource);
-    this._some(function (dataChannel) {
-        if (dataChannel.readyState == 'open') {
-            console.log(
-                    'sending ' + lower
-                        + ' endpoint changed notification to the bridge: ',
-                    userResource);
-
-            var jsonObject = {};
-
-            jsonObject.colibriClass = (upper + 'EndpointChangedEvent');
-            jsonObject[lower + "Endpoint"]
-                = (userResource ? userResource : null);
-            try {
-                dataChannel.send(JSON.stringify(jsonObject));
-            } catch (e) {
-                // FIXME: Maybe we should check if the conference is left
-                // before calling _onXXXEndpointChanged method.
-                // FIXME: We should check if we are disposing correctly the
-                // data channels.
-                logger.warn(e);
-            }
-
-            return true;
-        }
-    });
-}
+    logger.log(lower + ' endpoint changed: ', userResource);
+};
 
 DataChannels.prototype._some = function (callback, thisArg) {
     var dataChannels = this._dataChannels;
@@ -2486,13 +3558,48 @@ DataChannels.prototype._some = function (callback, thisArg) {
     } else {
         return false;
     }
+};
+
+/**
+ * Sends passed object via the first found open datachannel
+ * @param jsonObject {object} the object that will be sent
+ * @throws NetworkError or InvalidStateError from RTCDataChannel#send (@see
+ * {@link https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/send})
+ * or Error with "No opened data channels found!" message.
+ */
+DataChannels.prototype.send = function (jsonObject) {
+    if(!this._some(function (dataChannel) {
+        if (dataChannel.readyState == 'open') {
+                dataChannel.send(JSON.stringify(jsonObject));
+            return true;
+        }
+    })) {
+        throw new Error("No opened data channels found!");
+    }
+}
+
+/**
+ * Sends message via the datachannels.
+ * @param to {string} the id of the endpoint that should receive the message.
+ * If "" the message will be sent to all participants.
+ * @param payload {object} the payload of the message.
+ * @throws NetworkError or InvalidStateError from RTCDataChannel#send (@see
+ * {@link https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/send})
+ * or Error with "No opened data channels found!" message.
+ */
+DataChannels.prototype.sendDataChannelMessage = function (to, payload) {
+    this.send({
+        colibriClass: "EndpointMessage",
+        to: to,
+        msgPayload: payload
+    });
 }
 
 module.exports = DataChannels;
 
 }).call(this,"/modules/RTC/DataChannels.js")
 
-},{"../../service/RTC/RTCEvents":130,"jitsi-meet-logger":82}],14:[function(require,module,exports){
+},{"../../service/RTC/RTCEvents":148,"../util/GlobalOnErrorHandler":41,"jitsi-meet-logger":68}],18:[function(require,module,exports){
 (function (__filename){
 /* global __filename, Promise */
 var logger = require("jitsi-meet-logger").getLogger(__filename);
@@ -2500,8 +3607,12 @@ var JitsiTrack = require("./JitsiTrack");
 var RTCBrowserType = require("./RTCBrowserType");
 var JitsiTrackEvents = require('../../JitsiTrackEvents');
 var JitsiTrackErrors = require("../../JitsiTrackErrors");
+var JitsiTrackError = require("../../JitsiTrackError");
+var RTCEvents = require("../../service/RTC/RTCEvents");
 var RTCUtils = require("./RTCUtils");
+var MediaType = require('../../service/RTC/MediaType');
 var VideoType = require('../../service/RTC/VideoType');
+var CameraFacingMode = require('../../service/RTC/CameraFacingMode');
 
 /**
  * Represents a single media track(either audio or video).
@@ -2512,10 +3623,13 @@ var VideoType = require('../../service/RTC/VideoType');
  * @param videoType the VideoType of the JitsiRemoteTrack
  * @param resolution the video resoultion if it's a video track
  * @param deviceId the ID of the local device for this track
+ * @param facingMode the camera facing mode used in getUserMedia call
  * @constructor
  */
 function JitsiLocalTrack(stream, track, mediaType, videoType, resolution,
-                         deviceId) {
+                         deviceId, facingMode) {
+    var self = this;
+
     JitsiTrack.call(this,
         null /* RTC */, stream, track,
         function () {
@@ -2529,15 +3643,97 @@ function JitsiLocalTrack(stream, track, mediaType, videoType, resolution,
     this.resolution = resolution;
     this.deviceId = deviceId;
     this.startMuted = false;
-    this.disposed = false;
-    //FIXME: This dependacy is not necessary.
-    this.conference = null;
     this.initialMSID = this.getMSID();
     this.inMuteOrUnmuteProgress = false;
+
+    /**
+     * The facing mode of the camera from which this JitsiLocalTrack instance
+     * was obtained.
+     */
+    this._facingMode = facingMode;
+
+    // Currently there is no way to know the MediaStreamTrack ended due to to
+    // device disconnect in Firefox through e.g. "readyState" property. Instead
+    // we will compare current track's label with device labels from
+    // enumerateDevices() list.
+    this._trackEnded = false;
+
+    /**
+     * The value of bytes sent received from the statistics module.
+     */
+    this._bytesSent = null;
+
+    /**
+     * Used only for detection of audio problems. We want to check only once
+     * whether the track is sending bytes ot not. This flag is set to false
+     * after the check.
+     */
+    this._testByteSent = true;
+
+    // Currently there is no way to determine with what device track was
+    // created (until getConstraints() support), however we can associate tracks
+    // with real devices obtained from enumerateDevices() call as soon as it's
+    // called.
+    this._realDeviceId = this.deviceId === '' ? undefined : this.deviceId;
+
+    this._onDeviceListChanged = function (devices) {
+        self._setRealDeviceIdFromDeviceList(devices);
+
+        // Mark track as ended for those browsers that do not support
+        // "readyState" property. We do not touch tracks created with default
+        // device ID "".
+        if (typeof self.getTrack().readyState === 'undefined'
+            && typeof self._realDeviceId !== 'undefined'
+            && !devices.find(function (d) {
+                return d.deviceId === self._realDeviceId;
+            })) {
+            self._trackEnded = true;
+        }
+    };
+
+    // Subscribe each created local audio track to
+    // RTCEvents.AUDIO_OUTPUT_DEVICE_CHANGED event. This is different from
+    // handling this event for remote tracks (which are handled in RTC.js),
+    // because there might be local tracks not attached to a conference.
+    if (this.isAudioTrack() && RTCUtils.isDeviceChangeAvailable('output')) {
+        this._onAudioOutputDeviceChanged = this.setAudioOutput.bind(this);
+
+        RTCUtils.addListener(RTCEvents.AUDIO_OUTPUT_DEVICE_CHANGED,
+            this._onAudioOutputDeviceChanged);
+    }
+
+    RTCUtils.addListener(RTCEvents.DEVICE_LIST_CHANGED,
+        this._onDeviceListChanged);
 }
 
 JitsiLocalTrack.prototype = Object.create(JitsiTrack.prototype);
 JitsiLocalTrack.prototype.constructor = JitsiLocalTrack;
+
+/**
+ * Returns if associated MediaStreamTrack is in the 'ended' state
+ * @returns {boolean}
+ */
+JitsiLocalTrack.prototype.isEnded = function () {
+    return  this.getTrack().readyState === 'ended' || this._trackEnded;
+};
+
+/**
+ * Sets real device ID by comparing track information with device information.
+ * This is temporary solution until getConstraints() method will be implemented
+ * in browsers.
+ * @param {MediaDeviceInfo[]} devices - list of devices obtained from
+ *  enumerateDevices() call
+ */
+JitsiLocalTrack.prototype._setRealDeviceIdFromDeviceList = function (devices) {
+    var track = this.getTrack(),
+        device = devices.find(function (d) {
+            return d.kind === track.kind + 'input' && d.label === track.label;
+        });
+
+    if (device) {
+        this._realDeviceId = device.deviceId;
+    }
+};
 
 /**
  * Mutes the track. Will reject the Promise if there is mute/unmute operation
@@ -2559,155 +3755,209 @@ JitsiLocalTrack.prototype.unmute = function () {
 
 /**
  * Creates Promise for mute/unmute operation.
- * @param track the track that will be muted/unmuted
- * @param mute whether to mute or unmute the track
+ *
+ * @param {JitsiLocalTrack} track - The track that will be muted/unmuted.
+ * @param {boolean} mute - Whether to mute or unmute the track.
+ * @returns {Promise}
  */
-function createMuteUnmutePromise(track, mute)
-{
-    return new Promise(function (resolve, reject) {
+function createMuteUnmutePromise(track, mute) {
+    if (track.inMuteOrUnmuteProgress) {
+        return Promise.reject(
+            new JitsiTrackError(JitsiTrackErrors.TRACK_MUTE_UNMUTE_IN_PROGRESS)
+        );
+    }
 
-        if(this.inMuteOrUnmuteProgress) {
-            reject(new Error(JitsiTrackErrors.TRACK_MUTE_UNMUTE_IN_PROGRESS));
-            return;
-        }
-        this.inMuteOrUnmuteProgress = true;
+    track.inMuteOrUnmuteProgress = true;
 
-        this._setMute(mute,
-            function(){
-                this.inMuteOrUnmuteProgress = false;
-                resolve();
-            }.bind(this),
-            function(status){
-                this.inMuteOrUnmuteProgress = false;
-                reject(status);
-            }.bind(this));
-    }.bind(track));
+    return track._setMute(mute)
+        .then(function() {
+            track.inMuteOrUnmuteProgress = false;
+        })
+        .catch(function(status) {
+            track.inMuteOrUnmuteProgress = false;
+            throw status;
+        });
 }
 
 /**
  * Mutes / unmutes the track.
- * @param mute {boolean} if true the track will be muted. Otherwise the track
+ *
+ * @param {boolean} mute - If true the track will be muted. Otherwise the track
  * will be unmuted.
+ * @private
+ * @returns {Promise}
  */
-JitsiLocalTrack.prototype._setMute = function (mute, resolve, reject) {
+JitsiLocalTrack.prototype._setMute = function (mute) {
     if (this.isMuted() === mute) {
-        resolve();
-        return;
+        return Promise.resolve();
     }
-    if(!this.rtc) {
+
+    var promise = Promise.resolve();
+    var self = this;
+
+    // Local track can be used out of conference, so we need to handle that
+    // case and mark that track should start muted or not when added to
+    // conference.
+    if(!this.conference || !this.conference.room) {
         this.startMuted = mute;
-        resolve();
-        return;
     }
-    var isAudio = this.isAudioTrack();
+
     this.dontFireRemoveEvent = false;
 
-    var setStreamToNull = false;
-    // the callback that will notify that operation had finished
-    var callbackFunction = function() {
-
-        if(setStreamToNull)
-            this.stream = null;
-        this.eventEmitter.emit(JitsiTrackEvents.TRACK_MUTE_CHANGED);
-
-        resolve();
-    }.bind(this);
-
-    if ((window.location.protocol != "https:") ||
-        (isAudio) || this.videoType === VideoType.DESKTOP ||
-        // FIXME FF does not support 'removeStream' method used to mute
+    // FIXME FF does not support 'removeStream' method used to mute
+    if (window.location.protocol !== "https:" ||
+        this.isAudioTrack() ||
+        this.videoType === VideoType.DESKTOP ||
         RTCBrowserType.isFirefox()) {
-
-        if (this.track)
+        if(this.track)
             this.track.enabled = !mute;
-        if(isAudio)
-            this.rtc.room.setAudioMute(mute, callbackFunction);
-        else
-            this.rtc.room.setVideoMute(mute, callbackFunction);
     } else {
-        if (mute) {
+        if(mute) {
             this.dontFireRemoveEvent = true;
-            this.rtc.room.removeStream(this.stream, function () {},
-                {mtype: this.type, type: "mute", ssrc: this.ssrc});
-            RTCUtils.stopMediaStream(this.stream);
-            setStreamToNull = true;
-            if(isAudio)
-                this.rtc.room.setAudioMute(mute, callbackFunction);
-            else
-                this.rtc.room.setVideoMute(mute, callbackFunction);
-            //FIXME: Maybe here we should set the SRC for the containers to something
+
+            promise = this._removeStreamFromConferenceAsMute()
+                .then(function() {
+                    //FIXME: Maybe here we should set the SRC for the containers
+                    // to something
+                    RTCUtils.stopMediaStream(self.stream);
+                    self._setStream(null);
+                });
         } else {
-            var self = this;
-            // FIXME why are we doing all this audio type checks and
-            // convoluted scenarios if we're going this way only
-            // for VIDEO media and CAMERA type of video ?
+            // This path is only for camera.
             var streamOptions = {
-                devices: (isAudio ? ["audio"] : ["video"]),
-                resolution: self.resolution
+                cameraDeviceId: this.getDeviceId(),
+                devices: [ MediaType.VIDEO ],
+                facingMode: this.getCameraFacingMode(),
+                resolution: this.resolution
             };
-            if (isAudio) {
-                streamOptions['micDeviceId'] = self.deviceId;
-            } else if(self.videoType === VideoType.CAMERA) {
-                streamOptions['cameraDeviceId'] = self.deviceId;
-            }
-            RTCUtils.obtainAudioAndVideoPermissions(streamOptions)
+
+            promise = RTCUtils.obtainAudioAndVideoPermissions(streamOptions)
                 .then(function (streamsInfo) {
-                    var streamInfo = null;
-                    for(var i = 0; i < streamsInfo.length; i++) {
-                        if(streamsInfo[i].mediaType === self.getType()) {
-                            streamInfo = streamsInfo[i];
-                            self.stream = streamInfo.stream;
-                            self.track = streamInfo.track;
-                            // This is not good when video type changes after
-                            // unmute, but let's not crash here
-                            if (self.videoType != streamInfo.videoType) {
-                                logger.error(
-                                    "Video type has changed after unmute!",
-                                    self.videoType, streamInfo.videoType);
-                                self.videoType = streamInfo.videoType;
-                            }
-                            break;
+                    var mediaType = self.getType();
+                    var streamInfo = streamsInfo.find(function(info) {
+                        return info.mediaType === mediaType;
+                    });
+
+                    if(!streamInfo) {
+                        throw new JitsiTrackError(
+                            JitsiTrackErrors.TRACK_NO_STREAM_FOUND);
+                    }else {
+                        self._setStream(streamInfo.stream);
+                        self.track = streamInfo.track;
+                        // This is not good when video type changes after
+                        // unmute, but let's not crash here
+                        if (self.videoType !== streamInfo.videoType) {
+                            logger.warn(
+                                "Video type has changed after unmute!",
+                                self.videoType, streamInfo.videoType);
+                            self.videoType = streamInfo.videoType;
                         }
                     }
 
-                    if(!streamInfo) {
-                        reject(new Error('track.no_stream_found'));
-                        return;
-                    }
+                    self.containers = self.containers.map(function(cont) {
+                        return RTCUtils.attachMediaStream(cont, self.stream);
+                    });
 
-                    for(var i = 0; i < self.containers.length; i++)
-                    {
-                        self.containers[i]
-                            = RTCUtils.attachMediaStream(
-                                    self.containers[i], self.stream);
-                    }
-
-                    self.rtc.room.addStream(self.stream,
-                        function () {
-                            if(isAudio)
-                                self.rtc.room.setAudioMute(
-                                    mute, callbackFunction);
-                            else
-                                self.rtc.room.setVideoMute(
-                                    mute, callbackFunction);
-                        }, {
-                            mtype: self.type,
-                            type: "unmute",
-                            ssrc: self.ssrc,
-                            msid: self.getMSID()});
-                }).catch(function (error) {
-                    reject(error);
+                   return self._addStreamToConferenceAsUnmute();
                 });
         }
     }
+
+    return promise
+        .then(function() {
+            return self._sendMuteStatus(mute);
+        })
+        .then(function() {
+            self.eventEmitter.emit(JitsiTrackEvents.TRACK_MUTE_CHANGED);
+        });
 };
 
 /**
+ * Adds stream to conference and marks it as "unmute" operation.
+ *
+ * @private
+ * @returns {Promise}
+ */
+JitsiLocalTrack.prototype._addStreamToConferenceAsUnmute = function () {
+    if (!this.conference || !this.conference.room) {
+        return Promise.resolve();
+    }
+
+    var self = this;
+
+    return new Promise(function(resolve, reject) {
+        self.conference.room.addStream(
+            self.stream,
+            resolve,
+            reject,
+            {
+                mtype: self.type,
+                type: "unmute",
+                ssrc: self.ssrc,
+                msid: self.getMSID()
+            });
+    });
+};
+
+/**
+ * Removes stream from conference and marks it as "mute" operation.
+ *
+ * @private
+ * @returns {Promise}
+ */
+JitsiLocalTrack.prototype._removeStreamFromConferenceAsMute = function () {
+    if (!this.conference || !this.conference.room) {
+        return Promise.resolve();
+    }
+
+    var self = this;
+
+    return new Promise(function(resolve, reject) {
+        self.conference.room.removeStream(
+            self.stream,
+            resolve,
+            reject,
+            {
+                mtype: self.type,
+                type: "mute",
+                ssrc: self.ssrc
+            });
+    });
+};
+
+/**
+ * Sends mute status for a track to conference if any.
+ *
+ * @param {boolean} mute - If track is muted.
+ * @private
+ * @returns {Promise}
+ */
+JitsiLocalTrack.prototype._sendMuteStatus = function(mute) {
+    if (!this.conference || !this.conference.room) {
+        return Promise.resolve();
+    }
+
+    var self = this;
+
+    return new Promise(function(resolve) {
+        self.conference.room[
+            self.isAudioTrack()
+                ? 'setAudioMute'
+                : 'setVideoMute'](mute, resolve);
+    });
+};
+
+/**
+ * @inheritdoc
+ *
  * Stops sending the media track. And removes it from the HTML.
  * NOTE: Works for local tracks only.
+ *
+ * @extends JitsiTrack#dispose
  * @returns {Promise}
  */
 JitsiLocalTrack.prototype.dispose = function () {
+    var self = this;
     var promise = Promise.resolve();
 
     if (this.conference){
@@ -2718,9 +3968,19 @@ JitsiLocalTrack.prototype.dispose = function () {
         RTCUtils.stopMediaStream(this.stream);
         this.detach();
     }
-    this.disposed = true;
 
-    return promise;
+    RTCUtils.removeListener(RTCEvents.DEVICE_LIST_CHANGED,
+        this._onDeviceListChanged);
+
+    if (this._onAudioOutputDeviceChanged) {
+        RTCUtils.removeListener(RTCEvents.AUDIO_OUTPUT_DEVICE_CHANGED,
+            this._onAudioOutputDeviceChanged);
+    }
+
+    return promise
+        .then(function() {
+            return JitsiTrack.prototype.dispose.call(self); // super.dispose();
+        });
 };
 
 /**
@@ -2741,22 +4001,6 @@ JitsiLocalTrack.prototype.isMuted = function () {
 };
 
 /**
- * Private method. Updates rtc property of the track.
- * @param rtc the rtc instance.
- */
-JitsiLocalTrack.prototype._setRTC = function (rtc) {
-    this.rtc = rtc;
-    // We want to keep up with postponed events which should have been fired
-    // on "attach" call, but for local track we not always have the conference
-    // before attaching. However this may result in duplicated events if they
-    // have been triggered on "attach" already.
-    for(var i = 0; i < this.containers.length; i++)
-    {
-        this._maybeFireTrackAttached(this.containers[i]);
-    }
-};
-
-/**
  * Updates the SSRC associated with the MediaStream in JitsiLocalTrack object.
  * @ssrc the new ssrc
  */
@@ -2765,7 +4009,6 @@ JitsiLocalTrack.prototype._setSSRC = function (ssrc) {
 };
 
 
-//FIXME: This dependacy is not necessary. This is quick fix.
 /**
  * Sets the JitsiConference object associated with the track. This is temp
  * solution.
@@ -2773,6 +4016,15 @@ JitsiLocalTrack.prototype._setSSRC = function (ssrc) {
  */
 JitsiLocalTrack.prototype._setConference = function(conference) {
     this.conference = conference;
+
+    // We want to keep up with postponed events which should have been fired
+    // on "attach" call, but for local track we not always have the conference
+    // before attaching. However this may result in duplicated events if they
+    // have been triggered on "attach" already.
+    for(var i = 0; i < this.containers.length; i++)
+    {
+        this._maybeFireTrackAttached(this.containers[i]);
+    }
 };
 
 /**
@@ -2792,19 +4044,94 @@ JitsiLocalTrack.prototype.getSSRC = function () {
 };
 
 /**
- * Return true;
+ * Returns <tt>true</tt>.
+ * @returns {boolean} <tt>true</tt>
  */
 JitsiLocalTrack.prototype.isLocal = function () {
     return true;
 };
 
+/**
+ * Returns device id associated with track.
+ * @returns {string}
+ */
+JitsiLocalTrack.prototype.getDeviceId = function () {
+    return this._realDeviceId || this.deviceId;
+};
+
+/**
+ * Sets the value of bytes sent statistic.
+ * @param bytesSent {intiger} the new value
+ * NOTE: used only for audio tracks to detect audio issues.
+ */
+JitsiLocalTrack.prototype._setByteSent = function (bytesSent) {
+    this._bytesSent = bytesSent;
+    if(this._testByteSent) {
+        setTimeout(function () {
+            if(this._bytesSent <= 0){
+                //we are not receiving anything from the microphone
+                this.eventEmitter.emit(JitsiTrackEvents.TRACK_AUDIO_NOT_WORKING);
+            }
+        }.bind(this), 3000);
+        this._testByteSent = false;
+    }
+}
+
+/**
+ * Returns facing mode for video track from camera. For other cases (e.g. audio
+ * track or 'desktop' video track) returns undefined.
+ *
+ * @returns {CameraFacingMode|undefined}
+ */
+JitsiLocalTrack.prototype.getCameraFacingMode = function () {
+    if (this.isVideoTrack() && this.videoType === VideoType.CAMERA) {
+        // MediaStreamTrack#getSettings() is not implemented in many browsers,
+        // so we need feature checking here. Progress on the respective
+        // browser's implementation can be tracked at
+        // https://bugs.chromium.org/p/webrtc/issues/detail?id=2481 for Chromium
+        // and https://bugzilla.mozilla.org/show_bug.cgi?id=1213517 for Firefox.
+        // Even if a browser implements getSettings() already, it might still
+        // not return anything for 'facingMode'.
+        var trackSettings;
+
+        try {
+            trackSettings = this.track.getSettings();
+        } catch (e) {
+            // XXX React-native-webrtc, for example, defines
+            // MediaStreamTrack#getSettings() but the implementation throws a
+            // "Not implemented" Error.
+        }
+        if (trackSettings && 'facingMode' in trackSettings) {
+            return trackSettings.facingMode;
+        }
+
+        if (typeof this._facingMode !== 'undefined') {
+            return this._facingMode;
+        }
+
+        // In most cases we are showing a webcam. So if we've gotten here, it
+        // should be relatively safe to assume that we are probably showing
+        // the user-facing camera.
+        return CameraFacingMode.USER;
+    }
+
+    return undefined;
+};
+
+
 module.exports = JitsiLocalTrack;
 
 }).call(this,"/modules/RTC/JitsiLocalTrack.js")
 
-},{"../../JitsiTrackErrors":10,"../../JitsiTrackEvents":11,"../../service/RTC/VideoType":132,"./JitsiTrack":16,"./RTCBrowserType":18,"./RTCUtils":20,"jitsi-meet-logger":82}],15:[function(require,module,exports){
+},{"../../JitsiTrackError":13,"../../JitsiTrackErrors":14,"../../JitsiTrackEvents":15,"../../service/RTC/CameraFacingMode":146,"../../service/RTC/MediaType":147,"../../service/RTC/RTCEvents":148,"../../service/RTC/VideoType":150,"./JitsiTrack":20,"./RTCBrowserType":22,"./RTCUtils":24,"jitsi-meet-logger":68}],19:[function(require,module,exports){
 var JitsiTrack = require("./JitsiTrack");
 var JitsiTrackEvents = require("../../JitsiTrackEvents");
+var RTCBrowserType = require("./RTCBrowserType");
+var Statistics = require("../statistics/statistics");
+var AdapterJS = require("./adapter.screenshare");
+
+var ttfmTrackerAudioAttached = false;
+var ttfmTrackerVideoAttached = false;
 
 /**
  * Represents a single media track (either audio or video).
@@ -2818,13 +4145,17 @@ var JitsiTrackEvents = require("../../JitsiTrackEvents");
  * @param muted intial muted state of the JitsiRemoteTrack
  * @constructor
  */
-function JitsiRemoteTrack(RTC, ownerJid, stream, track, mediaType, videoType,
-                          ssrc, muted) {    
+function JitsiRemoteTrack(conference, ownerJid, stream, track, mediaType, videoType,
+                          ssrc, muted) {
     JitsiTrack.call(
-        this, RTC, stream, track, function () {}, mediaType, videoType, ssrc);
-    this.rtc = RTC;
+        this, conference, stream, track, function () {}, mediaType, videoType, ssrc);
+    this.conference = conference;
     this.peerjid = ownerJid;
     this.muted = muted;
+    // we want to mark whether the track has been ever muted
+    // to detect ttfm events for startmuted conferences, as it can significantly
+    // increase ttfm values
+    this.hasBeenMuted = muted;
 }
 
 JitsiRemoteTrack.prototype = Object.create(JitsiTrack.prototype);
@@ -2835,9 +4166,11 @@ JitsiRemoteTrack.prototype.constructor = JitsiRemoteTrack;
  * @param value the muted status.
  */
 JitsiRemoteTrack.prototype.setMute = function (value) {
-
     if(this.muted === value)
         return;
+
+    if(value)
+        this.hasBeenMuted = true;
 
     // we can have a fake video stream
     if(this.stream)
@@ -2872,7 +4205,8 @@ JitsiRemoteTrack.prototype.isLocal = function () {
 };
 
 /**
- * Return false;
+ * Returns the synchronization source identifier (SSRC) of this remote track.
+ * @returns {string} the SSRC of this remote track
  */
 JitsiRemoteTrack.prototype.getSSRC = function () {
     return this.ssrc;
@@ -2889,11 +4223,56 @@ JitsiRemoteTrack.prototype._setVideoType = function (type) {
     this.eventEmitter.emit(JitsiTrackEvents.TRACK_VIDEOTYPE_CHANGED, type);
 };
 
-delete JitsiRemoteTrack.prototype.dispose;
+JitsiRemoteTrack.prototype._playCallback = function () {
+    var type = (this.isVideoTrack() ? 'video' : 'audio');
+
+    var now = window.performance.now();
+    console.log("(TIME) Render " + type + ":\t", now);
+    this.conference.getConnectionTimes()[type + ".render"] = now;
+
+    var ttfm = now
+        - (this.conference.getConnectionTimes()["session.initiate"]
+        - this.conference.getConnectionTimes()["muc.joined"])
+        - (window.connectionTimes["obtainPermissions.end"]
+        - window.connectionTimes["obtainPermissions.start"]);
+    this.conference.getConnectionTimes()[type + ".ttfm"] = ttfm;
+    console.log("(TIME) TTFM " + type + ":\t", ttfm);
+    var eventName = type +'.ttfm';
+    if(this.hasBeenMuted)
+        eventName += '.muted';
+    Statistics.analytics.sendEvent(eventName, ttfm);
+};
+
+/**
+ * Attach time to first media tracker only if there is conference and only
+ * for the first element.
+ * @param container the HTML container which can be 'video' or 'audio' element.
+ *        It can also be 'object' element if Temasys plugin is in use and this
+ *        method has been called previously on video or audio HTML element.
+ * @private
+ */
+JitsiRemoteTrack.prototype._attachTTFMTracker = function (container) {
+    if((ttfmTrackerAudioAttached && this.isAudioTrack())
+        || (ttfmTrackerVideoAttached && this.isVideoTrack()))
+        return;
+
+    if (this.isAudioTrack())
+        ttfmTrackerAudioAttached = true;
+    if (this.isVideoTrack())
+        ttfmTrackerVideoAttached = true;
+
+    if (RTCBrowserType.isTemasysPluginUsed()) {
+        // FIXME: this is not working for IE11
+        AdapterJS.addEvent(container, 'play', this._playCallback.bind(this));
+    }
+    else {
+        container.addEventListener("canplay", this._playCallback.bind(this));
+    }
+};
 
 module.exports = JitsiRemoteTrack;
 
-},{"../../JitsiTrackEvents":11,"./JitsiTrack":16}],16:[function(require,module,exports){
+},{"../../JitsiTrackEvents":15,"../statistics/statistics":32,"./JitsiTrack":20,"./RTCBrowserType":22,"./adapter.screenshare":26}],20:[function(require,module,exports){
 (function (__filename){
 /* global __filename, module */
 var logger = require("jitsi-meet-logger").getLogger(__filename);
@@ -2951,7 +4330,7 @@ function addMediaStreamInactiveHandler(mediaStream, handler) {
  * @param videoType the VideoType for this track if any
  * @param ssrc the SSRC of this track if known
  */
-function JitsiTrack(rtc, stream, track, streamInactiveHandler, trackMediaType,
+function JitsiTrack(conference, stream, track, streamInactiveHandler, trackMediaType,
                     videoType, ssrc)
 {
     /**
@@ -2959,7 +4338,7 @@ function JitsiTrack(rtc, stream, track, streamInactiveHandler, trackMediaType,
      * @type {Array}
      */
     this.containers = [];
-    this.rtc = rtc;
+    this.conference = conference;
     this.stream = stream;
     this.ssrc = ssrc;
     this.eventEmitter = new EventEmitter();
@@ -2967,14 +4346,48 @@ function JitsiTrack(rtc, stream, track, streamInactiveHandler, trackMediaType,
     this.type = trackMediaType;
     this.track = track;
     this.videoType = videoType;
-    if(stream) {
-        if (RTCBrowserType.isFirefox()) {
-            implementOnEndedHandling(this);
-        }
-        addMediaStreamInactiveHandler(stream, streamInactiveHandler);
-    }
+    this.handlers = {};
 
-    RTCUtils.addListener(RTCEvents.AUDIO_OUTPUT_DEVICE_CHANGED, this.setAudioOutput.bind(this));
+    /**
+     * Indicates whether this JitsiTrack has been disposed. If true, this
+     * JitsiTrack is to be considered unusable and operations involving it are
+     * to fail (e.g. {@link JitsiConference#addTrack(JitsiTrack)},
+     * {@link JitsiConference#removeTrack(JitsiTrack)}).
+     * @type {boolean}
+     */
+    this.disposed = false;
+    this._setHandler("inactive", streamInactiveHandler);
+}
+
+/**
+ * Sets handler to the WebRTC MediaStream or MediaStreamTrack object depending
+ * on the passed type.
+ * @param {string} type the type of the handler that is going to be set
+ * @param {Function} handler the handler.
+ */
+JitsiTrack.prototype._setHandler = function (type, handler) {
+    if(this.stream) {
+        if(type === "inactive") {
+            if (RTCBrowserType.isFirefox()) {
+                implementOnEndedHandling(this);
+            }
+            addMediaStreamInactiveHandler(this.stream, handler);
+        }
+    }
+    this.handlers[type] = handler;
+}
+
+/**
+ * Sets the stream property of JitsiTrack object and sets all stored handlers
+ * to it.
+ * @param {MediaStream} stream the new stream.
+ */
+JitsiTrack.prototype._setStream = function (stream) {
+    this.stream = stream;
+    Object.keys(this.handlers).forEach(function (type) {
+        typeof(this.handlers[type]) === "function" &&
+            this._setHandler(type, this.handlers[type]);
+    }, this);
 }
 
 /**
@@ -3049,8 +4462,8 @@ JitsiTrack.prototype.getUsageLabel = function () {
  * @private
  */
 JitsiTrack.prototype._maybeFireTrackAttached = function (container) {
-    if (this.rtc && container) {
-        this.rtc.eventEmitter.emit(RTCEvents.TRACK_ATTACHED, this, container);
+    if (this.conference && container) {
+        this.conference._onTrackAttach(this, container);
     }
 };
 
@@ -3079,53 +4492,70 @@ JitsiTrack.prototype.attach = function (container) {
             !containerSel.is(':visible')) {
             containerSel.show();
         }
-        container
-            = RTCUtils.attachMediaStream(container, this.stream);
+        container = RTCUtils.attachMediaStream(container, this.stream);
     }
     this.containers.push(container);
 
     this._maybeFireTrackAttached(container);
 
+    this._attachTTFMTracker(container);
+
     return container;
 };
 
 /**
- * Removes the track from the passed HTML container.
- * @param container the HTML container. If <tt>null</tt> all containers are removed.
- *        A container can be 'video', 'audio' or 'object' HTML element instance
- *        to which this JitsiTrack is currently attached to.
+ * Removes this JitsiTrack from the passed HTML container.
+ *
+ * @param container the HTML container to detach from this JitsiTrack. If
+ * <tt>null</tt> or <tt>undefined</tt>, all containers are removed. A container
+ * can be a 'video', 'audio' or 'object' HTML element instance to which this
+ * JitsiTrack is currently attached.
  */
 JitsiTrack.prototype.detach = function (container) {
-    for(var i = 0; i < this.containers.length; i++)
-    {
-        if(!container)
-        {
-            RTCUtils.setVideoSrc(this.containers[i], null);
+    for (var cs = this.containers, i = cs.length - 1; i >= 0; --i) {
+        var c = cs[i];
+        if (!container) {
+            RTCUtils.attachMediaStream(c, null);
         }
-        if(!container || $(this.containers[i]).is($(container)))
-        {
-            this.containers.splice(i,1);
+        if (!container || c === container) {
+            cs.splice(i, 1);
         }
     }
 
-    if(container) {
-        RTCUtils.setVideoSrc(container, null);
+    if (container) {
+        RTCUtils.attachMediaStream(container, null);
     }
 };
 
 /**
- * Dispose sending the media track. And removes it from the HTML.
- * NOTE: Works for local tracks only.
+ * Attach time to first media tracker only if there is conference and only
+ * for the first element.
+ * @param container the HTML container which can be 'video' or 'audio' element.
+ *        It can also be 'object' element if Temasys plugin is in use and this
+ *        method has been called previously on video or audio HTML element.
+ * @private
+ */
+JitsiTrack.prototype._attachTTFMTracker = function (container) {
+};
+
+/**
+ * Removes attached event listeners.
+ *
+ * @returns {Promise}
  */
 JitsiTrack.prototype.dispose = function () {
+    this.eventEmitter.removeAllListeners();
+
+    this.disposed = true;
+
+    return Promise.resolve();
 };
 
 /**
  * Returns true if this is a video track and the source of the video is a
  * screen capture as opposed to a camera.
  */
-JitsiTrack.prototype.isScreenSharing = function(){
-
+JitsiTrack.prototype.isScreenSharing = function() {
 };
 
 /**
@@ -3155,7 +4585,7 @@ JitsiTrack.prototype.getId = function () {
  * @returns {boolean} whether MediaStream is active.
  */
 JitsiTrack.prototype.isActive = function () {
-    if((typeof this.stream.active !== "undefined"))
+    if(typeof this.stream.active !== "undefined")
         return this.stream.active;
     else
         return true;
@@ -3185,7 +4615,6 @@ JitsiTrack.prototype.off = function (eventId, handler) {
 // Common aliases for event emitter
 JitsiTrack.prototype.addEventListener = JitsiTrack.prototype.on;
 JitsiTrack.prototype.removeEventListener = JitsiTrack.prototype.off;
-
 
 /**
  * Sets the audio level for the stream
@@ -3234,10 +4663,11 @@ JitsiTrack.prototype.setAudioOutput = function (audioOutputDeviceId) {
     return Promise.all(this.containers.map(function(element) {
         return element.setSinkId(audioOutputDeviceId)
             .catch(function (error) {
-                logger.error('Failed to change audio output device on element',
+                logger.warn(
+                    'Failed to change audio output device on element. Default' +
+                    ' or previously set audio output device will be used.',
                     element, error);
-
-                    throw error;
+                throw error;
             });
     }))
     .then(function () {
@@ -3250,7 +4680,7 @@ module.exports = JitsiTrack;
 
 }).call(this,"/modules/RTC/JitsiTrack.js")
 
-},{"../../JitsiTrackEvents":11,"../../service/RTC/MediaType":129,"../../service/RTC/RTCEvents":130,"./RTCBrowserType":18,"./RTCUtils":20,"events":54,"jitsi-meet-logger":82}],17:[function(require,module,exports){
+},{"../../JitsiTrackEvents":15,"../../service/RTC/MediaType":147,"../../service/RTC/RTCEvents":148,"./RTCBrowserType":22,"./RTCUtils":24,"events":63,"jitsi-meet-logger":68}],21:[function(require,module,exports){
 (function (__filename){
 /* global __filename, APP, module */
 var logger = require("jitsi-meet-logger").getLogger(__filename);
@@ -3264,29 +4694,33 @@ var DataChannels = require("./DataChannels");
 var JitsiRemoteTrack = require("./JitsiRemoteTrack.js");
 var MediaType = require("../../service/RTC/MediaType");
 var VideoType = require("../../service/RTC/VideoType");
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 
 function createLocalTracks(tracksInfo, options) {
     var newTracks = [];
     var deviceId = null;
     tracksInfo.forEach(function(trackInfo){
         if (trackInfo.mediaType === MediaType.AUDIO) {
-          deviceId = options.micDeviceId;
+            deviceId = options.micDeviceId;
         } else if (trackInfo.videoType === VideoType.CAMERA){
-          deviceId = options.cameraDeviceId;
+            deviceId = options.cameraDeviceId;
         }
         var localTrack
             = new JitsiLocalTrack(
                 trackInfo.stream,
                 trackInfo.track,
                 trackInfo.mediaType,
-                trackInfo.videoType, trackInfo.resolution, deviceId);
+                trackInfo.videoType,
+                trackInfo.resolution,
+                deviceId,
+                options.facingMode);
         newTracks.push(localTrack);
     });
     return newTracks;
 }
 
-function RTC(room, options) {
-    this.room = room;
+function RTC(conference, options) {
+    this.conference = conference;
     this.localTracks = [];
     //FIXME: We should support multiple streams per jid.
     this.remoteTracks = {};
@@ -3295,35 +4729,20 @@ function RTC(room, options) {
     this.eventEmitter = new EventEmitter();
     var self = this;
     this.options = options || {};
-    room.addPresenceListener("videomuted", function (values, from) {
-        var videoTrack = self.getRemoteVideoTrack(from);
-        // If there is no video track, but we receive it is muted,
-        // we need to create a dummy track which we will mute, so we can
-        // notify interested about the muting
-        if (!videoTrack) {
-            videoTrack = self.createRemoteTrack({
-                    owner: room.roomjid + "/" + from,
-                    videoType: VideoType.CAMERA,
-                    mediaType: MediaType.VIDEO
-                },
-                null, null);
-            self.eventEmitter
-                .emit(RTCEvents.FAKE_VIDEO_TRACK_CREATED, videoTrack);
-        }
-        videoTrack.setMute(values.value == "true");
-    });
-    room.addPresenceListener("audiomuted", function (values, from) {
-        var audioTrack = self.getRemoteAudioTrack(from);
-        if (audioTrack) {
-            audioTrack.setMute(values.value == "true");
-        }
-    });
-    room.addPresenceListener("videoType", function(data, from) {
-        var videoTrack = self.getRemoteVideoTrack(from);
-        if (videoTrack) {
-            videoTrack._setVideoType(data.value);
-        }
-    });
+
+    // Switch audio output device on all remote audio tracks. Local audio tracks
+    // handle this event by themselves.
+    if (RTCUtils.isDeviceChangeAvailable('output')) {
+        RTCUtils.addListener(RTCEvents.AUDIO_OUTPUT_DEVICE_CHANGED,
+            function (deviceId) {
+                for (var key in self.remoteTracks) {
+                    if (self.remoteTracks.hasOwnProperty(key)
+                        && self.remoteTracks[key].audio) {
+                        self.remoteTracks[key].audio.setAudioOutput(deviceId);
+                    }
+                }
+            });
+    }
 }
 
 /**
@@ -3352,47 +4771,36 @@ RTC.prototype.onIncommingCall = function(event) {
     if(this.options.config.openSctp)
         this.dataChannels = new DataChannels(event.peerconnection,
             this.eventEmitter);
-    // Add local Tracks to the ChatRoom
-    this.localTracks.forEach(function(localTrack) {
-        var ssrcInfo = null;
-        if(localTrack.isVideoTrack() && localTrack.isMuted()) {
-            /**
-             * Handles issues when the stream is added before the peerconnection
-             * is created. The peerconnection is created when second participant
-             * enters the call. In that use case the track doesn't have
-             * information about it's ssrcs and no jingle packets are sent. That
-             * can cause inconsistent behavior later.
-             *
-             * For example:
-             * If we mute the stream and than second participant enter it's
-             * remote SDP won't include that track. On unmute we are not sending
-             * any jingle packets which will brake the unmute.
-             *
-             * In order to solve issues like the above one here we have to
-             * generate the ssrc information for the track .
-             */
-            localTrack._setSSRC(
-                this.room.generateNewStreamSSRCInfo());
-            ssrcInfo = {
-                mtype: localTrack.getType(),
-                type: "addMuted",
-                ssrc: localTrack.ssrc,
-                msid: localTrack.initialMSID
-            };
-        }
-        this.room.addStream(
-            localTrack.getOriginalStream(), function () {}, ssrcInfo, true);
-    }.bind(this));
 };
 
-RTC.prototype.selectedEndpoint = function (id) {
-    if(this.dataChannels)
-        this.dataChannels.handleSelectedEndpointEvent(id);
+/**
+ * Elects the participant with the given id to be the pinned participant in
+ * order to always receive video for this participant (even when last n is
+ * enabled).
+ * @param id {string} the user id.
+ * @throws NetworkError or InvalidStateError or Error if the operation fails.
+*/
+RTC.prototype.selectEndpoint = function (id) {
+    if(this.dataChannels) {
+        this.dataChannels.sendSelectedEndpointMessage(id);
+    } else {
+        throw new Error("Data channels support is disabled!");
+    }
 };
 
+/**
+ * Elects the participant with the given id to be the pinned participant in
+ * order to always receive video for this participant (even when last n is
+ * enabled).
+ * @param id {string} the user id
+ * @throws NetworkError or InvalidStateError or Error if the operation fails.
+ */
 RTC.prototype.pinEndpoint = function (id) {
-    if(this.dataChannels)
-        this.dataChannels.handlePinnedEndpointEvent(id);
+    if(this.dataChannels) {
+        this.dataChannels.sendPinnedEndpointMessage(id);
+    } else {
+        throw new Error("Data channels support is disabled!");
+    }
 };
 
 RTC.prototype.addListener = function (type, listener) {
@@ -3429,7 +4837,8 @@ RTC.prototype.addLocalTrack = function (track) {
         throw new Error('track must not be null nor undefined');
 
     this.localTracks.push(track);
-    track._setRTC(this);
+
+    track.conference = this.conference;
 
     if (track.isAudioTrack()) {
         this.localAudio = track;
@@ -3447,16 +4856,27 @@ RTC.prototype.getLocalVideoTrack = function () {
 };
 
 /**
+ * Gets JitsiRemoteTrack for the passed MediaType associated with given MUC
+ * nickname (resource part of the JID).
+ * @param type audio or video.
+ * @param resource the resource part of the MUC JID
+ * @returns {JitsiRemoteTrack|null}
+ */
+RTC.prototype.getRemoteTrackByType = function (type, resource) {
+    if (this.remoteTracks[resource])
+        return this.remoteTracks[resource][type];
+    else
+        return null;
+};
+
+/**
  * Gets JitsiRemoteTrack for AUDIO MediaType associated with given MUC nickname
  * (resource part of the JID).
  * @param resource the resource part of the MUC JID
  * @returns {JitsiRemoteTrack|null}
  */
 RTC.prototype.getRemoteAudioTrack = function (resource) {
-    if (this.remoteTracks[resource])
-        return this.remoteTracks[resource][MediaType.AUDIO];
-    else
-        return null;
+    return this.getRemoteTrackByType(MediaType.AUDIO, resource);
 };
 
 /**
@@ -3466,10 +4886,7 @@ RTC.prototype.getRemoteAudioTrack = function (resource) {
  * @returns {JitsiRemoteTrack|null}
  */
 RTC.prototype.getRemoteVideoTrack = function (resource) {
-    if (this.remoteTracks[resource])
-        return this.remoteTracks[resource][MediaType.VIDEO];
-    else
-        return null;
+    return this.getRemoteTrackByType(MediaType.VIDEO, resource);
 };
 
 /**
@@ -3506,33 +4923,65 @@ RTC.prototype.removeLocalTrack = function (track) {
     }
 };
 
+/**
+ * Initializes a new JitsiRemoteTrack instance with the data provided by (a)
+ * ChatRoom to XMPPEvents.REMOTE_TRACK_ADDED.
+ *
+ * @param {Object} event the data provided by (a) ChatRoom to
+ * XMPPEvents.REMOTE_TRACK_ADDED to (a)
+ */
 RTC.prototype.createRemoteTrack = function (event) {
     var ownerJid = event.owner;
     var remoteTrack = new JitsiRemoteTrack(
-        this,  ownerJid, event.stream,    event.track,
+        this.conference,  ownerJid, event.stream,    event.track,
         event.mediaType, event.videoType, event.ssrc, event.muted);
     var resource = Strophe.getResourceFromJid(ownerJid);
-    if(!this.remoteTracks[resource]) {
-        this.remoteTracks[resource] = {};
-    }
+    var remoteTracks
+        = this.remoteTracks[resource] || (this.remoteTracks[resource] = {});
     var mediaType = remoteTrack.getType();
-    if (this.remoteTracks[resource][mediaType]) {
-        logger.warn(
-            "Overwriting remote track !", resource, mediaType);
+    if (remoteTracks[mediaType]) {
+        logger.warn("Overwriting remote track!", resource, mediaType);
     }
-    this.remoteTracks[resource][mediaType] = remoteTrack;
+    remoteTracks[mediaType] = remoteTrack;
     return remoteTrack;
 };
 
 /**
  * Removes all JitsiRemoteTracks associated with given MUC nickname (resource
- * part of the JID).
- * @param resource the resource part of the MUC JID
- * @returns {JitsiRemoteTrack|null}
+ * part of the JID). Returns array of removed tracks.
+ *
+ * @param {string} resource - The resource part of the MUC JID.
+ * @returns {JitsiRemoteTrack[]}
  */
 RTC.prototype.removeRemoteTracks = function (resource) {
-    if(this.remoteTracks[resource]) {
-        delete this.remoteTracks[resource];
+    var removedTracks = [];
+    var removedAudioTrack = this.removeRemoteTrack(resource, MediaType.AUDIO);
+    var removedVideoTrack = this.removeRemoteTrack(resource, MediaType.VIDEO);
+
+    removedAudioTrack && removedTracks.push(removedAudioTrack);
+    removedVideoTrack && removedTracks.push(removedVideoTrack);
+
+    delete this.remoteTracks[resource];
+
+    return removedTracks;
+};
+
+/**
+ * Removes specified track type associated with given MUC nickname
+ * (resource part of the JID). Returns removed track if any.
+ *
+ * @param {string} resource - The resource part of the MUC JID.
+ * @param {string} mediaType - Type of track to remove.
+ * @returns {JitsiRemoteTrack|undefined}
+ */
+RTC.prototype.removeRemoteTrack = function (resource, mediaType) {
+    var remoteTracksForResource = this.remoteTracks[resource];
+
+    if (remoteTracksForResource && remoteTracksForResource[mediaType]) {
+        var track = remoteTracksForResource[mediaType];
+        track.dispose();
+        delete remoteTracksForResource[mediaType];
+        return track;
     }
 };
 
@@ -3546,10 +4995,6 @@ RTC.attachMediaStream =  function (elSelector, stream) {
 
 RTC.getStreamID = function (stream) {
     return RTCUtils.getStreamID(stream);
-};
-
-RTC.getVideoSrc = function (element) {
-    return RTCUtils.getVideoSrc(element);
 };
 
 /**
@@ -3583,6 +5028,23 @@ RTC.isDeviceChangeAvailable = function (deviceType) {
  */
 RTC.getAudioOutputDevice = function () {
     return RTCUtils.getAudioOutputDevice();
+};
+
+/**
+ * Returns list of available media devices if its obtained, otherwise an
+ * empty array is returned/
+ * @returns {Array} list of available media devices.
+ */
+RTC.getCurrentlyAvailableMediaDevices = function () {
+    return RTCUtils.getCurrentlyAvailableMediaDevices();
+};
+
+/**
+ * Returns event data for device to be reported to stats.
+ * @returns {MediaDeviceInfo} device.
+ */
+RTC.getEventDataForActiveDevice = function (device) {
+    return RTCUtils.getEventDataForActiveDevice(device);
 };
 
 /**
@@ -3621,10 +5083,6 @@ RTC.enumerateDevices = function (callback) {
     RTCUtils.enumerateDevices(callback);
 };
 
-RTC.setVideoSrc = function (element, src) {
-    RTCUtils.setVideoSrc(element, src);
-};
-
 /**
  * A method to handle stopping of the stream.
  * One point to handle the differences in various implementations.
@@ -3640,6 +5098,14 @@ RTC.stopMediaStream = function (mediaStream) {
  */
 RTC.isDesktopSharingEnabled = function () {
     return RTCUtils.isDesktopSharingEnabled();
+};
+
+/**
+ * Closes all currently opened data channels.
+ */
+RTC.prototype.closeAllDataChannels = function () {
+    if(this.dataChannels)
+        this.dataChannels.closeAllChannels();
 };
 
 RTC.prototype.dispose = function() {
@@ -3681,29 +5147,79 @@ RTC.prototype.setAudioLevel = function (resource, audioLevel) {
 RTC.prototype.getResourceBySSRC = function (ssrc) {
     if((this.localVideo && ssrc == this.localVideo.getSSRC())
         || (this.localAudio && ssrc == this.localAudio.getSSRC())) {
-        return Strophe.getResourceFromJid(this.room.myroomjid);
+        return this.conference.myUserId();
     }
 
-    var self = this;
-    var resultResource = null;
-    Object.keys(this.remoteTracks).some(function (resource) {
-        var audioTrack = self.getRemoteAudioTrack(resource);
-        var videoTrack = self.getRemoteVideoTrack(resource);
-        if((audioTrack && audioTrack.getSSRC() == ssrc) ||
-            (videoTrack && videoTrack.getSSRC() == ssrc)) {
-            resultResource = resource;
-            return true;
-        }
-    });
-
-    return resultResource;
+    var track = this.getRemoteTrackBySSRC(ssrc);
+    return track? track.getParticipantId() : null;
 };
+
+/**
+ * Searches in remoteTracks for the ssrc and returns the corresponding track.
+ * @param ssrc the ssrc to check.
+ */
+RTC.prototype.getRemoteTrackBySSRC = function (ssrc) {
+    for (var resource in this.remoteTracks) {
+        var track = this.getRemoteAudioTrack(resource);
+        if(track && track.getSSRC() == ssrc) {
+            return track;
+        }
+        track = this.getRemoteVideoTrack(resource);
+        if(track && track.getSSRC() == ssrc) {
+            return track;
+        }
+    }
+    return null;
+};
+
+/**
+ * Handles remote track mute / unmute events.
+ * @param type {string} "audio" or "video"
+ * @param isMuted {boolean} the new mute state
+ * @param from {string} user id
+ */
+RTC.prototype.handleRemoteTrackMute = function (type, isMuted, from) {
+    var track = this.getRemoteTrackByType(type, from);
+    if (track) {
+        track.setMute(isMuted);
+    }
+}
+
+/**
+ * Handles remote track video type events
+ * @param value {string} the new video type
+ * @param from {string} user id
+ */
+RTC.prototype.handleRemoteTrackVideoTypeChanged = function (value, from) {
+    var videoTrack = this.getRemoteVideoTrack(from);
+    if (videoTrack) {
+        videoTrack._setVideoType(value);
+    }
+}
+
+/**
+ * Sends message via the datachannels.
+ * @param to {string} the id of the endpoint that should receive the message.
+ * If "" the message will be sent to all participants.
+ * @param payload {object} the payload of the message.
+ * @throws NetworkError or InvalidStateError or Error if the operation fails.
+ */
+RTC.prototype.sendDataChannelMessage = function (to, payload) {
+    if(this.dataChannels) {
+        this.dataChannels.sendDataChannelMessage(to, payload);
+    } else {
+        throw new Error("Data channels support is disabled!");
+    }
+}
 
 module.exports = RTC;
 
 }).call(this,"/modules/RTC/RTC.js")
 
-},{"../../service/RTC/MediaType":129,"../../service/RTC/RTCEvents.js":130,"../../service/RTC/VideoType":132,"./DataChannels":13,"./JitsiLocalTrack.js":14,"./JitsiRemoteTrack.js":15,"./JitsiTrack":16,"./RTCBrowserType":18,"./RTCUtils.js":20,"events":54,"jitsi-meet-logger":82}],18:[function(require,module,exports){
+},{"../../service/RTC/MediaType":147,"../../service/RTC/RTCEvents.js":148,"../../service/RTC/VideoType":150,"../util/GlobalOnErrorHandler":41,"./DataChannels":17,"./JitsiLocalTrack.js":18,"./JitsiRemoteTrack.js":19,"./JitsiTrack":20,"./RTCBrowserType":22,"./RTCUtils.js":24,"events":63,"jitsi-meet-logger":68}],22:[function(require,module,exports){
+(function (__filename){
+var logger = require("jitsi-meet-logger").getLogger(__filename);
+
 var currentBrowser;
 
 var browserVersion;
@@ -3726,41 +5242,108 @@ var RTCBrowserType = {
 
 	RTC_BROWSER_IOSRTC: "rtc_browser.iosrtc",
 
+    RTC_BROWSER_REACT_NATIVE: "rtc_browser.react-native",
+
+    /**
+     * Gets current browser type.
+     * @returns {string}
+     */
     getBrowserType: function () {
         return currentBrowser;
     },
 
+    /**
+     * Gets current browser name, split from the type.
+     * @returns {string}
+     */
+    getBrowserName: function () {
+        var browser = currentBrowser.split('rtc_browser.')[1];
+        if (RTCBrowserType.isAndroid()) {
+            browser = 'android';
+        }
+        return browser;
+    },
+
+    /**
+     * Checks if current browser is Chrome.
+     * @returns {boolean}
+     */
     isChrome: function () {
         return currentBrowser === RTCBrowserType.RTC_BROWSER_CHROME;
     },
 
+    /**
+     * Checks if current browser is Opera.
+     * @returns {boolean}
+     */
     isOpera: function () {
         return currentBrowser === RTCBrowserType.RTC_BROWSER_OPERA;
     },
+
+    /**
+     * Checks if current browser is Firefox.
+     * @returns {boolean}
+     */
     isFirefox: function () {
         return currentBrowser === RTCBrowserType.RTC_BROWSER_FIREFOX;
     },
 
+    /**
+     * Checks if current browser is Internet Explorer.
+     * @returns {boolean}
+     */
     isIExplorer: function () {
         return currentBrowser === RTCBrowserType.RTC_BROWSER_IEXPLORER;
     },
 
+    /**
+     * Checks if current browser is Safari.
+     * @returns {boolean}
+     */
     isSafari: function () {
         return currentBrowser === RTCBrowserType.RTC_BROWSER_SAFARI;
     },
+
+    /**
+     * Checks if current environment is NWJS.
+     * @returns {boolean}
+     */
     isNWJS: function () {
         return currentBrowser === RTCBrowserType.RTC_BROWSER_NWJS;
     },
+
+    /**
+     * Checks if current environment is React Native.
+     * @returns {boolean}
+     */
+    isReactNative: function () {
+        return currentBrowser === RTCBrowserType.RTC_BROWSER_REACT_NATIVE;
+    },
+
     isiOSRTC: function () {
         return currentBrowser === RTCBrowserType.RTC_BROWSER_IOSRTC;
     },
+
+    /**
+     * Checks if Temasys RTC plugin is used.
+     * @returns {boolean}
+     */
     isTemasysPluginUsed: function () {
         return RTCBrowserType.isIExplorer() || RTCBrowserType.isSafari();
     },
+
+    /**
+     * Returns Firefox version.
+     * @returns {number|null}
+     */
     getFirefoxVersion: function () {
         return RTCBrowserType.isFirefox() ? browserVersion : null;
     },
 
+    /**
+     * Returns Chrome version.
+     * @returns {number|null}
+     */
     getChromeVersion: function () {
         return RTCBrowserType.isChrome() ? browserVersion : null;
     },
@@ -3776,6 +5359,7 @@ var RTCBrowserType = {
 
     /**
      * Whether the browser is running on an android device.
+     * @returns {boolean}
      */
     isAndroid: function() {
         return isAndroid;
@@ -3787,14 +5371,13 @@ var RTCBrowserType = {
 // detectOpera() must be called before detectChrome() !!!
 // otherwise Opera wil be detected as Chrome
 function detectChrome() {
-    var userAgent = navigator.userAgent;
     if (navigator.webkitGetUserMedia) {
         currentBrowser = RTCBrowserType.RTC_BROWSER_CHROME;
         var userAgent = navigator.userAgent.toLowerCase();
         // We can assume that user agent is chrome, because it's
         // enforced when 'ext' streaming method is set
         var ver = parseInt(userAgent.match(/chrome\/(\d+)\./)[1], 10);
-        console.log("This appears to be Chrome, ver: " + ver);
+        logger.log("This appears to be Chrome, ver: " + ver);
         return ver;
     }
     return null;
@@ -3805,7 +5388,7 @@ function detectOpera() {
     if (userAgent.match(/Opera|OPR/)) {
         currentBrowser = RTCBrowserType.RTC_BROWSER_OPERA;
         var version = userAgent.match(/(Opera|OPR) ?\/?(\d+)\.?/)[2];
-        console.info("This appears to be Opera, ver: " + version);
+        logger.info("This appears to be Opera, ver: " + version);
         return version;
     }
     return null;
@@ -3816,7 +5399,7 @@ function detectFirefox() {
         currentBrowser = RTCBrowserType.RTC_BROWSER_FIREFOX;
         var version = parseInt(
             navigator.userAgent.match(/Firefox\/([0-9]+)\./)[1], 10);
-        console.log('This appears to be Firefox, ver: ' + version);
+        logger.log('This appears to be Firefox, ver: ' + version);
         return version;
     }
     return null;
@@ -3825,7 +5408,7 @@ function detectFirefox() {
 function detectSafari() {
     if ((/^((?!chrome).)*safari/i.test(navigator.userAgent))) {
         currentBrowser = RTCBrowserType.RTC_BROWSER_SAFARI;
-        console.info("This appears to be Safari");
+        logger.info("This appears to be Safari");
         // FIXME detect Safari version when needed
         return 1;
     }
@@ -3857,7 +5440,7 @@ function detectIE() {
 
     if (version) {
         currentBrowser = RTCBrowserType.RTC_BROWSER_IEXPLORER;
-        console.info("This appears to be IExplorer, ver: " + version);
+        logger.info("This appears to be IExplorer, ver: " + version);
     }
     return version;
 }
@@ -3867,11 +5450,40 @@ function detectNWJS (){
     if (userAgent.match(/JitsiMeetNW/)) {
         currentBrowser = RTCBrowserType.RTC_BROWSER_NWJS;
         var version = userAgent.match(/JitsiMeetNW\/([\d.]+)/)[1];
-        console.info("This appears to be JitsiMeetNW, ver: " + version);
+        logger.info("This appears to be JitsiMeetNW, ver: " + version);
         return version;
     }
     return null;
 }
+
+function detectReactNative() {
+    var match
+        = navigator.userAgent.match(/\b(react[ \t_-]*native)(?:\/(\S+))?/i);
+    var version;
+    // If we're remote debugging a React Native app, it may be treated as
+    // Chrome. Check navigator.product as well and always return some version
+    // even if we can't get the real one.
+    if (match || navigator.product === 'ReactNative') {
+        currentBrowser = RTCBrowserType.RTC_BROWSER_REACT_NATIVE;
+        var name;
+        if (match && match.length > 2) {
+            name = match[1];
+            version = match[2];
+        }
+        if (!name) {
+            name = 'react-native';
+        }
+        if (!version) {
+            version = 'unknown';
+        }
+        console.info('This appears to be ' + name + ', ver: ' + version);
+    } else {
+        // We're not running in a React Native environment.
+        version = null;
+    }
+    return version;
+}
+
 function detectiOSRTC(){
 	var userAgent = navigator.userAgent;
 	if (userAgent.match(/iOSRTC/))
@@ -3914,9 +5526,11 @@ function detectiOSRTC(){
 	}
 	return null;
 }
+
 function detectBrowser() {
     var version;
     var detectors = [
+        detectReactNative,
         detectNWJS,
         detectOpera,
         detectChrome,
@@ -3931,7 +5545,7 @@ function detectBrowser() {
         if (version)
             return version;
     }
-    console.warn("Browser type defaults to Safari ver 1");
+    logger.warn("Browser type defaults to Safari ver 1");
     currentBrowser = RTCBrowserType.RTC_BROWSER_SAFARI;
     return 1;
 }
@@ -3941,7 +5555,9 @@ isAndroid = navigator.userAgent.indexOf('Android') != -1;
 
 module.exports = RTCBrowserType;
 
-},{}],19:[function(require,module,exports){
+}).call(this,"/modules/RTC/RTCBrowserType.js")
+
+},{"jitsi-meet-logger":68}],23:[function(require,module,exports){
 (function (__filename){
 /* global $, __filename */
 var logger = require("jitsi-meet-logger").getLogger(__filename);
@@ -4005,24 +5621,6 @@ var RTCUIHelper = {
         if (!RTCBrowserType.isIExplorer()) {
             streamElement.autoplay = true;
         }
-    },
-
-    /**
-     * Extract video stream id from the video element.
-     * @param {Element} element
-     * @returns {string} video stream id or empty string
-     */
-    getVideoId: function (element) {
-        var src = RTC.getVideoSrc(element);
-        if (!src) {
-            return "";
-        }
-
-        if (RTCBrowserType.isFirefox()) {
-            return src.id;
-        }
-
-        return src;
     }
 };
 
@@ -4030,7 +5628,7 @@ module.exports = RTCUIHelper;
 
 }).call(this,"/modules/RTC/RTCUIHelper.js")
 
-},{"./RTC":17,"./RTCBrowserType":18,"jitsi-meet-logger":82}],20:[function(require,module,exports){
+},{"./RTC":21,"./RTCBrowserType":22,"jitsi-meet-logger":68}],24:[function(require,module,exports){
 (function (__filename){
 /* global config, require, attachMediaStream, getUserMedia,
    RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, MediaStreamTrack,
@@ -4048,21 +5646,73 @@ var SDPUtil = require("../xmpp/SDPUtil");
 var EventEmitter = require("events");
 var screenObtainer = require("./ScreenObtainer");
 var JitsiTrackErrors = require("../../JitsiTrackErrors");
+var JitsiTrackError = require("../../JitsiTrackError");
 var MediaType = require("../../service/RTC/MediaType");
 var VideoType = require("../../service/RTC/VideoType");
+var CameraFacingMode = require("../../service/RTC/CameraFacingMode");
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 
 var eventEmitter = new EventEmitter();
 
+var AVAILABLE_DEVICES_POLL_INTERVAL_TIME = 3000; // ms
+
 var devices = {
-    audio: true,
-    video: true
+    audio: false,
+    video: false
 };
 
-var audioOuputDeviceId = ''; // default device
+// Currently audio output device change is supported only in Chrome and
+// default output always has 'default' device ID
+var audioOutputDeviceId = 'default'; // default device
+// Disables Acoustic Echo Cancellation
+var disableAEC = false;
+// Disables Noise Suppression
+var disableNS = false;
 
 var featureDetectionAudioEl = document.createElement('audio');
 var isAudioOutputDeviceChangeAvailable =
     typeof featureDetectionAudioEl.setSinkId !== 'undefined';
+
+var currentlyAvailableMediaDevices;
+
+var rawEnumerateDevicesWithCallback = undefined;
+/**
+ * "rawEnumerateDevicesWithCallback" will be initialized only after WebRTC is
+ * ready. Otherwise it is too early to assume that the devices listing is not
+ * supported.
+ */
+function initRawEnumerateDevicesWithCallback() {
+    rawEnumerateDevicesWithCallback = navigator.mediaDevices
+        && navigator.mediaDevices.enumerateDevices
+        ? function(callback) {
+            navigator.mediaDevices.enumerateDevices().then(
+                callback, function () {
+                    callback([]);
+            });
+        }
+        // Safari:
+        // "ReferenceError: Can't find variable: MediaStreamTrack"
+        // when Temasys plugin is not installed yet, have to delay this call
+        // until WebRTC is ready.
+        : (MediaStreamTrack && MediaStreamTrack.getSources)
+        ? function (callback) {
+            MediaStreamTrack.getSources(function (sources) {
+                callback(sources.map(convertMediaStreamTrackSource));
+            });
+        }
+        : undefined;
+}
+
+// TODO: currently no browser supports 'devicechange' event even in nightly
+// builds so no feature/browser detection is used at all. However in future this
+// should be changed to some expression. Progress on 'devicechange' event
+// implementation for Chrome/Opera/NWJS can be tracked at
+// https://bugs.chromium.org/p/chromium/issues/detail?id=388648, for Firefox -
+// at https://bugzilla.mozilla.org/show_bug.cgi?id=1152383. More information on
+// 'devicechange' event can be found in spec -
+// http://w3c.github.io/mediacapture-main/#event-mediadevices-devicechange
+// TODO: check MS Edge
+var isDeviceChangeEventSupported = false;
 
 var rtcReady = false;
 
@@ -4099,22 +5749,51 @@ function setResolutionConstraints(constraints, resolution) {
  * @param {string} options.desktopStream
  * @param {string} options.cameraDeviceId
  * @param {string} options.micDeviceId
+ * @param {CameraFacingMode} options.facingMode
  * @param {bool} firefox_fake_device
  */
 function getConstraints(um, options) {
 
     var constraints = {audio: false, video: false};
 
+    // Don't mix new and old style settings for Chromium as this leads
+    // to TypeError in new Chromium versions. @see
+    // https://bugs.chromium.org/p/chromium/issues/detail?id=614716
+    // This is a temporary solution, in future we will fully split old and
+    // new style constraints when new versions of Chromium and Firefox will
+    // have stable support of new constraints format. For more information
+    // @see https://github.com/jitsi/lib-jitsi-meet/pull/136
+    var isNewStyleConstraintsSupported =
+        RTCBrowserType.isFirefox() ||
+        RTCBrowserType.isReactNative() ||
+        RTCBrowserType.isTemasysPluginUsed();
+
     if (um.indexOf('video') >= 0) {
         // same behaviour as true
         constraints.video = { mandatory: {}, optional: [] };
 
         if (options.cameraDeviceId) {
-            // new style of settings device id (FF only)
-            constraints.video.deviceId = options.cameraDeviceId;
-            // old style
+            if (isNewStyleConstraintsSupported) {
+                // New style of setting device id.
+                constraints.video.deviceId = options.cameraDeviceId;
+            }
+            // Old style.
             constraints.video.optional.push({
                 sourceId: options.cameraDeviceId
+            });
+        } else {
+            // Prefer the front i.e. user-facing camera (to the back i.e.
+            // environment-facing camera, for example).
+            // TODO: Maybe use "exact" syntax if options.facingMode is defined,
+            // but this probably needs to be decided when updating other
+            // constraints, as we currently don't use "exact" syntax anywhere.
+            var facingMode = options.facingMode || CameraFacingMode.USER;
+
+            if (isNewStyleConstraintsSupported) {
+                constraints.video.facingMode = facingMode;
+            }
+            constraints.video.optional.push({
+                facingMode: facingMode
             });
         }
 
@@ -4123,25 +5802,31 @@ function getConstraints(um, options) {
         setResolutionConstraints(constraints, options.resolution);
     }
     if (um.indexOf('audio') >= 0) {
-        if (!RTCBrowserType.isFirefox() && !RTCBrowserType.isiOSRTC()) {
+        if (RTCBrowserType.isReactNative()) {
+            // The react-native-webrtc project that we're currently using
+            // expects the audio constraint to be a boolean.
+            constraints.audio = true;
+        } else if (!RTCBrowserType.isFirefox() && !RTCBrowserType.isiOSRTC()) {
             // same behaviour as true
             constraints.audio = { mandatory: {}, optional: []};
             if (options.micDeviceId) {
-                // new style of settings device id (FF only)
-                constraints.audio.deviceId = options.micDeviceId;
-                // old style
+                if (isNewStyleConstraintsSupported) {
+                    // New style of setting device id.
+                    constraints.audio.deviceId = options.micDeviceId;
+                }
+                // Old style.
                 constraints.audio.optional.push({
                     sourceId: options.micDeviceId
                 });
             }
             // if it is good enough for hangouts...
             constraints.audio.optional.push(
-                {googEchoCancellation: true},
+                {googEchoCancellation: !disableAEC},
                 {googAutoGainControl: true},
-                {googNoiseSupression: true},
+                {googNoiseSupression: !disableNS},
                 {googHighpassFilter: true},
-                {googNoisesuppression2: true},
-                {googEchoCancellation2: true},
+                {googNoiseSuppression2: !disableNS},
+                {googEchoCancellation2: !disableAEC},
                 {googAutoGainControl2: true}
             );
         } else {
@@ -4184,9 +5869,11 @@ function getConstraints(um, options) {
             };
 
         } else {
-            logger.error(
-                "'screen' WebRTC media source is supported only in Chrome" +
-                " and with Temasys plugin");
+            var errmsg
+                = "'screen' WebRTC media source is supported only in Chrome"
+                    + " and with Temasys plugin";
+            GlobalOnErrorHandler.callErrorHandler(new Error(errmsg));
+            logger.error(errmsg);
         }
     }
     if (um.indexOf('desktop') >= 0) {
@@ -4241,15 +5928,111 @@ function getConstraints(um, options) {
     return constraints;
 }
 
-function setAvailableDevices(um, available) {
+/**
+ * Sets the availbale devices based on the options we requested and the
+ * streams we received.
+ * @param um the options we requested to getUserMedia.
+ * @param stream the stream we received from calling getUserMedia.
+ */
+function setAvailableDevices(um, stream) {
+    var audioTracksReceived = stream && !!stream.getAudioTracks().length;
+    var videoTracksReceived = stream && !!stream.getVideoTracks().length;
+
     if (um.indexOf("video") != -1) {
-        devices.video = available;
+        devices.video = videoTracksReceived;
     }
     if (um.indexOf("audio") != -1) {
-        devices.audio = available;
+        devices.audio = audioTracksReceived;
     }
 
     eventEmitter.emit(RTCEvents.AVAILABLE_DEVICES_CHANGED, devices);
+}
+
+/**
+ * Checks if new list of available media devices differs from previous one.
+ * @param {MediaDeviceInfo[]} newDevices - list of new devices.
+ * @returns {boolean} - true if list is different, false otherwise.
+ */
+function compareAvailableMediaDevices(newDevices) {
+    if (newDevices.length !== currentlyAvailableMediaDevices.length) {
+        return true;
+    }
+
+    return newDevices.map(mediaDeviceInfoToJSON).sort().join('') !==
+        currentlyAvailableMediaDevices.map(mediaDeviceInfoToJSON).sort().join('');
+
+    function mediaDeviceInfoToJSON(info) {
+        return JSON.stringify({
+            kind: info.kind,
+            deviceId: info.deviceId,
+            groupId: info.groupId,
+            label: info.label,
+            facing: info.facing
+        });
+    }
+}
+
+/**
+ * Periodically polls enumerateDevices() method to check if list of media
+ * devices has changed. This is temporary workaround until 'devicechange' event
+ * will be supported by browsers.
+ */
+function pollForAvailableMediaDevices() {
+    // Here we use plain navigator.mediaDevices.enumerateDevices instead of
+    // wrapped because we just need to know the fact the devices changed, labels
+    // do not matter. This fixes situation when we have no devices initially,
+    // and then plug in a new one.
+    if (rawEnumerateDevicesWithCallback) {
+        rawEnumerateDevicesWithCallback(function (devices) {
+            // We don't fire RTCEvents.DEVICE_LIST_CHANGED for the first time
+            // we call enumerateDevices(). This is the initial step.
+            if (typeof currentlyAvailableMediaDevices === 'undefined') {
+                currentlyAvailableMediaDevices = devices.slice(0);
+            } else if (compareAvailableMediaDevices(devices)) {
+                onMediaDevicesListChanged(devices);
+            }
+
+            window.setTimeout(pollForAvailableMediaDevices,
+                AVAILABLE_DEVICES_POLL_INTERVAL_TIME);
+        });
+    }
+}
+
+/**
+ * Event handler for the 'devicechange' event.
+ * @param {MediaDeviceInfo[]} devices - list of media devices.
+ * @emits RTCEvents.DEVICE_LIST_CHANGED
+ */
+function onMediaDevicesListChanged(devicesReceived) {
+    currentlyAvailableMediaDevices = devicesReceived.slice(0);
+    logger.info('list of media devices has changed:', currentlyAvailableMediaDevices);
+
+    var videoInputDevices = currentlyAvailableMediaDevices.filter(function (d) {
+            return d.kind === 'videoinput';
+        }),
+        audioInputDevices = currentlyAvailableMediaDevices.filter(function (d) {
+            return d.kind === 'audioinput';
+        }),
+        videoInputDevicesWithEmptyLabels = videoInputDevices.filter(
+            function (d) {
+                return d.label === '';
+            }),
+        audioInputDevicesWithEmptyLabels = audioInputDevices.filter(
+            function (d) {
+                return d.label === '';
+            });
+
+    if (videoInputDevices.length &&
+        videoInputDevices.length === videoInputDevicesWithEmptyLabels.length) {
+        devices.video = false;
+    }
+
+    if (audioInputDevices.length &&
+        audioInputDevices.length === audioInputDevicesWithEmptyLabels.length) {
+        devices.audio = false;
+    }
+
+    eventEmitter.emit(RTCEvents.DEVICE_LIST_CHANGED, devicesReceived);
 }
 
 // In case of IE we continue from 'onReady' callback
@@ -4259,6 +6042,29 @@ function onReady (options, GUM) {
     rtcReady = true;
     eventEmitter.emit(RTCEvents.RTC_READY, true);
     screenObtainer.init(options, GUM);
+
+    // Initialize rawEnumerateDevicesWithCallback
+    initRawEnumerateDevicesWithCallback();
+
+    if (RTCUtils.isDeviceListAvailable() && rawEnumerateDevicesWithCallback) {
+        rawEnumerateDevicesWithCallback(function (devices) {
+            currentlyAvailableMediaDevices = devices.splice(0);
+
+            eventEmitter.emit(RTCEvents.DEVICE_LIST_AVAILABLE,
+                currentlyAvailableMediaDevices);
+
+            if (isDeviceChangeEventSupported) {
+                navigator.mediaDevices.addEventListener(
+                    'devicechange',
+                    function () {
+                        RTCUtils.enumerateDevices(
+                            onMediaDevicesListChanged);
+                    });
+            } else {
+                pollForAvailableMediaDevices();
+            }
+        });
+    }
 }
 
 /**
@@ -4302,22 +6108,6 @@ function wrapGetUserMedia(getUserMedia) {
 }
 
 /**
- * Create stub device which equals to auto selected device.
- * @param {string} kind if that should be `audio` or `video` device
- * @returns {Object} stub device description in `enumerateDevices` format
- */
-function createAutoDeviceInfo(kind) {
-    return {
-        facing: null,
-        label: 'Auto',
-        kind: kind,
-        deviceId: '',
-        groupId: ''
-    };
-}
-
-
-/**
  * Execute function after getUserMedia was executed at least once.
  * @param {Function} callback function to execute after getUserMedia
  */
@@ -4339,25 +6129,9 @@ function wrapEnumerateDevices(enumerateDevices) {
     return function (callback) {
         // enumerate devices only after initial getUserMedia
         afterUserMediaInitialized(function () {
-
-            enumerateDevices().then(function (devices) {
-                //add auto devices
-                devices.unshift(
-                    createAutoDeviceInfo('audioinput'),
-                    createAutoDeviceInfo('videoinput'),
-                    createAutoDeviceInfo('audiooutput')
-                );
-
-                callback(devices);
-            }, function (err) {
-                console.error('cannot enumerate devices: ', err);
-
-                // return only auto devices
-                callback([
-                    createAutoDeviceInfo('audioinput'),
-                    createAutoDeviceInfo('videoinput'),
-                    createAutoDeviceInfo('audiooutput')
-                ]);
+            enumerateDevices().then(callback, function (err) {
+                logger.error('cannot enumerate devices: ', err);
+                callback([]);
             });
         });
     };
@@ -4370,30 +6144,29 @@ function wrapEnumerateDevices(enumerateDevices) {
  */
 function enumerateDevicesThroughMediaStreamTrack (callback) {
     MediaStreamTrack.getSources(function (sources) {
-        var devices = sources.map(function (source) {
-            var kind = (source.kind || '').toLowerCase();
-            return {
-                facing: source.facing || null,
-                label: source.label,
-                // theoretically deprecated MediaStreamTrack.getSources should
-                // not return 'audiooutput' devices but let's handle it in any
-                // case
-                kind: kind
-                    ? (kind === 'audiooutput' ? kind : kind + 'input')
-                    : null,
-                deviceId: source.id,
-                groupId: source.groupId || null
-            };
-        });
-
-        //add auto devices
-        devices.unshift(
-            createAutoDeviceInfo('audioinput'),
-            createAutoDeviceInfo('videoinput'),
-            createAutoDeviceInfo('audiooutput')
-        );
-        callback(devices);
+        callback(sources.map(convertMediaStreamTrackSource));
     });
+}
+
+/**
+ * Converts MediaStreamTrack Source to enumerateDevices format.
+ * @param {Object} source
+ */
+function convertMediaStreamTrackSource(source) {
+    var kind = (source.kind || '').toLowerCase();
+
+    return {
+        facing: source.facing || null,
+        label: source.label,
+        // theoretically deprecated MediaStreamTrack.getSources should
+        // not return 'audiooutput' devices but let's handle it in any
+        // case
+        kind: kind
+            ? (kind === 'audiooutput' ? kind : kind + 'input')
+            : null,
+        deviceId: source.id,
+        groupId: source.groupId || null
+    };
 }
 
 function obtainDevices(options) {
@@ -4415,7 +6188,8 @@ function obtainDevices(options) {
             });
             logger.error(
                 "failed to obtain " + device + " stream - stop", error);
-            options.errorCallback(JitsiTrackErrors.parseError(error, devices));
+
+            options.errorCallback(error);
         });
 }
 
@@ -4428,9 +6202,17 @@ function obtainDevices(options) {
  */
 function handleLocalStream(streams, resolution) {
     var audioStream, videoStream, desktopStream, res = [];
-    // If this is FF, the stream parameter is *not* a MediaStream object, it's
-    // an object with two properties: audioStream, videoStream.
-    if (window.webkitMediaStream) {
+
+    // XXX The function obtainAudioAndVideoPermissions has examined the type of
+    // the browser, its capabilities, etc. and has taken the decision whether to
+    // invoke getUserMedia per device (e.g. Firefox) or once for both audio and
+    // video (e.g. Chrome). In order to not duplicate the logic here, examine
+    // the specified streams and figure out what we've received based on
+    // obtainAudioAndVideoPermissions' decision.
+    if (streams) {
+        // As mentioned above, certian types of browser (e.g. Chrome) support
+        // (with a result which meets our requirements expressed bellow) calling
+        // getUserMedia once for both audio and video.
         var audioVideo = streams.audioVideo;
         if (audioVideo) {
             var audioTracks = audioVideo.getAudioTracks();
@@ -4448,22 +6230,17 @@ function handleLocalStream(streams, resolution) {
                     videoStream.addTrack(videoTracks[j]);
                 }
             }
+        } else {
+          // On other types of browser (e.g. Firefox) we choose (namely,
+          // obtainAudioAndVideoPermissions) to call getUsermedia per device
+          // (type).
+          audioStream = streams.audio;
+          videoStream = streams.video;
         }
-
-        // FIXME Checking streams here is unnecessary because there's
-        // streams.audioVideo above.
-        if (streams)
-            desktopStream = streams.desktopStream;
-
+        // Again, different choices on different types of browser.
+        desktopStream = streams.desktopStream || streams.desktop;
     }
-    else if (RTCBrowserType.isFirefox() || RTCBrowserType.isTemasysPluginUsed()) {   // Firefox and Temasys plugin
-        if (streams) {
-            audioStream = streams.audio;
-            videoStream = streams.video;
-            desktopStream = streams.desktop;
-        }
-    }
-	
+
 	else if(RTCBrowserType.isiOSRTC())
 	{
 		//TODO avoid calling getAudioTracks getVideoTracks twice
@@ -4472,29 +6249,29 @@ function handleLocalStream(streams, resolution) {
 		{
 			if(streams.audioVideo.getAudioTracks().length > 0)
             audioStream = streams.audioVideo;
-		
+
 			if(streams.audioVideo.getVideoTracks().length > 0)
             videoStream = streams.audioVideo;
 		}
 	}
 
-    if (desktopStream)
+    if (desktopStream) {
         res.push({
             stream: desktopStream,
             track: desktopStream.getVideoTracks()[0],
             mediaType: MediaType.VIDEO,
             videoType: VideoType.DESKTOP
         });
-
-    if(audioStream)
+    }
+    if (audioStream) {
         res.push({
             stream: audioStream,
             track: audioStream.getAudioTracks()[0],
             mediaType: MediaType.AUDIO,
             videoType: null
         });
-
-    if(videoStream)
+    }
+    if (videoStream) {
         res.push({
             stream: videoStream,
             track: videoStream.getVideoTracks()[0],
@@ -4502,6 +6279,7 @@ function handleLocalStream(streams, resolution) {
             videoType: VideoType.CAMERA,
             resolution: resolution
         });
+    }
 
     return res;
 }
@@ -4516,12 +6294,21 @@ function wrapAttachMediaStream(origAttachMediaStream) {
     return function(element, stream) {
         var res = origAttachMediaStream.apply(RTCUtils, arguments);
 
-        if (RTCUtils.isDeviceChangeAvailable('output') &&
-            stream.getAudioTracks && stream.getAudioTracks().length) {
+        if (stream
+                && RTCUtils.isDeviceChangeAvailable('output')
+                && stream.getAudioTracks
+                && stream.getAudioTracks().length) {
             element.setSinkId(RTCUtils.getAudioOutputDevice())
                 .catch(function (ex) {
-                    logger.error('Failed to set audio output on element',
-                        element, ex);
+                    var err = new JitsiTrackError(ex, null, ['audiooutput']);
+
+                    GlobalOnErrorHandler.callUnhandledRejectionHandler(
+                        {promise: this, reason: err});
+
+                    logger.warn('Failed to set audio output device for the ' +
+                        'element. Default audio output device will be used ' +
+                        'instead',
+                        element, err);
                 });
         }
 
@@ -4529,9 +6316,67 @@ function wrapAttachMediaStream(origAttachMediaStream) {
     }
 }
 
+/**
+ * Represents a default implementation of setting a <tt>MediaStream</tt> as the
+ * source of a video element that tries to be browser-agnostic through feature
+ * checking. Note though that it was not completely clear from the predating
+ * browser-specific implementations what &quot;videoSrc&quot; was because one
+ * implementation of {@link RTCUtils#getVideoSrc} would return
+ * <tt>MediaStream</tt> (e.g. Firefox), another a <tt>string</tt> representation
+ * of the <tt>URL</tt> of the <tt>MediaStream</tt> (e.g. Chrome) and the return
+ * value was only used by {@link RTCUIHelper#getVideoId} which itself did not
+ * appear to be used anywhere. Generally, the implementation will try to follow
+ * the related standards i.e. work with the <tt>srcObject</tt> and <tt>src</tt>
+ * properties of the specified <tt>element</tt> taking into account vender
+ * prefixes.
+ *
+ * @param element the element whose video source/src is to be set to the
+ * specified <tt>stream</tt>
+ * @param {MediaStream} stream the <tt>MediaStream</tt> to set as the video
+ * source/src of <tt>element</tt>
+ */
+function defaultSetVideoSrc(element, stream) {
+    // srcObject
+    var srcObjectPropertyName = 'srcObject';
+    if (!(srcObjectPropertyName in element)) {
+        srcObjectPropertyName = 'mozSrcObject';
+        if (!(srcObjectPropertyName in element)) {
+            srcObjectPropertyName = null;
+        }
+    }
+    if (srcObjectPropertyName) {
+        element[srcObjectPropertyName] = stream;
+        return;
+    }
+
+    // src
+    var src;
+    if (stream) {
+        src = stream.jitsiObjectURL;
+        // Save the created URL for stream so we can reuse it and not keep
+        // creating URLs.
+        if (!src) {
+            stream.jitsiObjectURL
+                = src
+                    = (URL || webkitURL).createObjectURL(stream);
+        }
+    }
+    element.src = src || '';
+}
+
 //Options parameter is to pass config options. Currently uses only "useIPv6".
 var RTCUtils = {
     init: function (options) {
+
+        if (typeof(options.disableAEC) === "boolean") {
+            disableAEC = options.disableAEC;
+            logger.info("Disable AEC: " + disableAEC);
+        }
+        if (typeof(options.disableNS) === "boolean") {
+            disableNS = options.disableNS;
+            logger.info("Disable NS: " + disableNS);
+        }
+
         return new Promise(function(resolve, reject) {
             if (RTCBrowserType.isFirefox()) {
                 var FFversion = RTCBrowserType.getFirefoxVersion();
@@ -4557,11 +6402,11 @@ var RTCUtils = {
                     //
                     // https://groups.google.com/forum/#!topic/mozilla.dev.media/pKOiioXonJg
                     // https://github.com/webrtc/samples/issues/302
-                    if (!element)
-                        return;
-                    element.mozSrcObject = stream;
-                    element.play();
-
+                    if (element) {
+                        defaultSetVideoSrc(element, stream);
+                        if (stream)
+                            element.play();
+                    }
                     return element;
                 });
                 this.getStreamID = function (stream) {
@@ -4575,18 +6420,12 @@ var RTCUtils = {
                     }
                     return SDPUtil.filter_special_chars(id);
                 };
-                this.getVideoSrc = function (element) {
-                    if (!element)
-                        return null;
-                    return element.mozSrcObject;
-                };
-                this.setVideoSrc = function (element, src) {
-                    if (element)
-                        element.mozSrcObject = src;
-                };
                 RTCSessionDescription = mozRTCSessionDescription;
                 RTCIceCandidate = mozRTCIceCandidate;
-            } else if (RTCBrowserType.isChrome() || RTCBrowserType.isOpera() || RTCBrowserType.isNWJS()) {
+            } else if (RTCBrowserType.isChrome() ||
+                    RTCBrowserType.isOpera() ||
+                    RTCBrowserType.isNWJS() ||
+                    RTCBrowserType.isReactNative()) {
                 this.peerconnection = webkitRTCPeerConnection;
                 var getUserMedia = navigator.webkitGetUserMedia.bind(navigator);
                 if (navigator.mediaDevices) {
@@ -4599,34 +6438,24 @@ var RTCUtils = {
                     this.enumerateDevices = enumerateDevicesThroughMediaStreamTrack;
                 }
                 this.attachMediaStream = wrapAttachMediaStream(function (element, stream) {
-
-                    // saves the created url for the stream, so we can reuse it
-                    // and not keep creating urls
-                    if (!stream.jitsiObjectURL) {
-                        stream.jitsiObjectURL
-                            = webkitURL.createObjectURL(stream);
-                    }
-
-                    element.src = stream.jitsiObjectURL;
-
+                    defaultSetVideoSrc(element, stream);
                     return element;
                 });
                 this.getStreamID = function (stream) {
-                    // streams from FF endpoints have the characters '{' and '}'
-                    // that make jQuery choke.
-                    return SDPUtil.filter_special_chars(stream.id);
-                };
-                this.getVideoSrc = function (element) {
-                    if (!element)
-                        return null;
-                    return element.getAttribute("src");
-                };
-                this.setVideoSrc = function (element, src) {
-                    if (!src) {
-                        src = '';
-                    }
-                    if (element)
-                        element.setAttribute("src", src);
+                    // A. MediaStreams from FF endpoints have the characters '{'
+                    // and '}' that make jQuery choke.
+                    // B. The react-native-webrtc implementation that we use on
+                    // React Native at the time of this writing returns a number
+                    // for the id of MediaStream. Let's just say that a number
+                    // contains no special characters.
+                    var id = stream.id;
+                    // XXX The return statement is affected by automatic
+                    // semicolon insertion (ASI). No line terminator is allowed
+                    // between the return keyword and the expression.
+                    return (
+                        (typeof id === 'number')
+                            ? id
+                            : SDPUtil.filter_special_chars(id));
                 };
                 // DTLS should now be enabled by default but..
                 this.pc_constraints = {'optional': [
@@ -4662,14 +6491,25 @@ var RTCUtils = {
                     self.getUserMedia = window.getUserMedia;
                     self.enumerateDevices = enumerateDevicesThroughMediaStreamTrack;
                     self.attachMediaStream = wrapAttachMediaStream(function (element, stream) {
+                        if (stream) {
+                            if (stream.id === "dummyAudio"
+                                    || stream.id === "dummyVideo") {
+                                return;
+                            }
 
-                        if (stream.id === "dummyAudio" || stream.id === "dummyVideo") {
-                            return;
-                        }
-
-                        var isVideoStream = !!stream.getVideoTracks().length;
-                        if (isVideoStream && !$(element).is(':visible')) {
-                            throw new Error('video element must be visible to attach video stream');
+                            // The container must be visible in order to play or
+                            // attach the stream when Temasys plugin is in use
+                            var containerSel = $(element);
+                            if (RTCBrowserType.isTemasysPluginUsed()
+                                    && !containerSel.is(':visible')) {
+                                containerSel.show();
+                            }
+                            var video = !!stream.getVideoTracks().length;
+                            if (video && !$(element).is(':visible')) {
+                                throw new Error(
+                                    'video element must be visible to attach'
+                                        + ' video stream');
+                            }
                         }
 
                         return attachMediaStream(element, stream);
@@ -4677,122 +6517,83 @@ var RTCUtils = {
                     self.getStreamID = function (stream) {
                         return SDPUtil.filter_special_chars(stream.label);
                     };
-                    self.getVideoSrc = function (element) {
-                        if (!element) {
-                            logger.warn("Attempt to get video SRC of null element");
-                            return null;
-                        }
-                        var children = element.children;
-                        for (var i = 0; i !== children.length; ++i) {
-                            if (children[i].name === 'streamId') {
-                                return children[i].value;
-                            }
-                        }
-                        //logger.info(element.id + " SRC: " + src);
-                        return null;
-                    };
-                    self.setVideoSrc = function (element, src) {
-                        //logger.info("Set video src: ", element, src);
-                        if (!src) {
-                            attachMediaStream(element, null);
-                        } else {
-                            AdapterJS.WebRTCPlugin.WaitForPluginReady();
-                            var stream
-                                = AdapterJS.WebRTCPlugin.plugin
-                                    .getStreamWithId(
-                                        AdapterJS.WebRTCPlugin.pageId, src);
-                            attachMediaStream(element, stream);
-                        }
-                    };
-			
+
                     onReady(options, self.getUserMediaWithConstraints);
                     resolve();
                 });
-            }
-			else if(RTCBrowserType.isiOSRTC())
-			{
-					
-				 var self = this;
-				
-				this.attachMediaStream = function (element, stream) {
-					
-					console.log("attachMediaStream", element, stream);
 
-					 if (!element)
+            }
+            else if(RTCBrowserType.isiOSRTC())
+            {
+                var self = this;
+
+                this.attachMediaStream = function (element, stream) {
+
+                    console.log("attachMediaStream", element, stream);
+
+                     if (!element)
                         return;
 
                     element.src = URL.createObjectURL(stream);
 
                     return element;
                 };
-				this.getVideoSrc = function (element) {
-                    if (!element)
-                        return null;
-                    return element.getAttribute("src");
-                };
-                this.setVideoSrc = function (element, src) {
-                    if (!src) {
-                        src = '';
-                    }
-                    if (element)
-                        element.setAttribute("src", src);
-                };
                 self.getStreamID = function (stream) {
-						var id = stream.id;
-						return SDPUtil.filter_special_chars(id);
-					};
-				
+                        var id = stream.id;
+                        return SDPUtil.filter_special_chars(id);
+                    };
+
                 self.pc_constraints = {};
-                // window.addEventListener("load", function () {
-					console.log("lib-jitsi-cordova >>> DOM ready event");
-					document.addEventListener("deviceready", function () {
-						console.log("lib-jitsi-cordova >>> deviceready event");
-						  //getStats not yet implemented in iosrtc plugin
-						 cordova.plugins.iosrtc.RTCPeerConnection.prototype.getStats = function(callback)
-						 {
-							 //console.log("simulated callback for peerconnection.getStats() remove this when its done RTCUtils line ~630");
-						 };
-						 self.peerconnection = cordova.plugins.iosrtc.RTCPeerConnection;
-						
-						 
-						var getUserMedia =  cordova.plugins.iosrtc.getUserMedia;
-						/*if (navigator.mediaDevices) {
-							self.getUserMedia = wrapGetUserMedia(getUserMedia);
-							self.enumerateDevices = wrapEnumerateDevices(
-								cordova.plugins.iosrtc.enumerateDevices.bind(navigator.mediaDevices)
-							);
-						} else*/ {
-							self.getUserMedia = getUserMedia;
-							self.enumerateDevices = cordova.plugins.iosrtc.enumerateDevices;
-						}
-						 
-						window.RTCIceCandidate = cordova.plugins.iosrtc.RTCIceCandidate;
-						window.RTCSessionDescription            = cordova.plugins.iosrtc.RTCSessionDescription;
-						
-						window.MediaStream                      = cordova.plugins.iosrtc.MediaStream;
-						window.MediaStreamTrack                 = cordova.plugins.iosrtc.MediaStreamTrack
-						 
-						 /*if (!MediaStream.prototype.getVideoTracks) {
-								MediaStream.prototype.getVideoTracks = function () {
-									return this.videoTracks;
-								};
-							}
-							if (!MediaStream.prototype.getAudioTracks) {
-								MediaStream.prototype.getAudioTracks = function () {
-									return this.audioTracks;
-								};
-							}*/
-						onReady(options, this.getUserMediaWithConstraints);
-						resolve();
-					 });  // End of ondeviceready.
-				// }); 
-			}				
-			else {
+                window.addEventListener("load", function () {
+                    console.log("lib-jitsi-cordova >>> DOM ready event");
+                    document.addEventListener("deviceready", function () {
+                        console.log("lib-jitsi-cordova >>> deviceready event");
+                          //getStats not yet implemented in iosrtc plugin
+                         cordova.plugins.iosrtc.RTCPeerConnection.prototype.getStats = function(callback)
+                         {
+                             //console.log("simulated callback for peerconnection.getStats() remove this when its done RTCUtils line ~630");
+                         };
+                         self.peerconnection = cordova.plugins.iosrtc.RTCPeerConnection;
+
+
+                        var getUserMedia =  cordova.plugins.iosrtc.getUserMedia;
+                        /*if (navigator.mediaDevices) {
+                            self.getUserMedia = wrapGetUserMedia(getUserMedia);
+                            self.enumerateDevices = wrapEnumerateDevices(
+                                cordova.plugins.iosrtc.enumerateDevices.bind(navigator.mediaDevices)
+                            );
+                        } else*/ {
+                            self.getUserMedia = getUserMedia;
+                            self.enumerateDevices = cordova.plugins.iosrtc.enumerateDevices;
+                        }
+
+                        window.RTCIceCandidate = cordova.plugins.iosrtc.RTCIceCandidate;
+                        window.RTCSessionDescription            = cordova.plugins.iosrtc.RTCSessionDescription;
+
+                        window.MediaStream                      = cordova.plugins.iosrtc.MediaStream;
+                        window.MediaStreamTrack                 = cordova.plugins.iosrtc.MediaStreamTrack
+
+                         /*if (!MediaStream.prototype.getVideoTracks) {
+                                MediaStream.prototype.getVideoTracks = function () {
+                                    return this.videoTracks;
+                                };
+                            }
+                            if (!MediaStream.prototype.getAudioTracks) {
+                                MediaStream.prototype.getAudioTracks = function () {
+                                    return this.audioTracks;
+                                };
+                            }*/
+                        onReady(options, this.getUserMediaWithConstraints);
+                        resolve();
+                     });  // End of ondeviceready.
+                });
+            } else {
+                var errmsg = 'Browser does not appear to be WebRTC-capable';
                 try {
-                    logger.error('Browser does not appear to be WebRTC-capable');
+                    logger.error(errmsg);
                 } catch (e) {
                 }
-                reject('Browser does not appear to be WebRTC-capable');
+                reject(new Error(errmsg));
                 return;
             }
 
@@ -4826,21 +6627,24 @@ var RTCUtils = {
             this.getUserMedia(constraints,
                 function (stream) {
                     logger.log('onUserMediaSuccess');
-                    setAvailableDevices(um, true);
+                    setAvailableDevices(um, stream);
                     success_callback(stream);
                 },
                 function (error) {
-                    setAvailableDevices(um, false);
+                    setAvailableDevices(um, undefined);
                     logger.warn('Failed to get access to local media. Error ',
                         error, constraints);
+
                     if (failure_callback) {
-                        failure_callback(error, resolution);
+                        failure_callback(
+                            new JitsiTrackError(error, constraints, um));
                     }
                 });
         } catch (e) {
             logger.error('GUM failed: ', e);
+
             if (failure_callback) {
-                failure_callback(e);
+                failure_callback(new JitsiTrackError(e, constraints, um));
             }
         }
     },
@@ -4861,6 +6665,7 @@ var RTCUtils = {
         var self = this;
 
         options = options || {};
+        var dsOptions = options.desktopSharingExtensionExternalInstallation;
         return new Promise(function (resolve, reject) {
             var successCallback = function (stream) {
                 resolve(handleLocalStream(stream, options.resolution));
@@ -4871,8 +6676,15 @@ var RTCUtils = {
                 && options.devices.indexOf("desktop") !== -1){
                 reject(new Error("Desktop sharing is not supported!"));
             }
-            if (RTCBrowserType.isFirefox() ||
-                RTCBrowserType.isTemasysPluginUsed()) {
+            if (RTCBrowserType.isFirefox()
+                    // XXX The react-native-webrtc implementation that we
+                    // utilize on React Native at the time of this writing does
+                    // not support the MediaStream constructors defined by
+                    // https://www.w3.org/TR/mediacapture-streams/#constructors
+                    // and instead has a single constructor which expects (an
+                    // NSNumber as) a MediaStream ID.
+                    || RTCBrowserType.isReactNative()
+                    || RTCBrowserType.isTemasysPluginUsed()) {
                 var GUM = function (device, s, e) {
                     this.getUserMediaWithConstraints(device, s, e, options);
                 };
@@ -4884,7 +6696,8 @@ var RTCUtils = {
 
                 if(screenObtainer.isSupported()){
                     deviceGUM["desktop"] = screenObtainer.obtainStream.bind(
-                        screenObtainer);
+                        screenObtainer,
+                        dsOptions);
                 }
                 // With FF/IE we can't split the stream into audio and video because FF
                 // doesn't support media stream constructors. So, we need to get the
@@ -4911,46 +6724,88 @@ var RTCUtils = {
                     this.getUserMediaWithConstraints(
                         options.devices,
                         function (stream) {
-                            if((options.devices.indexOf("audio") !== -1 &&
-                                !stream.getAudioTracks().length) ||
-                                (options.devices.indexOf("video") !== -1 &&
-                                !stream.getVideoTracks().length))
+                            var audioDeviceRequested = options.devices.indexOf("audio") !== -1;
+                            var videoDeviceRequested = options.devices.indexOf("video") !== -1;
+                            var audioTracksReceived = !!stream.getAudioTracks().length;
+                            var videoTracksReceived = !!stream.getVideoTracks().length;
+
+                            if((audioDeviceRequested && !audioTracksReceived) ||
+                                (videoDeviceRequested && !videoTracksReceived))
                             {
                                 self.stopMediaStream(stream);
-                                reject(JitsiTrackErrors.parseError(
-                                    new Error("Unable to get the audio and " +
-                                        "video tracks."),
-                                    options.devices));
+
+                                // We are getting here in case if we requested
+                                // 'audio' or 'video' devices or both, but
+                                // didn't get corresponding MediaStreamTrack in
+                                // response stream. We don't know the reason why
+                                // this happened, so reject with general error.
+                                var devices = [];
+
+                                if (audioDeviceRequested && !audioTracksReceived) {
+                                    devices.push("audio");
+                                }
+
+                                if (videoDeviceRequested && !videoTracksReceived) {
+                                    devices.push("video");
+                                }
+
+                                // we are missing one of the media we requested
+                                // in order to get the actual error that caused
+                                // this missing media we will call one more time
+                                // getUserMedia so we can obtain the actual
+                                // error (Example usecases are requesting
+                                // audio and video and video device is missing
+                                // or device is denied to be used and chrome is
+                                // set to not ask for permissions)
+                                self.getUserMediaWithConstraints(
+                                    devices,
+                                    function (stream) {
+                                        // we already failed to obtain this
+                                        // media, so we are not supposed in any
+                                        // way to receive success for this call
+                                        // any way we will throw an error to be
+                                        // sure the promise will finish
+                                        reject(new JitsiTrackError(
+                                            { name: "UnknownError" },
+                                            getConstraints(
+                                                options.devices, options),
+                                            devices)
+                                        );
+                                    },
+                                    function (error) {
+                                        // rejects with real error for not
+                                        // obtaining the media
+                                        reject(error);
+                                    },options);
+
                                 return;
                             }
                             if(hasDesktop) {
                                 screenObtainer.obtainStream(
+                                    dsOptions,
                                     function (desktopStream) {
                                         successCallback({audioVideo: stream,
                                             desktopStream: desktopStream});
                                     }, function (error) {
                                         self.stopMediaStream(stream);
-                                        reject(
-                                            JitsiTrackErrors.parseError(error,
-                                                options.devices));
+
+                                        reject(error);
                                     });
                             } else {
                                 successCallback({audioVideo: stream});
                             }
                         },
                         function (error) {
-                            reject(JitsiTrackErrors.parseError(error,
-                                options.devices));
+                            reject(error);
                         },
                         options);
                 } else if (hasDesktop) {
                     screenObtainer.obtainStream(
+                        dsOptions,
                         function (stream) {
                             successCallback({desktopStream: stream});
                         }, function (error) {
-                            reject(
-                                JitsiTrackErrors.parseError(error,
-                                    ["desktop"]));
+                            reject(error);
                         });
                 }
             }
@@ -4968,17 +6823,51 @@ var RTCUtils = {
     isRTCReady: function () {
         return rtcReady;
     },
-    /**
-     * Checks if its possible to enumerate available cameras/micropones.
-     * @returns {boolean} true if available, false otherwise.
-     */
-    isDeviceListAvailable: function () {
+    _isDeviceListAvailable: function () {
+        if (!rtcReady)
+            throw new Error("WebRTC not ready yet");
         var isEnumerateDevicesAvailable
             = navigator.mediaDevices && navigator.mediaDevices.enumerateDevices;
         if (isEnumerateDevicesAvailable) {
             return true;
         }
-        return (MediaStreamTrack && MediaStreamTrack.getSources)? true : false;
+        return (typeof MediaStreamTrack !== "undefined" &&
+            MediaStreamTrack.getSources)? true : false;
+    },
+    /**
+     * Returns a promise which can be used to make sure that the WebRTC stack
+     * has been initialized.
+     *
+     * @returns {Promise} which is resolved only if the WebRTC stack is ready.
+     * Note that currently we do not detect stack initialization failure and
+     * the promise is never rejected(unless unexpected error occurs).
+     */
+    onRTCReady: function() {
+        if (rtcReady) {
+            return Promise.resolve();
+        } else {
+            return new Promise(function (resolve) {
+                var listener = function () {
+                    eventEmitter.removeListener(RTCEvents.RTC_READY, listener);
+                    resolve();
+                };
+                eventEmitter.addListener(RTCEvents.RTC_READY, listener);
+                // We have no failed event, so... it either resolves or nothing
+                // happens
+            });
+        }
+    },
+    /**
+     * Checks if its possible to enumerate available cameras/microphones.
+     *
+     * @returns {Promise<boolean>} a Promise which will be resolved only once
+     * the WebRTC stack is ready, either with true if the device listing is
+     * available available or with false otherwise.
+     */
+    isDeviceListAvailable: function () {
+        return this.onRTCReady().then(function() {
+            return this._isDeviceListAvailable();
+        }.bind(this));
     },
     /**
      * Returns true if changing the input (camera / microphone) or output
@@ -4989,7 +6878,7 @@ var RTCUtils = {
      */
 
     isDeviceChangeAvailable: function (deviceType) {
-		
+
         return deviceType === 'output' || deviceType === 'audiooutput'
             ? isAudioOutputDeviceChangeAvailable
             : RTCBrowserType.isChrome() ||
@@ -5018,9 +6907,18 @@ var RTCUtils = {
             mediaStream.stop();
         }
 
+        // The MediaStream implementation of the react-native-webrtc project has
+        // an explicit release method that is to be invoked in order to release
+        // used resources such as memory.
+        if (mediaStream.release) {
+            mediaStream.release();
+        }
+
         // if we have done createObjectURL, lets clean it
-        if (mediaStream.jitsiObjectURL) {
-            webkitURL.revokeObjectURL(mediaStream.jitsiObjectURL);
+        var url = mediaStream.jitsiObjectURL;
+        if (url) {
+            delete mediaStream.jitsiObjectURL;
+            (URL || webkitURL).revokeObjectURL(url);
         }
     },
     /**
@@ -5033,7 +6931,8 @@ var RTCUtils = {
     /**
      * Sets current audio output device.
      * @param {string} deviceId - id of 'audiooutput' device from
-     *      navigator.mediaDevices.enumerateDevices(), '' for default device
+     *      navigator.mediaDevices.enumerateDevices(), 'default' for default
+     *      device
      * @returns {Promise} - resolves when audio output is changed, is rejected
      *      otherwise
      */
@@ -5045,7 +6944,7 @@ var RTCUtils = {
 
         return featureDetectionAudioEl.setSinkId(deviceId)
             .then(function() {
-                audioOuputDeviceId = deviceId;
+                audioOutputDeviceId = deviceId;
 
                 logger.log('Audio output device set to ' + deviceId);
 
@@ -5059,7 +6958,32 @@ var RTCUtils = {
      * @returns {string}
      */
     getAudioOutputDevice: function () {
-        return audioOuputDeviceId;
+        return audioOutputDeviceId;
+    },
+
+    /**
+     * Returns list of available media devices if its obtained, otherwise an
+     * empty array is returned/
+     * @returns {Array} list of available media devices.
+     */
+    getCurrentlyAvailableMediaDevices: function () {
+        return currentlyAvailableMediaDevices;
+    },
+
+    /**
+     * Returns event data for device to be reported to stats.
+     * @returns {MediaDeviceInfo} device.
+     */
+    getEventDataForActiveDevice: function (device) {
+        var devices = [];
+        var deviceData = {
+            "deviceId": device.deviceId,
+            "kind":     device.kind,
+            "label":    device.label,
+            "groupId":  device.groupId
+        };
+        devices.push(deviceData);
+        return { deviceList: devices };
     }
 };
 
@@ -5067,7 +6991,7 @@ module.exports = RTCUtils;
 
 }).call(this,"/modules/RTC/RTCUtils.js")
 
-},{"../../JitsiTrackErrors":10,"../../service/RTC/MediaType":129,"../../service/RTC/RTCEvents":130,"../../service/RTC/Resolutions":131,"../../service/RTC/VideoType":132,"../xmpp/SDPUtil":37,"./RTCBrowserType":18,"./ScreenObtainer":21,"./adapter.screenshare":22,"events":54,"jitsi-meet-logger":82}],21:[function(require,module,exports){
+},{"../../JitsiTrackError":13,"../../JitsiTrackErrors":14,"../../service/RTC/CameraFacingMode":146,"../../service/RTC/MediaType":147,"../../service/RTC/RTCEvents":148,"../../service/RTC/Resolutions":149,"../../service/RTC/VideoType":150,"../util/GlobalOnErrorHandler":41,"../xmpp/SDPUtil":51,"./RTCBrowserType":22,"./ScreenObtainer":25,"./adapter.screenshare":26,"events":63,"jitsi-meet-logger":68}],25:[function(require,module,exports){
 (function (__filename){
 /* global chrome, $, alert */
 /* jshint -W003 */
@@ -5075,6 +6999,8 @@ var logger = require("jitsi-meet-logger").getLogger(__filename);
 var RTCBrowserType = require("./RTCBrowserType");
 var AdapterJS = require("./adapter.screenshare");
 var JitsiTrackErrors = require("../../JitsiTrackErrors");
+var JitsiTrackError = require("../../JitsiTrackError");
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 
 /**
  * Indicates whether the Chrome desktop sharing extension is installed.
@@ -5106,6 +7032,19 @@ var reDetectFirefoxExtension = false;
 var GUM = null;
 
 /**
+ * The error returned by chrome when trying to start inline installation from
+ * popup.
+ */
+var CHROME_EXTENSION_POPUP_ERROR =
+    "Inline installs can not be initiated from pop-up windows.";
+
+/**
+ * The error message returned by chrome when the extension is installed.
+ */
+var CHROME_NO_EXTENSION_ERROR_MSG =
+    "Could not establish connection. Receiving end does not exist.";
+
+/**
  * Handles obtaining a stream from a screen capture on different browsers.
  */
 var ScreenObtainer = {
@@ -5121,6 +7060,8 @@ var ScreenObtainer = {
      * or disable screen capture (if the value is other).
      * Note that for the "screen" media source to work the
      * 'chrome://flags/#enable-usermedia-screen-capture' flag must be set.
+     * @param options {object}
+     * @param gum {Function} GUM method
      */
     init: function(options, gum) {
         var obtainDesktopStream = null;
@@ -5135,8 +7076,36 @@ var ScreenObtainer = {
             (options.desktopSharingChromeMethod || options.desktopSharing);
 
         if (RTCBrowserType.isNWJS()) {
-            obtainDesktopStream = function (onSuccess, onFailure) {
-                window.JitsiMeetNW.obtainDesktopStream (onSuccess, onFailure);
+            obtainDesktopStream = function (options, onSuccess, onFailure) {
+                window.JitsiMeetNW.obtainDesktopStream (
+                    onSuccess, function (error, constraints) {
+                        var jitsiError;
+                        // FIXME:
+                        // This is very very durty fix for recognising that the
+                        // user have clicked the cancel button from the Desktop
+                        // sharing pick window. The proper solution would be to
+                        // detect this in the NWJS application by checking the
+                        // streamId === "". Even better solution would be to
+                        // stop calling GUM from the NWJS app and just pass the
+                        // streamId to lib-jitsi-meet. This way the desktop
+                        // sharing implementation for NWJS and chrome extension
+                        // will be the same and lib-jitsi-meet will be able to
+                        // control the constraints, check the streamId, etc.
+                        //
+                        // I cannot find documentation about "InvalidStateError"
+                        // but this is what we are receiving from GUM when the
+                        // streamId for the desktop sharing is "".
+                        if (error && error.name == "InvalidStateError") {
+                            jitsiError = new JitsiTrackError(
+                                JitsiTrackErrors.CHROME_EXTENSION_USER_CANCELED
+                            );
+                        } else {
+                            jitsiError = new JitsiTrackError(
+                                error, constraints, ["desktop"]);
+                        }
+                        (typeof(onFailure) === "function") &&
+                            onFailure(jitsiError);
+                    });
             };
         } 
 		else if (RTCBrowserType.isTemasysPluginUsed()) {
@@ -5208,7 +7177,7 @@ var ScreenObtainer = {
      * @param errorCallback
      */
     obtainScreenOnFirefox:
-           function (callback, errorCallback) {
+           function (options, callback, errorCallback) {
         var self = this;
         var extensionRequired = false;
         if (this.options.desktopSharingFirefoxMaxVersionExtRequired === -1 ||
@@ -5221,7 +7190,7 @@ var ScreenObtainer = {
         }
 
         if (!extensionRequired || firefoxExtInstalled === true) {
-            obtainWebRTCScreen(callback, errorCallback);
+            obtainWebRTCScreen(options, callback, errorCallback);
             return;
         }
 
@@ -5254,16 +7223,14 @@ var ScreenObtainer = {
 
         // Make sure desktopsharing knows that we failed, so that it doesn't get
         // stuck in 'switching' mode.
-        errorCallback({
-            type: "jitsiError",
-            errorObject: JitsiTrackErrors.FIREFOX_EXTENSION_NEEDED
-        });
+        errorCallback(
+            new JitsiTrackError(JitsiTrackErrors.FIREFOX_EXTENSION_NEEDED));
     },
     /**
      * Asks Chrome extension to call chooseDesktopMedia and gets chrome
      * 'desktop' stream for returned stream token.
      */
-    obtainScreenFromExtension: function (streamCallback, failCallback) {
+    obtainScreenFromExtension: function(options, streamCallback, failCallback) {
         var self = this;
         if (chromeExtInstalled) {
             doGetStreamFromExtension(this.options, streamCallback,
@@ -5288,26 +7255,58 @@ var ScreenObtainer = {
                                 streamCallback, failCallback);
                         }, 500);
                     },
-                    function (arg) {
-                        logger.log("Failed to install the extension from:"
-                            + getWebStoreInstallUrl(self.options), arg);
-                        failCallback({
-                            type: "jitsiError",
-                            errorObject: JitsiTrackErrors
-                                .CHROME_EXTENSION_INSTALLATION_ERROR
-                        });
-                    }
+                    this.handleExtensionInstallationError.bind(this,
+                        options, streamCallback, failCallback)
                 );
             } catch(e) {
-                logger.log("Failed to install the extension from:"
-                    + self.getWebStoreInstallUrl(this.options), e);
-                failCallback({
-                    type: "jitsiError",
-                    errorObject:
-                        JitsiTrackErrors.CHROME_EXTENSION_INSTALLATION_ERROR
-                });
+                this.handleExtensionInstallationError(options, streamCallback,
+                    failCallback, e);
             }
         }
+    },
+    handleExtensionInstallationError: function (options, streamCallback,
+        failCallback, e) {
+        if( CHROME_EXTENSION_POPUP_ERROR === e && options.interval > 0 &&
+            typeof(options.checkAgain) === "function" &&
+            typeof(options.listener) === "function") {
+            options.listener("waitingForExtension",
+                getWebStoreInstallUrl(this.options));
+            this.checkForChromeExtensionOnInterval(options,
+                streamCallback, failCallback, e);
+            return;
+        }
+        var msg = "Failed to install the extension from "
+            + getWebStoreInstallUrl(this.options);
+
+        logger.log(msg, e);
+
+        failCallback(new JitsiTrackError(
+            JitsiTrackErrors.CHROME_EXTENSION_INSTALLATION_ERROR,
+            msg
+        ));
+    },
+    checkForChromeExtensionOnInterval: function (options,
+        streamCallback, failCallback) {
+        if (options.checkAgain() === false) {
+            failCallback(new JitsiTrackError(
+                JitsiTrackErrors.CHROME_EXTENSION_INSTALLATION_ERROR));
+            return;
+        }
+        var self = this;
+        window.setTimeout(function () {
+            checkChromeExtInstalled(function (installed, updateRequired) {
+                chromeExtInstalled = installed;
+                chromeExtUpdateRequired = updateRequired;
+                if(installed) {
+                    options.listener("extensionFound");
+                    self.obtainScreenFromExtension(options,
+                        streamCallback, failCallback);
+                } else {
+                    self.checkForChromeExtensionOnInterval(options,
+                        streamCallback, failCallback);
+                }
+            }, self.options);
+        }, options.interval);
     }
 };
 
@@ -5322,7 +7321,7 @@ var ScreenObtainer = {
  * 'media.getusermedia.screensharing.allowed_domains' preference in
  * 'about:config'.
  */
-function obtainWebRTCScreen(streamCallback, failCallback) {
+function obtainWebRTCScreen(options, streamCallback, failCallback) {
     GUM(
         ['screen'],
         streamCallback,
@@ -5376,6 +7375,7 @@ function isUpdateRequired(minVersion, extVersion) {
         return false;
     }
     catch (e) {
+        GlobalOnErrorHandler.callErrorHandler(e);
         logger.error("Failed to parse extension version", e);
         return true;
     }
@@ -5427,7 +7427,13 @@ function doGetStreamFromExtension(options, streamCallback, failCallback) {
         },
         function (response) {
             if (!response) {
-                failCallback(chrome.runtime.lastError);
+                // possibly re-wraping error message to make code consistent
+                var lastError = chrome.runtime.lastError;
+                failCallback(lastError instanceof Error
+                    ? lastError
+                    : new JitsiTrackError(
+                        JitsiTrackErrors.CHROME_EXTENSION_GENERIC_ERROR,
+                        lastError));
                 return;
             }
             logger.log("Response from extension: ", response);
@@ -5445,15 +7451,14 @@ function doGetStreamFromExtension(options, streamCallback, failCallback) {
                 // then the callback is called with an empty streamId.
                 if(response.streamId === "")
                 {
-                    failCallback({
-                        type: "jitsiError",
-                        errorObject:
-                            JitsiTrackErrors.CHROME_EXTENSION_USER_CANCELED
-                    });
+                    failCallback(new JitsiTrackError(
+                        JitsiTrackErrors.CHROME_EXTENSION_USER_CANCELED));
                     return;
                 }
 
-                failCallback("Extension failed to get the stream");
+                failCallback(new JitsiTrackError(
+                    JitsiTrackErrors.CHROME_EXTENSION_GENERIC_ERROR,
+                    response.error));
             }
         }
     );
@@ -5527,7 +7532,7 @@ module.exports = ScreenObtainer;
 
 }).call(this,"/modules/RTC/ScreenObtainer.js")
 
-},{"../../JitsiTrackErrors":10,"./RTCBrowserType":18,"./adapter.screenshare":22,"jitsi-meet-logger":82}],22:[function(require,module,exports){
+},{"../../JitsiTrackError":13,"../../JitsiTrackErrors":14,"../util/GlobalOnErrorHandler":41,"./RTCBrowserType":22,"./adapter.screenshare":26,"jitsi-meet-logger":68}],26:[function(require,module,exports){
 (function (__filename){
 /*! adapterjs - v0.12.3 - 2015-11-16 */
 var console = require("jitsi-meet-logger").getLogger(__filename);
@@ -6761,7 +8766,7 @@ else if (navigator.mediaDevices && navigator.userAgent.match(
 
 }).call(this,"/modules/RTC/adapter.screenshare.js")
 
-},{"jitsi-meet-logger":82}],23:[function(require,module,exports){
+},{"jitsi-meet-logger":68}],27:[function(require,module,exports){
 (function (__filename){
 var logger = require("jitsi-meet-logger").getLogger(__filename);
 var UsernameGenerator = require('../util/UsernameGenerator');
@@ -6890,15 +8895,87 @@ module.exports = Settings;
 
 }).call(this,"/modules/settings/Settings.js")
 
-},{"../util/UsernameGenerator":30,"jitsi-meet-logger":82}],24:[function(require,module,exports){
+},{"../util/UsernameGenerator":44,"jitsi-meet-logger":68}],28:[function(require,module,exports){
+var RTCBrowserType = require("../RTC/RTCBrowserType");
+
+function NoopAnalytics() {}
+NoopAnalytics.prototype.sendEvent = function () {};
+
+function AnalyticsAdapter() {
+    this.browserName = RTCBrowserType.getBrowserName();
+}
+
+// some events may happen before init or implementation script download
+// in this case we accumulate them in this array and send them on init
+AnalyticsAdapter.eventsQueue = [];
+
+// XXX Since we asynchronously load the integration of the analytics API and the
+// analytics API may asynchronously load its implementation (e.g. Google
+// Analytics), we cannot make the decision with respect to which analytics
+// implementation we will use here and we have to postpone it i.e. we will make
+// a lazy decision, will wait for loaded or dispose methods to be called.
+// in the meantime we accumulate any events received
+AnalyticsAdapter.prototype.sendEvent = function (action, data, label) {
+    if (this.analytics === null || typeof this.analytics === 'undefined') {
+        // missing this.analytics but have window implementation, let's use it
+        if (window.Analytics) {
+            this.loaded();
+        }
+        else {
+            AnalyticsAdapter.eventsQueue.push({
+                action: action,
+                data: data,
+                label: label
+            });
+            // stored, lets break here
+            return;
+        }
+    }
+    try {
+        this.analytics.sendEvent(
+            action, data, label, this.browserName);
+    } catch (ignored) {}
+};
+
+/**
+ * Dispose analytics. Clears any available queue element and sets
+ * NoopAnalytics to be used.
+ */
+AnalyticsAdapter.prototype.dispose = function () {
+    this.analytics = new NoopAnalytics();
+    AnalyticsAdapter.eventsQueue.length = 0;
+};
+
+/**
+ * Loaded analytics script. Sens queued events.
+ */
+AnalyticsAdapter.prototype.loaded = function () {
+    var AnalyticsImpl = window.Analytics || NoopAnalytics;
+
+    this.analytics = new AnalyticsImpl();
+
+    // new analytics lets send all events if any
+    if (AnalyticsAdapter.eventsQueue.length) {
+        AnalyticsAdapter.eventsQueue.forEach(function (event) {
+            this.sendEvent(event.action, event.data, event.label);
+        }.bind(this));
+        AnalyticsAdapter.eventsQueue.length = 0;
+    }
+};
+
+module.exports = new AnalyticsAdapter();
+},{"../RTC/RTCBrowserType":22}],29:[function(require,module,exports){
 (function (__filename){
 /* global $, Strophe, callstats */
 var logger = require("jitsi-meet-logger").getLogger(__filename);
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 
 var jsSHA = require('jssha');
 var io = require('socket.io-client');
 
 /**
+ * We define enumeration of wrtcFuncNames as we need them before
+ * callstats is initialized to queue events.
  * @const
  * @see http://www.callstats.io/api/#enumeration-of-wrtcfuncnames
  */
@@ -6910,10 +8987,13 @@ var wrtcFuncNames = {
     addIceCandidate:      "addIceCandidate",
     getUserMedia:         "getUserMedia",
     iceConnectionFailure: "iceConnectionFailure",
-    signalingError:       "signalingError"
+    signalingError:       "signalingError",
+    applicationLog:       "applicationLog"
 };
 
 /**
+ * We define enumeration of fabricEvent as we need them before
+ * callstats is initialized to queue events.
  * @const
  * @see http://www.callstats.io/api/#enumeration-of-fabricevent
  */
@@ -6929,7 +9009,8 @@ var fabricEvent = {
     fabricTerminated:"fabricTerminated",
     screenShareStart:"screenShareStart",
     screenShareStop:"screenShareStop",
-    dominantSpeaker:"dominantSpeaker"
+    dominantSpeaker:"dominantSpeaker",
+    activeDeviceList:"activeDeviceList"
 };
 
 var callStats = null;
@@ -6937,24 +9018,60 @@ var callStats = null;
 function initCallback (err, msg) {
     logger.log("CallStats Status: err=" + err + " msg=" + msg);
 
+    CallStats.initializeInProgress = false;
+
     // there is no lib, nothing to report to
-    if (err !== 'success')
+    if (err !== 'success') {
+        CallStats.initializeFailed = true;
         return;
+    }
+
+    var ret = callStats.addNewFabric(this.peerconnection,
+        Strophe.getResourceFromJid(this.session.peerjid),
+        callStats.fabricUsage.multiplex,
+        this.confID,
+        this.pcCallback.bind(this));
+
+    var fabricInitialized = (ret.status === 'success');
+
+    if(!fabricInitialized) {
+        CallStats.initializeFailed = true;
+        console.log("callstats fabric not initilized", ret.message);
+        return;
+    }
+
+    CallStats.initializeFailed = false;
+    CallStats.initialized = true;
+    CallStats.feedbackEnabled = true;
 
     // notify callstats about failures if there were any
     if (CallStats.reportsQueue.length) {
         CallStats.reportsQueue.forEach(function (report) {
-            if (report.type === reportType.ERROR)
-            {
+            if (report.type === reportType.ERROR) {
                 var error = report.data;
                 CallStats._reportError.call(this, error.type, error.error,
                     error.pc);
             }
-            else if (report.type === reportType.EVENT)
-            {
-                var data = report.data;
+            // if we have and event to report and we failed to add fabric
+            // this event will not be reported anyway, returning an error
+            else if (report.type === reportType.EVENT
+                && fabricInitialized) {
+                var eventData = report.data;
                 callStats.sendFabricEvent(
-                    this.peerconnection, data.event, this.confID);
+                    this.peerconnection,
+                    eventData.event,
+                    this.confID,
+                    eventData.eventData);
+            } else if (report.type === reportType.MST_WITH_USERID) {
+                var data = report.data;
+                callStats.associateMstWithUserID(
+                    this.peerconnection,
+                    data.callStatsId,
+                    this.confID,
+                    data.ssrc,
+                    data.usageLabel,
+                    data.containerId
+                );
             }
         }, this);
         CallStats.reportsQueue.length = 0;
@@ -6974,6 +9091,7 @@ function _try_catch (f) {
         try {
             f.apply(this, arguments);
         } catch (e) {
+            GlobalOnErrorHandler.callErrorHandler(e);
             logger.error(e);
         }
     };
@@ -6988,12 +9106,8 @@ function _try_catch (f) {
  */
 var CallStats = _try_catch(function(jingleSession, Settings, options) {
     try{
-        //check weather that should work with more than 1 peerconnection
-        if(!callStats) {
-            callStats = new callstats($, io, jsSHA);
-        } else {
-            return;
-        }
+        CallStats.feedbackEnabled = false;
+        callStats = new callstats($, io, jsSHA);
 
         this.session = jingleSession;
         this.peerconnection = jingleSession.peerconnection.peerconnection;
@@ -7004,21 +9118,21 @@ var CallStats = _try_catch(function(jingleSession, Settings, options) {
         // The confID is case sensitive!!!
         this.confID = location.hostname + "/" + options.roomName;
 
+        this.callStatsID = options.callStatsID;
+        this.callStatsSecret = options.callStatsSecret;
+
+        CallStats.initializeInProgress = true;
         //userID is generated or given by the origin server
-        callStats.initialize(options.callStatsID,
-            options.callStatsSecret,
+        callStats.initialize(this.callStatsID,
+            this.callStatsSecret,
             this.userID,
             initCallback.bind(this));
 
-        callStats.addNewFabric(this.peerconnection,
-            Strophe.getResourceFromJid(jingleSession.peerjid),
-            callStats.fabricUsage.multiplex,
-            this.confID,
-            this.pcCallback.bind(this));
     } catch (e) {
         // The callstats.io API failed to initialize (e.g. because its
         // download failed to succeed in general or on time). Further
         // attempts to utilize it cannot possibly succeed.
+        GlobalOnErrorHandler.callErrorHandler(e);
         callStats = null;
         logger.error(e);
     }
@@ -7030,12 +9144,57 @@ var CallStats = _try_catch(function(jingleSession, Settings, options) {
 CallStats.reportsQueue = [];
 
 /**
+ * Whether the library was successfully initialized using its initialize method.
+ * And whether we had successfully called addNewFabric.
+ * @type {boolean}
+ */
+CallStats.initialized = false;
+
+/**
+ * Whether we are in progress of initializing.
+ * @type {boolean}
+ */
+CallStats.initializeInProgress = false;
+
+/**
+ * Whether we tried to initialize and it failed.
+ * @type {boolean}
+ */
+CallStats.initializeFailed = false;
+
+/**
+ * Shows weather sending feedback is enabled or not
+ * @type {boolean}
+ */
+CallStats.feedbackEnabled = false;
+
+/**
+ * Checks whether we need to re-initialize callstats and starts the process.
+ * @private
+ */
+CallStats._checkInitialize = function () {
+    if (CallStats.initialized || !CallStats.initializeFailed
+        || !callStats || CallStats.initializeInProgress)
+        return;
+
+    // callstats object created, not initialized and it had previously failed,
+    // and there is no init in progress, so lets try initialize it again
+    CallStats.initializeInProgress = true;
+    callStats.initialize(
+        callStats.callStatsID,
+        callStats.callStatsSecret,
+        callStats.userID,
+        initCallback.bind(callStats));
+};
+
+/**
  * Type of pending reports, can be event or an error.
  * @type {{ERROR: string, EVENT: string}}
  */
 var reportType = {
     ERROR: "error",
-    EVENT: "event"
+    EVENT: "event",
+    MST_WITH_USERID: "mstWithUserID"
 };
 
 CallStats.prototype.pcCallback = _try_catch(function (err, msg) {
@@ -7048,6 +9207,7 @@ CallStats.prototype.pcCallback = _try_catch(function (err, msg) {
 /**
  * Lets CallStats module know where is given SSRC rendered by providing renderer
  * tag ID.
+ * If the lib is not initialized yet queue the call for later, when its ready.
  * @param ssrc {number} the SSRC of the stream
  * @param isLocal {boolean} <tt>true<tt> if this stream is local or
  *        <tt>false</tt> otherwise.
@@ -7077,14 +9237,28 @@ function (ssrc, isLocal, usageLabel, containerId) {
             usageLabel,
             containerId
         );
-        callStats.associateMstWithUserID(
-            this.peerconnection,
-            callStatsId,
-            this.confID,
-            ssrc,
-            usageLabel,
-            containerId
-        );
+        if(CallStats.initialized) {
+            callStats.associateMstWithUserID(
+                this.peerconnection,
+                callStatsId,
+                this.confID,
+                ssrc,
+                usageLabel,
+                containerId
+            );
+        }
+        else {
+            CallStats.reportsQueue.push({
+                type: reportType.MST_WITH_USERID,
+                data: {
+                    callStatsId: callStatsId,
+                    ssrc: ssrc,
+                    usageLabel: usageLabel,
+                    containerId: containerId
+                }
+            });
+            CallStats._checkInitialize();
+        }
     }).bind(this)();
 };
 
@@ -7092,6 +9266,7 @@ function (ssrc, isLocal, usageLabel, containerId) {
  * Notifies CallStats for mute events
  * @param mute {boolean} true for muted and false for not muted
  * @param type {String} "audio"/"video"
+ * @param {CallStats} cs callstats instance related to the event
  */
 CallStats.sendMuteEvent = _try_catch(function (mute, type, cs) {
 
@@ -7110,6 +9285,7 @@ CallStats.sendMuteEvent = _try_catch(function (mute, type, cs) {
  * Notifies CallStats for screen sharing events
  * @param start {boolean} true for starting screen sharing and
  * false for not stopping
+ * @param {CallStats} cs callstats instance related to the event
  */
 CallStats.sendScreenSharingEvent = _try_catch(function (start, cs) {
 
@@ -7119,6 +9295,7 @@ CallStats.sendScreenSharingEvent = _try_catch(function (start, cs) {
 
 /**
  * Notifies CallStats that we are the new dominant speaker in the conference.
+ * @param {CallStats} cs callstats instance related to the event
  */
 CallStats.sendDominantSpeakerEvent = _try_catch(function (cs) {
 
@@ -7127,21 +9304,34 @@ CallStats.sendDominantSpeakerEvent = _try_catch(function (cs) {
 });
 
 /**
+ * Notifies CallStats about active device.
+ * @param {{deviceList: {String:String}}} list of devices with their data
+ * @param {CallStats} cs callstats instance related to the event
+ */
+CallStats.sendActiveDeviceListEvent = _try_catch(function (devicesData, cs) {
+
+    CallStats._reportEvent.call(cs, fabricEvent.activeDeviceList, devicesData);
+});
+
+/**
  * Reports an error to callstats.
  *
  * @param type the type of the error, which will be one of the wrtcFuncNames
  * @param e the error
  * @param pc the peerconnection
+ * @param eventData additional data to pass to event
  * @private
  */
-CallStats._reportEvent = function (event) {
-    if (callStats) {
-        callStats.sendFabricEvent(this.peerconnection, event, this.confID);
+CallStats._reportEvent = function (event, eventData) {
+    if (CallStats.initialized) {
+        callStats.sendFabricEvent(
+            this.peerconnection, event, this.confID, eventData);
     } else {
         CallStats.reportsQueue.push({
                 type: reportType.EVENT,
-                data: {event: event}
+                data: {event: event, eventData: eventData}
             });
+        CallStats._checkInitialize();
     }
 };
 
@@ -7149,12 +9339,24 @@ CallStats._reportEvent = function (event) {
  * Notifies CallStats for connection setup errors
  */
 CallStats.prototype.sendTerminateEvent = _try_catch(function () {
-    if(!callStats) {
+    if(!CallStats.initialized) {
         return;
     }
     callStats.sendFabricEvent(this.peerconnection,
         callStats.fabricEvent.fabricTerminated, this.confID);
 });
+
+/**
+ * Notifies CallStats that audio problems are detected.
+ *
+ * @param {Error} e error to send
+ * @param {CallStats} cs callstats instance related to the error (optional)
+ */
+CallStats.prototype.sendDetectedAudioProblem = _try_catch(function (e) {
+    CallStats._reportError.call(this, wrtcFuncNames.applicationLog, e,
+        this.peerconnection);
+});
+
 
 /**
  * Notifies CallStats for ice connection failed
@@ -7175,7 +9377,7 @@ CallStats.prototype.sendIceConnectionFailedEvent = _try_catch(function (pc, cs){
  */
 CallStats.prototype.sendFeedback = _try_catch(
 function(overallFeedback, detailedFeedback) {
-    if(!callStats) {
+    if(!CallStats.feedbackEnabled) {
         return;
     }
     var feedbackString =    '{"userID":"' + this.userID + '"' +
@@ -7196,13 +9398,18 @@ function(overallFeedback, detailedFeedback) {
  * @private
  */
 CallStats._reportError = function (type, e, pc) {
-    if (callStats) {
+    if(!e) {
+        logger.warn("No error is passed!");
+        e = new Error("Unknown error");
+    }
+    if (CallStats.initialized) {
         callStats.reportError(pc, this.confID, type, e);
     } else {
         CallStats.reportsQueue.push({
             type: reportType.ERROR,
             data: { type: type, error: e, pc: pc}
         });
+        CallStats._checkInitialize();
     }
     // else just ignore it
 };
@@ -7273,24 +9480,33 @@ CallStats.sendAddIceCandidateFailed = _try_catch(function (e, pc, cs) {
 });
 
 /**
- * Notifies CallStats that there is an unhandled error on the page.
+ * Notifies CallStats that there is a log we want to report.
  *
- * @param {Error} e error to send
- * @param {RTCPeerConnection} pc connection on which failure occured.
+ * @param {Error} e error to send or {String} message
  * @param {CallStats} cs callstats instance related to the error (optional)
  */
-CallStats.sendUnhandledError = _try_catch(function (e, cs) {
-    // for now send the stack property of errors, which is has the form:
-    // name: message <newline> stack(multiline)
+CallStats.sendApplicationLog = _try_catch(function (e, cs) {
     CallStats._reportError
-        .call(cs, wrtcFuncNames.signalingError, e, null);
+        .call(cs, wrtcFuncNames.applicationLog, e, null);
 });
+
+/**
+ * Clears allocated resources.
+ */
+CallStats.dispose = function () {
+    // The next line is commented because we need to be able to send feedback
+    // even after the conference has been destroyed.
+    // callStats = null;
+    CallStats.initialized = false;
+    CallStats.initializeFailed = false;
+    CallStats.initializeInProgress = false;
+};
 
 module.exports = CallStats;
 
 }).call(this,"/modules/statistics/CallStats.js")
 
-},{"jitsi-meet-logger":82,"jssha":84,"socket.io-client":117}],25:[function(require,module,exports){
+},{"../util/GlobalOnErrorHandler":41,"jitsi-meet-logger":68,"jssha":69,"socket.io-client":96}],30:[function(require,module,exports){
 /* global config */
 /**
  * Provides statistics for the local stream.
@@ -7420,7 +9636,7 @@ LocalStatsCollector.prototype.stop = function () {
 
 module.exports = LocalStatsCollector;
 
-},{"../RTC/RTCBrowserType":18}],26:[function(require,module,exports){
+},{"../RTC/RTCBrowserType":22}],31:[function(require,module,exports){
 (function (__filename){
 /* global require */
 /* jshint -W101 */
@@ -7428,13 +9644,18 @@ module.exports = LocalStatsCollector;
 var logger = require("jitsi-meet-logger").getLogger(__filename);
 var RTCBrowserType = require("../RTC/RTCBrowserType");
 var StatisticsEvents = require("../../service/statistics/Events");
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 
 /* Whether we support the browser we are running into for logging statistics */
 var browserSupported = RTCBrowserType.isChrome() ||
         RTCBrowserType.isOpera() || RTCBrowserType.isFirefox();
 
-var keyMap = {};
-keyMap[RTCBrowserType.RTC_BROWSER_FIREFOX] = {
+/**
+ * The LibJitsiMeet browser-agnostic names of the browser-specific keys reported
+ * by RTCPeerConnection#getStats mapped by RTCBrowserType.
+ */
+var KEYS_BY_BROWSER_TYPE = {};
+KEYS_BY_BROWSER_TYPE[RTCBrowserType.RTC_BROWSER_FIREFOX] = {
     "ssrc": "ssrc",
     "packetsReceived": "packetsReceived",
     "packetsLost": "packetsLost",
@@ -7442,7 +9663,7 @@ keyMap[RTCBrowserType.RTC_BROWSER_FIREFOX] = {
     "bytesReceived": "bytesReceived",
     "bytesSent": "bytesSent"
 };
-keyMap[RTCBrowserType.RTC_BROWSER_CHROME] = {
+KEYS_BY_BROWSER_TYPE[RTCBrowserType.RTC_BROWSER_CHROME] = {
     "receiveBandwidth": "googAvailableReceiveBandwidth",
     "sendBandwidth": "googAvailableSendBandwidth",
     "remoteAddress": "googRemoteAddress",
@@ -7462,12 +9683,15 @@ keyMap[RTCBrowserType.RTC_BROWSER_CHROME] = {
     "audioInputLevel": "audioInputLevel",
     "audioOutputLevel": "audioOutputLevel"
 };
-keyMap[RTCBrowserType.RTC_BROWSER_OPERA] =
-    keyMap[RTCBrowserType.RTC_BROWSER_CHROME];
-keyMap[RTCBrowserType.RTC_BROWSER_IEXPLORER] =
-    keyMap[RTCBrowserType.RTC_BROWSER_CHROME];
-keyMap[RTCBrowserType.RTC_BROWSER_SAFARI] =
-    keyMap[RTCBrowserType.RTC_BROWSER_CHROME];
+KEYS_BY_BROWSER_TYPE[RTCBrowserType.RTC_BROWSER_OPERA] =
+    KEYS_BY_BROWSER_TYPE[RTCBrowserType.RTC_BROWSER_CHROME];
+KEYS_BY_BROWSER_TYPE[RTCBrowserType.RTC_BROWSER_IEXPLORER] =
+    KEYS_BY_BROWSER_TYPE[RTCBrowserType.RTC_BROWSER_CHROME];
+KEYS_BY_BROWSER_TYPE[RTCBrowserType.RTC_BROWSER_SAFARI] =
+    KEYS_BY_BROWSER_TYPE[RTCBrowserType.RTC_BROWSER_CHROME];
+KEYS_BY_BROWSER_TYPE[RTCBrowserType.RTC_BROWSER_REACT_NATIVE] =
+    KEYS_BY_BROWSER_TYPE[RTCBrowserType.RTC_BROWSER_CHROME];
+
 /**
  * Calculates packet lost percent using the number of lost packets and the
  * number of all packet.
@@ -7481,15 +9705,6 @@ function calculatePacketLoss(lostPackets, totalPackets) {
     return Math.round((lostPackets/totalPackets)*100);
 }
 
-function getStatValue(item, name) {
-    var browserType = RTCBrowserType.getBrowserType();
-    if (!keyMap[browserType][name])
-        throw "The property isn't supported!";
-    var key = keyMap[browserType][name];
-    return (RTCBrowserType.isChrome() || RTCBrowserType.isOpera()) ?
-        item.stat(key) : item[key];
-}
-
 function formatAudioLevel(audioLevel) {
     return Math.min(Math.max(audioLevel, 0), 1);
 }
@@ -7498,10 +9713,11 @@ function formatAudioLevel(audioLevel) {
  * Checks whether a certain record should be included in the logged statistics.
  */
 function acceptStat(reportId, reportType, statName) {
-    if (reportType == "googCandidatePair" && statName == "googChannelId")
-        return false;
+    if (reportType == "googCandidatePair") {
+        if (statName == "googChannelId")
+            return false;
 
-    if (reportType == "ssrc") {
+    } else if (reportType == "ssrc") {
         if (statName == "googTrackId" ||
             statName == "transportId" ||
             statName == "ssrc")
@@ -7515,12 +9731,12 @@ function acceptStat(reportId, reportType, statName) {
  * Checks whether a certain record should be included in the logged statistics.
  */
 function acceptReport(id, type) {
+    if (type == "googComponent")
+        return false;
+
     if (id.substring(0, 15) == "googCertificate" ||
         id.substring(0, 9) == "googTrack" ||
         id.substring(0, 20) == "googLibjingleSession")
-        return false;
-
-    if (type == "googComponent")
         return false;
 
     return true;
@@ -7530,8 +9746,7 @@ function acceptReport(id, type) {
  * Peer statistics data holder.
  * @constructor
  */
-function PeerStats()
-{
+function PeerStats() {
     this.ssrc2Loss = {};
     this.ssrc2AudioLevel = {};
     this.ssrc2bitrate = {
@@ -7591,7 +9806,6 @@ PeerStats.prototype.setSsrcAudioLevel = function (audioLevel) {
 
 function ConferenceStats() {
 
-
     /**
      * The bandwidth
      * @type {{}}
@@ -7610,7 +9824,6 @@ function ConferenceStats() {
      */
     this.packetLoss = null;
 
-
     /**
      * Array with the transport information.
      * @type {Array}
@@ -7625,15 +9838,45 @@ function ConferenceStats() {
  * is done <tt>audioLevelsUpdateCallback</tt> is called with <tt>this</tt>
  * instance as an event source.
  *
- * @param peerconnection webRTC peer connection object.
- * @param interval stats refresh interval given in ms.
- * @param {function(StatsCollector)} audioLevelsUpdateCallback the callback
- * called on stats update.
- * @param config {object} supports the following properties - disableAudioLevels, disableStats, logStats
+ * @param peerconnection WebRTC PeerConnection object.
+ * @param audioLevelsInterval
+ * @param statsInterval stats refresh interval given in ms.
+ * @param eventEmitter
  * @constructor
  */
-function StatsCollector(peerconnection, audioLevelsInterval, statsInterval, eventEmitter, config)
-{
+function StatsCollector(
+        peerconnection,
+        audioLevelsInterval,
+        statsInterval,
+        eventEmitter) {
+    // StatsCollector depends entirely on the format of the reports returned by
+    // RTCPeerConnection#getStats. Given that the value of
+    // RTCBrowserType#getBrowserType() is very unlikely to change at runtime, it
+    // makes sense to discover whether StatsCollector supports the executing
+    // browser as soon as possible. Otherwise, (1) getStatValue would have to
+    // needlessly check a "static" condition multiple times very very often and
+    // (2) the lack of support for the executing browser would be discovered and
+    // reported multiple times very very often too late in the execution in some
+    // totally unrelated callback.
+    /**
+     * The RTCBrowserType supported by this StatsCollector. In other words, the
+     * RTCBrowserType of the browser which initialized this StatsCollector
+     * instance.
+     * @private
+     */
+    this._browserType = RTCBrowserType.getBrowserType();
+    var keys = KEYS_BY_BROWSER_TYPE[this._browserType];
+    if (!keys)
+        throw "The browser type '" + this._browserType + "' isn't supported!";
+    /**
+     * The function which is to be used to retrieve the value associated in a
+     * report returned by RTCPeerConnection#getStats with a LibJitsiMeet
+     * browser-agnostic name/key.
+     * @function
+     * @private
+     */
+    this._getStatValue = this._defineGetStatValueMethod(keys);
+
     this.peerconnection = peerconnection;
     this.baselineAudioLevelsReport = null;
     this.currentAudioLevelsReport = null;
@@ -7641,7 +9884,6 @@ function StatsCollector(peerconnection, audioLevelsInterval, statsInterval, even
     this.baselineStatsReport = null;
     this.audioLevelsIntervalId = null;
     this.eventEmitter = eventEmitter;
-    this.config = config || {};
     this.conferenceStats = new ConferenceStats();
 
     /**
@@ -7657,8 +9899,7 @@ function StatsCollector(peerconnection, audioLevelsInterval, statsInterval, even
     /**
      * Stores the statistics which will be send to the focus to be logged.
      */
-    this.statsToBeLogged =
-    {
+    this.statsToBeLogged = {
         timestamps: [],
         stats: {}
     };
@@ -7683,14 +9924,12 @@ StatsCollector.prototype.stop = function () {
         this.audioLevelsIntervalId = null;
     }
 
-    if (this.statsIntervalId)
-    {
+    if (this.statsIntervalId) {
         clearInterval(this.statsIntervalId);
         this.statsIntervalId = null;
     }
 
-    if(this.gatherStatsIntervalId)
-    {
+    if (this.gatherStatsIntervalId) {
         clearInterval(this.gatherStatsIntervalId);
         this.gatherStatsIntervalId = null;
     }
@@ -7700,8 +9939,8 @@ StatsCollector.prototype.stop = function () {
  * Callback passed to <tt>getStats</tt> method.
  * @param error an error that occurred on <tt>getStats</tt> call.
  */
-StatsCollector.prototype.errorCallback = function (error)
-{
+StatsCollector.prototype.errorCallback = function (error) {
+    GlobalOnErrorHandler.callErrorHandler(error);
     logger.error("Get stats error", error);
     this.stop();
 };
@@ -7709,35 +9948,35 @@ StatsCollector.prototype.errorCallback = function (error)
 /**
  * Starts stats updates.
  */
-StatsCollector.prototype.start = function ()
-{
+StatsCollector.prototype.start = function (startAudioLevelStats) {
     var self = this;
-    this.audioLevelsIntervalId = setInterval(
-        function () {
-            // Interval updates
-            self.peerconnection.getStats(
-                function (report) {
-                    var results = null;
-                    if (!report || !report.result ||
-                        typeof report.result != 'function') {
-                        results = report;
-                    }
-                    else {
-                        results = report.result();
-                    }
-                    //logger.error("Got interval report", results);
-                    self.currentAudioLevelsReport = results;
-                    self.processAudioLevelReport();
-                    self.baselineAudioLevelsReport =
-                        self.currentAudioLevelsReport;
-                },
-                self.errorCallback
-            );
-        },
-        self.audioLevelsIntervalMilis
-    );
+    if(startAudioLevelStats) {
+        this.audioLevelsIntervalId = setInterval(
+            function () {
+                // Interval updates
+                self.peerconnection.getStats(
+                    function (report) {
+                        var results = null;
+                        if (!report || !report.result ||
+                            typeof report.result != 'function') {
+                            results = report;
+                        }
+                        else {
+                            results = report.result();
+                        }
+                        self.currentAudioLevelsReport = results;
+                        self.processAudioLevelReport();
+                        self.baselineAudioLevelsReport =
+                            self.currentAudioLevelsReport;
+                    },
+                    self.errorCallback
+                );
+            },
+            self.audioLevelsIntervalMilis
+        );
+    }
 
-    if (!this.config.disableStats && browserSupported) {
+    if (browserSupported) {
         this.statsIntervalId = setInterval(
             function () {
                 // Interval updates
@@ -7753,12 +9992,12 @@ StatsCollector.prototype.start = function ()
                             //chrome
                             results = report.result();
                         }
-                        //logger.error("Got interval report", results);
                         self.currentStatsReport = results;
                         try {
                             self.processStatsReport();
                         }
                         catch (e) {
+                            GlobalOnErrorHandler.callErrorHandler(e);
                             logger.error("Unsupported key:" + e, e);
                         }
 
@@ -7771,8 +10010,9 @@ StatsCollector.prototype.start = function ()
         );
     }
 
-    // logging statistics does not support firefox
-    if (this.config.logStats && (browserSupported && !RTCBrowserType.isFirefox())) {
+    if (browserSupported
+            // logging statistics does not support firefox
+            && this._browserType !== RTCBrowserType.RTC_BROWSER_FIREFOX) {
         this.gatherStatsIntervalId = setInterval(
             function () {
                 self.peerconnection.getStats(
@@ -7830,6 +10070,70 @@ StatsCollector.prototype.clearCollectedStats = function () {
    this.statsToBeLogged.timestamps = [];
 };
 
+/**
+ * Defines a function which (1) is to be used as a StatsCollector method and (2)
+ * gets the value from a specific report returned by RTCPeerConnection#getStats
+ * associated with a LibJitsiMeet browser-agnostic name.
+ *
+ * @param {Object.<string,string>} keys the map of LibJitsi browser-agnostic
+ * names to RTCPeerConnection#getStats browser-specific keys
+ */
+StatsCollector.prototype._defineGetStatValueMethod = function (keys) {
+    // Define the function which converts a LibJitsiMeet browser-asnostic name
+    // to a browser-specific key of a report returned by
+    // RTCPeerConnection#getStats.
+    var keyFromName = function (name) {
+        var key = keys[name];
+        if (key)
+            return key;
+        else
+            throw "The property '" + name + "' isn't supported!";
+    };
+
+    // Define the function which retrieves the value from a specific report
+    // returned by RTCPeerConnection#getStats associated with a given
+    // browser-specific key.
+    var itemStatByKey;
+    switch (this._browserType) {
+    case RTCBrowserType.RTC_BROWSER_CHROME:
+    case RTCBrowserType.RTC_BROWSER_OPERA:
+        // TODO What about other types of browser which are based on Chrome such
+        // as NW.js? Every time we want to support a new type browser we have to
+        // go and add more conditions (here and in multiple other places).
+        // Cannot we do a feature detection instead of a browser type check? For
+        // example, if item has a stat property of type function, then it's very
+        // likely that whoever defined it wanted you to call it in order to
+        // retrieve the value associated with a specific key.
+        itemStatByKey = function (item, key) { return item.stat(key) };
+        break;
+    case RTCBrowserType.RTC_BROWSER_REACT_NATIVE:
+        // The implementation provided by react-native-webrtc follows the
+        // Objective-C WebRTC API: RTCStatsReport has a values property of type
+        // Array in which each element is a key-value pair.
+        itemStatByKey = function (item, key) {
+            var value;
+            item.values.some(function (pair) {
+                if (pair.hasOwnProperty(key)) {
+                    value = pair[key];
+                    return true;
+                } else {
+                    return false;
+                }
+            });
+            return value;
+        };
+        break;
+    default:
+        itemStatByKey = function (item, key) { return item[key] };
+    }
+
+    // Compose the 2 functions defined above to get a function which retrieves
+    // the value from a specific report returned by RTCPeerConnection#getStats
+    // associated with a specific LibJitsiMeet browser-agnostic name.
+    return function (item, name) {
+        return itemStatByKey(item, keyFromName(name))
+    };
+};
 
 /**
  * Stats processing logic.
@@ -7839,16 +10143,18 @@ StatsCollector.prototype.processStatsReport = function () {
         return;
     }
 
+    var getStatValue = this._getStatValue;
+    byteSentStats = {};
+
     for (var idx in this.currentStatsReport) {
         var now = this.currentStatsReport[idx];
         try {
-            if (getStatValue(now, 'receiveBandwidth') ||
-                getStatValue(now, 'sendBandwidth')) {
+            var receiveBandwidth = getStatValue(now, 'receiveBandwidth');
+            var sendBandwidth = getStatValue(now, 'sendBandwidth');
+            if (receiveBandwidth || sendBandwidth) {
                 this.conferenceStats.bandwidth = {
-                    "download": Math.round(
-                            (getStatValue(now, 'receiveBandwidth')) / 1000),
-                    "upload": Math.round(
-                            (getStatValue(now, 'sendBandwidth')) / 1000)
+                    "download": Math.round(receiveBandwidth / 1000),
+                    "upload": Math.round(sendBandwidth / 1000)
                 };
             }
         }
@@ -7856,42 +10162,38 @@ StatsCollector.prototype.processStatsReport = function () {
 
         if(now.type == 'googCandidatePair')
         {
-            var ip, type, localIP, active;
+            var ip, type, localip, active;
             try {
                 ip = getStatValue(now, 'remoteAddress');
                 type = getStatValue(now, "transportType");
-                localIP = getStatValue(now, "localAddress");
+                localip = getStatValue(now, "localAddress");
                 active = getStatValue(now, "activeConnection");
             }
             catch(e){/*not supported*/}
-            if(!ip || !type || !localIP || active != "true")
+            if(!ip || !type || !localip || active != "true")
                 continue;
-            var addressSaved = false;
-            for(var i = 0; i < this.conferenceStats.transport.length; i++)
-            {
-                if(this.conferenceStats.transport[i].ip == ip &&
-                    this.conferenceStats.transport[i].type == type &&
-                    this.conferenceStats.transport[i].localip == localIP)
-                {
-                    addressSaved = true;
-                }
+            // Save the address unless it has been saved already.
+            var conferenceStatsTransport = this.conferenceStats.transport;
+            if(!conferenceStatsTransport.some(function (t) { return (
+                        t.ip == ip && t.type == type && t.localip == localip
+                    )})) {
+                conferenceStatsTransport.push(
+                    {ip: ip, type: type, localip: localip});
             }
-            if(addressSaved)
-                continue;
-            this.conferenceStats.transport.push({localip: localIP, ip: ip, type: type});
             continue;
         }
 
-        if(now.type == "candidatepair")
-        {
+        if(now.type == "candidatepair") {
             if(now.state == "succeeded")
                 continue;
 
             var local = this.currentStatsReport[now.localCandidateId];
             var remote = this.currentStatsReport[now.remoteCandidateId];
-            this.conferenceStats.transport.push({localip: local.ipAddress + ":" + local.portNumber,
-                ip: remote.ipAddress + ":" + remote.portNumber, type: local.transport});
-
+            this.conferenceStats.transport.push({
+                ip: remote.ipAddress + ":" + remote.portNumber,
+                type: local.transport,
+                localip: local.ipAddress + ":" + local.portNumber
+            });
         }
 
         if (now.type != 'ssrc' && now.type != "outboundrtp" &&
@@ -7900,21 +10202,17 @@ StatsCollector.prototype.processStatsReport = function () {
         }
 
         var before = this.baselineStatsReport[idx];
+        var ssrc = getStatValue(now, 'ssrc');
         if (!before) {
-            logger.warn(getStatValue(now, 'ssrc') + ' not enough data');
+            logger.warn(ssrc + ' not enough data');
             continue;
         }
 
-        var ssrc = getStatValue(now, 'ssrc');
         if(!ssrc)
             continue;
 
-        var ssrcStats = this.ssrc2stats[ssrc];
-        if (!ssrcStats) {
-            ssrcStats = new PeerStats();
-            this.ssrc2stats[ssrc] = ssrcStats;
-        }
-
+        var ssrcStats
+          = this.ssrc2stats[ssrc] || (this.ssrc2stats[ssrc] = new PeerStats());
 
         var isDownloadStream = true;
         var key = 'packetsReceived';
@@ -7925,7 +10223,7 @@ StatsCollector.prototype.processStatsReport = function () {
             key = 'packetsSent';
             packetsNow = getStatValue(now, key);
             if (typeof packetsNow === 'undefined' || packetsNow === null) {
-                console.warn("No packetsReceived nor packetsSent stat found");
+                logger.warn("No packetsReceived nor packetsSent stat found");
                 continue;
             }
         }
@@ -7955,16 +10253,23 @@ StatsCollector.prototype.processStatsReport = function () {
             isDownloadStream: isDownloadStream
         });
 
-
         var bytesReceived = 0, bytesSent = 0;
-        if(getStatValue(now, "bytesReceived")) {
-            bytesReceived = getStatValue(now, "bytesReceived") -
-                getStatValue(before, "bytesReceived");
+        var nowBytesTransmitted = getStatValue(now, "bytesReceived");
+        if(nowBytesTransmitted) {
+            bytesReceived
+                = nowBytesTransmitted - getStatValue(before, "bytesReceived");
         }
-
-        if (getStatValue(now, "bytesSent")) {
-            bytesSent = getStatValue(now, "bytesSent") -
-                getStatValue(before, "bytesSent");
+        nowBytesTransmitted = getStatValue(now, "bytesSent");
+        if(typeof(nowBytesTransmitted) === "number" ||
+            typeof(nowBytesTransmitted) === "string") {
+            nowBytesTransmitted = Number(nowBytesTransmitted);
+            if(!isNaN(nowBytesTransmitted)){
+                byteSentStats[ssrc] = nowBytesTransmitted;
+                if (nowBytesTransmitted > 0) {
+                    bytesSent = nowBytesTransmitted -
+                        getStatValue(before, "bytesSent");
+                }
+            }
         }
 
         var time = Math.round((now.timestamp - before.timestamp) / 1000);
@@ -7980,6 +10285,11 @@ StatsCollector.prototype.processStatsReport = function () {
             bytesSent = Math.round(((bytesSent * 8) / time) / 1000);
         }
 
+        //detect audio issues (receiving data but audioLevel == 0)
+        if(bytesReceived > 10 && ssrcStats.ssrc2AudioLevel === 0) {
+            this.eventEmitter.emit(StatisticsEvents.AUDIO_NOT_WORKING, ssrc);
+        }
+
         ssrcStats.setSsrcBitrate({
             "download": bytesReceived,
             "upload": bytesSent
@@ -7987,16 +10297,16 @@ StatsCollector.prototype.processStatsReport = function () {
 
         var resolution = {height: null, width: null};
         try {
-            if (getStatValue(now, "googFrameHeightReceived") &&
-                getStatValue(now, "googFrameWidthReceived")) {
-                resolution.height =
-                    getStatValue(now, "googFrameHeightReceived");
-                resolution.width = getStatValue(now, "googFrameWidthReceived");
+            var height, width;
+            if ((height = getStatValue(now, "googFrameHeightReceived")) &&
+                (width = getStatValue(now, "googFrameWidthReceived"))) {
+                resolution.height = height;
+                resolution.width = width;
             }
-            else if (getStatValue(now, "googFrameHeightSent") &&
-                getStatValue(now, "googFrameWidthSent")) {
-                resolution.height = getStatValue(now, "googFrameHeightSent");
-                resolution.width = getStatValue(now, "googFrameWidthSent");
+            else if ((height = getStatValue(now, "googFrameHeightSent")) &&
+                (width = getStatValue(now, "googFrameWidthSent"))) {
+                resolution.height = height;
+                resolution.width = width;
             }
         }
         catch(e){/*not supported*/}
@@ -8023,7 +10333,6 @@ StatsCollector.prototype.processStatsReport = function () {
     Object.keys(this.ssrc2stats).forEach(
         function (ssrc) {
             var ssrcStats = this.ssrc2stats[ssrc];
-
             // process package loss stats
             var ssrc2Loss = ssrcStats.ssrc2Loss;
             var type = ssrc2Loss.isDownloadStream ? "download" : "upload";
@@ -8043,7 +10352,10 @@ StatsCollector.prototype.processStatsReport = function () {
         this
     );
 
-    this.conferenceStats.bitrate = {"upload": bitrateUpload, "download": bitrateDownload};
+    this.eventEmitter.emit(StatisticsEvents.BYTE_SENT_STATS, byteSentStats);
+
+    this.conferenceStats.bitrate
+      = {"upload": bitrateUpload, "download": bitrateDownload};
 
     this.conferenceStats.packetLoss = {
         total:
@@ -8054,8 +10366,7 @@ StatsCollector.prototype.processStatsReport = function () {
         upload:
             calculatePacketLoss(lostPackets.upload, totalPackets.upload)
     };
-    this.eventEmitter.emit(StatisticsEvents.CONNECTION_STATS,
-        {
+    this.eventEmitter.emit(StatisticsEvents.CONNECTION_STATS, {
             "bitrate": this.conferenceStats.bitrate,
             "packetLoss": this.conferenceStats.packetLoss,
             "bandwidth": this.conferenceStats.bandwidth,
@@ -8063,7 +10374,6 @@ StatsCollector.prototype.processStatsReport = function () {
             "transport": this.conferenceStats.transport
         });
     this.conferenceStats.transport = [];
-
 };
 
 /**
@@ -8074,6 +10384,8 @@ StatsCollector.prototype.processAudioLevelReport = function () {
         return;
     }
 
+    var getStatValue = this._getStatValue;
+
     for (var idx in this.currentAudioLevelsReport) {
         var now = this.currentAudioLevelsReport[idx];
 
@@ -8083,31 +10395,27 @@ StatsCollector.prototype.processAudioLevelReport = function () {
         }
 
         var before = this.baselineAudioLevelsReport[idx];
+        var ssrc = getStatValue(now, 'ssrc');
         if (!before) {
-            logger.warn(getStatValue(now, 'ssrc') + ' not enough data');
+            logger.warn(ssrc + ' not enough data');
             continue;
         }
 
-        var ssrc = getStatValue(now, 'ssrc');
         if (!ssrc) {
-            if((Date.now() - now.timestamp) < 3000)
+            if ((Date.now() - now.timestamp) < 3000)
                 logger.warn("No ssrc: ");
             continue;
         }
 
-        var ssrcStats = this.ssrc2stats[ssrc];
-        if (!ssrcStats) {
-            ssrcStats = new PeerStats();
-            this.ssrc2stats[ssrc] = ssrcStats;
-        }
+        var ssrcStats
+            = this.ssrc2stats[ssrc]
+                || (this.ssrc2stats[ssrc] = new PeerStats());
 
         // Audio level
-        var audioLevel = null;
-
         try {
-            audioLevel = getStatValue(now, 'audioInputLevel');
-            if (!audioLevel)
-                audioLevel = getStatValue(now, 'audioOutputLevel');
+            var audioLevel
+                = getStatValue(now, 'audioInputLevel')
+                    || getStatValue(now, 'audioOutputLevel');
         }
         catch(e) {/*not supported*/
             logger.warn("Audio Levels are not available in the statistics.");
@@ -8128,38 +10436,119 @@ StatsCollector.prototype.processAudioLevelReport = function () {
 
 }).call(this,"/modules/statistics/RTPStatsCollector.js")
 
-},{"../../service/statistics/Events":134,"../RTC/RTCBrowserType":18,"jitsi-meet-logger":82}],27:[function(require,module,exports){
+},{"../../service/statistics/Events":152,"../RTC/RTCBrowserType":22,"../util/GlobalOnErrorHandler":41,"jitsi-meet-logger":68}],32:[function(require,module,exports){
+(function (__filename){
 /* global require */
 var LocalStats = require("./LocalStatsCollector.js");
+var logger = require("jitsi-meet-logger").getLogger(__filename);
 var RTPStats = require("./RTPStatsCollector.js");
 var EventEmitter = require("events");
 var StatisticsEvents = require("../../service/statistics/Events");
+var AnalyticsAdapter = require("./AnalyticsAdapter");
 var CallStats = require("./CallStats");
 var ScriptUtil = require('../util/ScriptUtil');
+var JitsiTrackError = require("../../JitsiTrackError");
 
-// Since callstats.io is a third party, we cannot guarantee the quality of
-// their service. More specifically, their server may take noticeably long
-// time to respond. Consequently, it is in our best interest (in the sense
-// that the intergration of callstats.io is pretty important to us but not
-// enough to allow it to prevent people from joining a conference) to (1)
-// start downloading their API as soon as possible and (2) do the
-// downloading asynchronously.
+/**
+ * True if callstats API is loaded
+ */
+ var isCallstatsLoaded = false;
+
+// Since callstats.io is a third party, we cannot guarantee the quality of their
+// service. More specifically, their server may take noticeably long time to
+// respond. Consequently, it is in our best interest (in the sense that the
+// intergration of callstats.io is pretty important to us but not enough to
+// allow it to prevent people from joining a conference) to (1) start
+// downloading their API as soon as possible and (2) do the downloading
+// asynchronously.
 function loadCallStatsAPI() {
-    ScriptUtil.loadScript(
-            'https://api.callstats.io/static/callstats.min.js',
-            /* async */ true,
-            /* prepend */ true);
+    if(!isCallstatsLoaded) {
+        ScriptUtil.loadScript(
+                'https://api.callstats.io/static/callstats.min.js',
+                /* async */ true,
+                /* prepend */ true);
+        isCallstatsLoaded = true;
+    }
     // FIXME At the time of this writing, we hope that the callstats.io API will
     // have loaded by the time we needed it (i.e. CallStats.init is invoked).
 }
 
+// Load the integration of a third-party analytics API such as Google Analytics.
+// Since we cannot guarantee the quality of the third-party service (e.g. their
+// server may take noticeably long time to respond), it is in our best interest
+// (in the sense that the intergration of the analytics API is important to us
+// but not enough to allow it to prevent people from joining a conference) to
+// download the API asynchronously. Additionally, Google Analytics will download
+// its implementation asynchronously anyway so it makes sense to append the
+// loading on our side rather than prepend it.
+function loadAnalytics(customScriptUrl) {
+    // if we have a custom script url passed as parameter we don't want to
+    // search it relatively near the library
+    ScriptUtil.loadScript(
+        customScriptUrl ? customScriptUrl : 'analytics.js',
+        /* async */ true,
+        /* prepend */ false,
+        /* relativeURL */ customScriptUrl ? false : true,
+        /* loadCallback */ function () {
+            Statistics.analytics.loaded();
+        },
+        /* errorCallback */ function () {
+            Statistics.analytics.dispose();
+        });
+}
 
 /**
  * Log stats via the focus once every this many milliseconds.
  */
 var LOG_INTERVAL = 60000;
 
-var eventEmitter = new EventEmitter();
+/**
+ * callstats strips any additional fields from Error except for "name", "stack",
+ * "message" and "constraintName". So we need to bundle additional information
+ * from JitsiTrackError into error passed to callstats to preserve valuable
+ * information about error.
+ * @param {JitsiTrackError} error
+ */
+function formatJitsiTrackErrorForCallStats(error) {
+    var err = new Error();
+
+    // Just copy original stack from error
+    err.stack = error.stack;
+
+    // Combine name from error's name plus (possibly) name of original GUM error
+    err.name = (error.name || "Unknown error") + (error.gum && error.gum.error
+        && error.gum.error.name ? " - " + error.gum.error.name : "");
+
+    // Put all constraints into this field. For constraint failed errors we will
+    // still know which exactly constraint failed as it will be a part of
+    // message.
+    err.constraintName = error.gum && error.gum.constraints
+        ? JSON.stringify(error.gum.constraints) : "";
+
+    // Just copy error's message.
+    err.message = error.message;
+
+    return err;
+}
+
+/**
+ * Init statistic options
+ * @param options
+ */
+Statistics.init = function (options) {
+    Statistics.audioLevelsEnabled = !options.disableAudioLevels;
+
+    if(typeof options.audioLevelsInterval === 'number') {
+        Statistics.audioLevelsInterval = options.audioLevelsInterval;
+    }
+
+    Statistics.disableThirdPartyRequests = options.disableThirdPartyRequests;
+
+    if (Statistics.disableThirdPartyRequests !== true)
+        loadAnalytics(options.analyticsScriptUrl);
+    else // if not enable make sure we dispose any event that goes in the queue
+        Statistics.analytics.dispose();
+};
 
 function Statistics(xmpp, options) {
     this.rtpStats = null;
@@ -8168,37 +10557,50 @@ function Statistics(xmpp, options) {
     this.options = options || {};
     this.callStatsIntegrationEnabled
         = this.options.callStatsID && this.options.callStatsSecret
-        // Even though AppID and AppSecret may be specified, the integration of
-        // callstats.io may be disabled because of globally-disallowed requests
-        // to any third parties.
-        && (this.options.disableThirdPartyRequests !== true);
+            // Even though AppID and AppSecret may be specified, the integration
+            // of callstats.io may be disabled because of globally-disallowed
+            // requests to any third parties.
+            && (Statistics.disableThirdPartyRequests !== true);
     if(this.callStatsIntegrationEnabled)
         loadCallStatsAPI();
     this.callStats = null;
 
     /**
-     * Send the stats already saved in rtpStats to be logged via
-     * the focus.
+     * Send the stats already saved in rtpStats to be logged via the focus.
      */
     this.logStatsIntervalId = null;
 }
 Statistics.audioLevelsEnabled = false;
+Statistics.audioLevelsInterval = 200;
+Statistics.disableThirdPartyRequests = false;
+Statistics.analytics = AnalyticsAdapter;
+
+/**
+ * Array of callstats instances. Used to call Statistics static methods and
+ * send stats to all cs instances.
+ */
+Statistics.callsStatsInstances = [];
 
 Statistics.prototype.startRemoteStats = function (peerconnection) {
-    if(!Statistics.audioLevelsEnabled)
-        return;
-
     this.stopRemoteStats();
 
-    this.rtpStats = new RTPStats(peerconnection, 200, 2000, this.eventEmitter);
-    this.rtpStats.start();
-
-    this.logStatsIntervalId = setInterval(function () {
-        var stats = this.rtpStats.getCollectedStats();
-        if (this.xmpp.sendLogs(stats)) {
-            this.rtpStats.clearCollectedStats();
-        }
-    }.bind(this), LOG_INTERVAL);
+    try {
+        this.rtpStats
+            = new RTPStats(peerconnection,
+                    Statistics.audioLevelsInterval, 2000, this.eventEmitter);
+        this.rtpStats.start(Statistics.audioLevelsEnabled);
+    } catch (e) {
+        this.rtpStats = null;
+        logger.error('Failed to start collecting remote statistics: ' + e);
+    }
+    if (this.rtpStats) {
+        this.logStatsIntervalId = setInterval(function () {
+            var stats = this.rtpStats.getCollectedStats();
+            if (this.xmpp.sendLogs(stats)) {
+                this.rtpStats.clearCollectedStats();
+            }
+        }.bind(this), LOG_INTERVAL);
+    }
 };
 
 Statistics.localStats = [];
@@ -8206,23 +10608,30 @@ Statistics.localStats = [];
 Statistics.startLocalStats = function (stream, callback) {
     if(!Statistics.audioLevelsEnabled)
         return;
-    var localStats = new LocalStats(stream, 200, callback);
+    var localStats = new LocalStats(stream, Statistics.audioLevelsInterval,
+        callback);
     this.localStats.push(localStats);
     localStats.start();
 };
 
-Statistics.prototype.addAudioLevelListener = function(listener)
-{
+Statistics.prototype.addAudioLevelListener = function(listener) {
     if(!Statistics.audioLevelsEnabled)
         return;
     this.eventEmitter.on(StatisticsEvents.AUDIO_LEVEL, listener);
 };
 
-Statistics.prototype.removeAudioLevelListener = function(listener)
-{
+Statistics.prototype.removeAudioLevelListener = function(listener) {
     if(!Statistics.audioLevelsEnabled)
         return;
     this.eventEmitter.removeListener(StatisticsEvents.AUDIO_LEVEL, listener);
+};
+
+/**
+ * Adds listener for detected audio problems.
+ * @param listener the listener.
+ */
+Statistics.prototype.addAudioProblemListener = function (listener) {
+    this.eventEmitter.on(StatisticsEvents.AUDIO_NOT_WORKING, listener);
 };
 
 Statistics.prototype.addConnectionStatsListener = function (listener) {
@@ -8233,26 +10642,19 @@ Statistics.prototype.removeConnectionStatsListener = function (listener) {
     this.eventEmitter.removeListener(StatisticsEvents.CONNECTION_STATS, listener);
 };
 
-Statistics.prototype.dispose = function () {
-    if(Statistics.audioLevelsEnabled) {
-        Statistics.stopAllLocalStats();
-        this.stopRemoteStats();
-        if(this.eventEmitter)
-            this.eventEmitter.removeAllListeners();
-
-        if(eventEmitter)
-            eventEmitter.removeAllListeners();
-    }
+Statistics.prototype.addByteSentStatsListener = function (listener) {
+    this.eventEmitter.on(StatisticsEvents.BYTE_SENT_STATS, listener);
 };
 
+Statistics.prototype.removeByteSentStatsListener = function (listener) {
+    this.eventEmitter.removeListener(StatisticsEvents.BYTE_SENT_STATS,
+        listener);
+};
 
-Statistics.stopAllLocalStats = function () {
-    if(!Statistics.audioLevelsEnabled)
-        return;
-
-    for(var i = 0; i < this.localStats.length; i++)
-        this.localStats[i].stop();
-    this.localStats = [];
+Statistics.prototype.dispose = function () {
+    this.stopRemoteStats();
+    if(this.eventEmitter)
+        this.eventEmitter.removeAllListeners();
 };
 
 Statistics.stopLocalStats = function (stream) {
@@ -8268,7 +10670,7 @@ Statistics.stopLocalStats = function (stream) {
 };
 
 Statistics.prototype.stopRemoteStats = function () {
-    if (!Statistics.audioLevelsEnabled || !this.rtpStats) {
+    if (!this.rtpStats) {
         return;
     }
 
@@ -8292,6 +10694,22 @@ Statistics.prototype.stopRemoteStats = function () {
 Statistics.prototype.startCallStats = function (session, settings) {
     if(this.callStatsIntegrationEnabled && !this.callstats) {
         this.callstats = new CallStats(session, settings, this.options);
+        Statistics.callsStatsInstances.push(this.callstats);
+    }
+};
+
+/**
+ * Removes the callstats.io instances.
+ */
+Statistics.prototype.stopCallStats = function () {
+    if(this.callstats) {
+        var index = Statistics.callsStatsInstances.indexOf(this.callstats);
+        if(index > -1)
+            Statistics.callsStatsInstances.splice(index, 1);
+        // The next line is commented because we need to be able to send
+        // feedback even after the conference has been destroyed.
+        // this.callstats = null;
+        CallStats.dispose();
     }
 };
 
@@ -8311,7 +10729,7 @@ Statistics.prototype.isCallstatsEnabled = function () {
  * @param {RTCPeerConnection} pc connection on which failure occured.
  */
 Statistics.prototype.sendIceConnectionFailedEvent = function (pc) {
-    if(this.callStatsIntegrationEnabled && this.callstats)
+    if(this.callstats)
         this.callstats.sendIceConnectionFailedEvent(pc, this.callstats);
 };
 
@@ -8321,7 +10739,7 @@ Statistics.prototype.sendIceConnectionFailedEvent = function (pc) {
  * @param type {String} "audio"/"video"
  */
 Statistics.prototype.sendMuteEvent = function (muted, type) {
-    if(this.callStatsIntegrationEnabled)
+    if(this.callstats)
         CallStats.sendMuteEvent(muted, type, this.callstats);
 };
 
@@ -8331,7 +10749,7 @@ Statistics.prototype.sendMuteEvent = function (muted, type) {
  * false for not stopping
  */
 Statistics.prototype.sendScreenSharingEvent = function (start) {
-    if(this.callStatsIntegrationEnabled)
+    if(this.callstats)
         CallStats.sendScreenSharingEvent(start, this.callstats);
 };
 
@@ -8340,8 +10758,23 @@ Statistics.prototype.sendScreenSharingEvent = function (start) {
  * conference.
  */
 Statistics.prototype.sendDominantSpeakerEvent = function () {
-    if(this.callStatsIntegrationEnabled)
+    if(this.callstats)
         CallStats.sendDominantSpeakerEvent(this.callstats);
+};
+
+/**
+ * Notifies about active device.
+ * @param {{deviceList: {String:String}}} devicesData - list of devices with
+ *      their data
+ */
+Statistics.sendActiveDeviceListEvent = function (devicesData) {
+    if (Statistics.callsStatsInstances.length) {
+        Statistics.callsStatsInstances.forEach(function (cs) {
+            CallStats.sendActiveDeviceListEvent(devicesData, cs);
+        });
+    } else {
+        CallStats.sendActiveDeviceListEvent(devicesData, null);
+    }
 };
 
 /**
@@ -8357,7 +10790,7 @@ Statistics.prototype.sendDominantSpeakerEvent = function () {
  */
 Statistics.prototype.associateStreamWithVideoTag =
 function (ssrc, isLocal, usageLabel, containerId) {
-    if(this.callStatsIntegrationEnabled && this.callstats) {
+    if(this.callstats) {
         this.callstats.associateStreamWithVideoTag(
             ssrc, isLocal, usageLabel, containerId);
     }
@@ -8368,18 +10801,23 @@ function (ssrc, isLocal, usageLabel, containerId) {
  *
  * @param {Error} e error to send
  */
-Statistics.prototype.sendGetUserMediaFailed = function (e) {
-    if(this.callStatsIntegrationEnabled)
-        CallStats.sendGetUserMediaFailed(e, this.callstats);
-};
-
-/**
- * Notifies CallStats that getUserMedia failed.
- *
- * @param {Error} e error to send
- */
 Statistics.sendGetUserMediaFailed = function (e) {
-    CallStats.sendGetUserMediaFailed(e, null);
+
+    if (Statistics.callsStatsInstances.length) {
+        Statistics.callsStatsInstances.forEach(function (cs) {
+            CallStats.sendGetUserMediaFailed(
+                e instanceof JitsiTrackError
+                    ? formatJitsiTrackErrorForCallStats(e)
+                    : e,
+                cs);
+        });
+    } else {
+        CallStats.sendGetUserMediaFailed(
+            e instanceof JitsiTrackError
+                ? formatJitsiTrackErrorForCallStats(e)
+                : e,
+            null);
+    }
 };
 
 /**
@@ -8389,7 +10827,7 @@ Statistics.sendGetUserMediaFailed = function (e) {
  * @param {RTCPeerConnection} pc connection on which failure occured.
  */
 Statistics.prototype.sendCreateOfferFailed = function (e, pc) {
-    if(this.callStatsIntegrationEnabled)
+    if(this.callstats)
         CallStats.sendCreateOfferFailed(e, pc, this.callstats);
 };
 
@@ -8400,7 +10838,7 @@ Statistics.prototype.sendCreateOfferFailed = function (e, pc) {
  * @param {RTCPeerConnection} pc connection on which failure occured.
  */
 Statistics.prototype.sendCreateAnswerFailed = function (e, pc) {
-    if(this.callStatsIntegrationEnabled)
+    if(this.callstats)
         CallStats.sendCreateAnswerFailed(e, pc, this.callstats);
 };
 
@@ -8411,7 +10849,7 @@ Statistics.prototype.sendCreateAnswerFailed = function (e, pc) {
  * @param {RTCPeerConnection} pc connection on which failure occured.
  */
 Statistics.prototype.sendSetLocalDescFailed = function (e, pc) {
-    if(this.callStatsIntegrationEnabled)
+    if(this.callstats)
         CallStats.sendSetLocalDescFailed(e, pc, this.callstats);
 };
 
@@ -8422,7 +10860,7 @@ Statistics.prototype.sendSetLocalDescFailed = function (e, pc) {
  * @param {RTCPeerConnection} pc connection on which failure occured.
  */
 Statistics.prototype.sendSetRemoteDescFailed = function (e, pc) {
-    if(this.callStatsIntegrationEnabled)
+    if(this.callstats)
         CallStats.sendSetRemoteDescFailed(e, pc, this.callstats);
 };
 
@@ -8433,48 +10871,1139 @@ Statistics.prototype.sendSetRemoteDescFailed = function (e, pc) {
  * @param {RTCPeerConnection} pc connection on which failure occured.
  */
 Statistics.prototype.sendAddIceCandidateFailed = function (e, pc) {
-    if(this.callStatsIntegrationEnabled)
+    if(this.callstats)
         CallStats.sendAddIceCandidateFailed(e, pc, this.callstats);
 };
 
 /**
- * Notifies CallStats that there is an unhandled error on the page.
+ * Notifies CallStats that audio problems are detected.
  *
  * @param {Error} e error to send
- * @param {RTCPeerConnection} pc connection on which failure occured.
  */
-Statistics.prototype.sendUnhandledError = function (e) {
-    if(this.callStatsIntegrationEnabled)
-        CallStats.sendUnhandledError(e, this.callstats);
+Statistics.prototype.sendDetectedAudioProblem = function (e) {
+    if(this.callstats)
+        this.callstats.sendDetectedAudioProblem(e);
 };
 
 /**
- * Notifies CallStats that there is unhandled exception.
+ * Adds to CallStats an application log.
  *
- * @param {Error} e error to send
+ * @param {String} a log message to send or an {Error} object to be reported
  */
-Statistics.sendUnhandledError = function (e) {
-    CallStats.sendUnhandledError(e, null);
+Statistics.sendLog = function (m) {
+    if (Statistics.callsStatsInstances.length) {
+        Statistics.callsStatsInstances.forEach(function (cs) {
+            CallStats.sendApplicationLog(m, cs);
+        });
+    } else {
+        CallStats.sendApplicationLog(m, null);
+    }
 };
 
 /**
  * Sends the given feedback through CallStats.
  *
- * @param overallFeedback an integer between 1 and 5 indicating the
- * user feedback
- * @param detailedFeedback detailed feedback from the user. Not yet used
+ * @param overall an integer between 1 and 5 indicating the user feedback
+ * @param detailed detailed feedback from the user. Not yet used
  */
-Statistics.prototype.sendFeedback =
-function(overallFeedback, detailedFeedback){
-    if(this.callStatsIntegrationEnabled && this.callstats)
-        this.callstats.sendFeedback(overallFeedback, detailedFeedback);
+Statistics.prototype.sendFeedback = function(overall, detailed) {
+    if(this.callstats)
+        this.callstats.sendFeedback(overall, detailed);
 };
 
 Statistics.LOCAL_JID = require("../../service/statistics/constants").LOCAL_JID;
 
+/**
+ * Reports global error to CallStats.
+ *
+ * @param {Error} error
+ */
+Statistics.reportGlobalError = function (error) {
+    if (error instanceof JitsiTrackError && error.gum) {
+        Statistics.sendGetUserMediaFailed(error);
+    } else {
+        Statistics.sendLog(error);
+    }
+};
+
+/**
+ * Sends event to analytics and callstats.
+ * @param eventName {string} the event name.
+ * @param msg {String} optional event info/messages.
+ */
+Statistics.sendEventToAll = function (eventName, msg) {
+    this.analytics.sendEvent(eventName, null, msg);
+    Statistics.sendLog({name: eventName, msg: msg ? msg : ""});
+};
+
 module.exports = Statistics;
 
-},{"../../service/statistics/Events":134,"../../service/statistics/constants":135,"../util/ScriptUtil":29,"./CallStats":24,"./LocalStatsCollector.js":25,"./RTPStatsCollector.js":26,"events":54}],28:[function(require,module,exports){
+}).call(this,"/modules/statistics/statistics.js")
+
+},{"../../JitsiTrackError":13,"../../service/statistics/Events":152,"../../service/statistics/constants":153,"../util/ScriptUtil":43,"./AnalyticsAdapter":28,"./CallStats":29,"./LocalStatsCollector.js":30,"./RTPStatsCollector.js":31,"events":63,"jitsi-meet-logger":68}],33:[function(require,module,exports){
+/* global APP, MediaRecorder, MediaStream, webkitMediaStream*/
+var RecordingResult = require("./recordingResult");
+
+/**
+ * Possible audio formats MIME types
+ */
+var AUDIO_WEBM = "audio/webm";    // Supported in chrome
+var AUDIO_OGG  = "audio/ogg";     // Supported in firefox
+
+/**
+ * A TrackRecorder object holds all the information needed for recording a
+ * single JitsiTrack (either remote or local)
+ * @param track The JitsiTrack the object is going to hold
+ */
+var TrackRecorder = function(track){
+    // The JitsiTrack holding the stream
+    this.track = track;
+    // The MediaRecorder recording the stream
+    this.recorder = null;
+    // The array of data chunks recorded from the stream
+    // acts as a buffer until the data is stored on disk
+    this.data = null;
+    //the name of the person of the JitsiTrack. This can be undefined and/or
+    //not unique
+    this.name = null;
+    //the time of the start of the recording
+    this.startTime = null;
+};
+
+/**
+ * Starts the recording of a JitsiTrack in a TrackRecorder object.
+ * This will also define the timestamp and try to update the name
+ * @param trackRecorder the TrackRecorder to start
+ */
+function startRecorder(trackRecorder) {
+    if(trackRecorder.recorder === undefined) {
+        throw new Error("Passed an object to startRecorder which is not a " +
+            "TrackRecorder object");
+    }
+    trackRecorder.recorder.start();
+    trackRecorder.startTime = new Date();
+}
+
+/**
+ * Stops the recording of a JitsiTrack in a TrackRecorder object.
+ * This will also try to update the name
+ * @param trackRecorder the TrackRecorder to stop
+ */
+function stopRecorder(trackRecorder){
+    if(trackRecorder.recorder === undefined) {
+        throw new Error("Passed an object to stopRecorder which is not a " +
+            "TrackRecorder object");
+    }
+    trackRecorder.recorder.stop();
+}
+
+/**
+ * Creates a TrackRecorder object. Also creates the MediaRecorder and
+ * data array for the trackRecorder.
+ * @param track the JitsiTrack holding the audio MediaStream(s)
+ */
+function instantiateTrackRecorder(track) {
+    var trackRecorder = new TrackRecorder(track);
+    // Create a new stream which only holds the audio track
+    var originalStream = trackRecorder.track.getOriginalStream();
+    var stream = createEmptyStream();
+    originalStream.getAudioTracks().forEach(function(track){
+        stream.addTrack(track);
+    });
+    // Create the MediaRecorder
+    trackRecorder.recorder = new MediaRecorder(stream,
+        {mimeType: audioRecorder.fileType});
+    //array for holding the recorder data. Resets it when
+    //audio already has been recorder once
+    trackRecorder.data = [];
+    // function handling a dataEvent, e.g the stream gets new data
+    trackRecorder.recorder.ondataavailable = function (dataEvent) {
+        if(dataEvent.data.size > 0) {
+            trackRecorder.data.push(dataEvent.data);
+        }
+    };
+
+    return trackRecorder;
+}
+
+/**
+ * Determines which kind of audio recording the browser supports
+ * chrome supports "audio/webm" and firefox supports "audio/ogg"
+ */
+function determineCorrectFileType() {
+    if(MediaRecorder.isTypeSupported(AUDIO_WEBM)) {
+        return AUDIO_WEBM;
+    }
+    else if(MediaRecorder.isTypeSupported(AUDIO_OGG)) {
+        return AUDIO_OGG;
+    }
+    else {
+        throw new Error("unable to create a MediaRecorder with the" +
+            "right mimetype!");
+    }
+}
+
+/**
+ * main exported object of the file, holding all
+ * relevant functions and variables for the outside world
+ * @param jitsiConference the jitsiConference which this object
+ * is going to record
+ */
+var audioRecorder = function(jitsiConference){
+    // array of TrackRecorders, where each trackRecorder
+    // holds the JitsiTrack, MediaRecorder and recorder data
+    this.recorders = [];
+
+    //get which file type is supported by the current browser
+    this.fileType = determineCorrectFileType();
+
+    //boolean flag for active recording
+    this.isRecording = false;
+
+    //the jitsiconference the object is recording
+    this.jitsiConference = jitsiConference;
+};
+
+/**
+ * Add the the exported module so that it can be accessed by other files
+ */
+audioRecorder.determineCorrectFileType = determineCorrectFileType;
+
+/**
+ * Adds a new TrackRecorder object to the array.
+ *
+ * @param track the track potentially holding an audio stream
+ */
+audioRecorder.prototype.addTrack = function (track) {
+    if(track.isAudioTrack()) {
+        //create the track recorder
+        var trackRecorder = instantiateTrackRecorder(track);
+        //push it to the local array of all recorders
+        this.recorders.push(trackRecorder);
+        //update the name of the trackRecorders
+        this.updateNames();
+        //if we're already recording, immediately start recording this new track
+        if(this.isRecording){
+            startRecorder(trackRecorder);
+        }
+    }
+};
+
+/**
+ * Notifies the module that a specific track has stopped, e.g participant left
+ * the conference.
+ * if the recording has not started yet, the TrackRecorder will be removed from
+ * the array. If the recording has started, the recorder will stop recording
+ * but not removed from the array so that the recorded stream can still be
+ * accessed
+ *
+ * @param {JitsiTrack} track the JitsiTrack to remove from the recording session
+ */
+audioRecorder.prototype.removeTrack = function(track){
+    if(track.isVideoTrack()){
+        return;
+    }
+    
+    var array = this.recorders;
+    var i;
+    for(i = 0; i < array.length; i++) {
+        if(array[i].track.getParticipantId() === track.getParticipantId()){
+            var recorderToRemove = array[i];
+            if(this.isRecording){
+                stopRecorder(recorderToRemove);
+            }
+            else {
+                //remove the TrackRecorder from the array
+                array.splice(i, 1);
+            }
+        }
+    }
+
+    //make sure the names are up to date
+    this.updateNames();
+};
+
+/**
+ * Tries to update the name value of all TrackRecorder in the array.
+ * If it hasn't changed,it will keep the exiting name. If it changes to a
+ * undefined value, the old value will also be kept.
+ */
+audioRecorder.prototype.updateNames = function(){
+    var conference = this.jitsiConference;
+    this.recorders.forEach(function(trackRecorder){
+        if(trackRecorder.track.isLocal()){
+            trackRecorder.name = "the transcriber";
+        }
+        else {
+            var id = trackRecorder.track.getParticipantId();
+            var participant = conference.getParticipantById(id);
+            var newName = participant.getDisplayName();
+            if(newName !== 'undefined') {
+                trackRecorder.name = newName;
+            }
+        }
+    });
+};
+
+/**
+ * Starts the audio recording of every local and remote track
+ */
+audioRecorder.prototype.start = function () {
+    if(this.isRecording) {
+        throw new Error("audiorecorder is already recording");
+    }
+    // set boolean isRecording flag to true so if new participants join the
+    // conference, that track can instantly start recording as well
+    this.isRecording = true;
+    //start all the mediaRecorders
+    this.recorders.forEach(function(trackRecorder){
+        startRecorder(trackRecorder);
+    });
+    //log that recording has started
+    console.log("Started the recording of the audio. There are currently " +
+        this.recorders.length + " recorders active.");
+};
+
+/**
+ * Stops the audio recording of every local and remote track
+ */
+audioRecorder.prototype.stop = function() {
+    //set the boolean flag to false
+    this.isRecording = false;
+    //stop all recorders
+    this.recorders.forEach(function(trackRecorder){
+       stopRecorder(trackRecorder);
+    });
+    console.log("stopped recording");
+};
+
+/**
+ * link hacking to download all recorded audio streams
+ */
+audioRecorder.prototype.download = function () {
+    var t = this;
+    this.recorders.forEach(function (trackRecorder) {
+        var blob = new Blob(trackRecorder.data, {type: t.fileType});
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        document.body.appendChild(a);
+        a.style = "display: none";
+        a.href = url;
+        a.download = 'test.' + t.fileType.split("/")[1];
+        a.click();
+        window.URL.revokeObjectURL(url);
+    });
+};
+
+/**
+ * returns the audio files of all recorders as an array of objects,
+ * which include the name of the owner of the track and the starting time stamp
+ * @returns {Array} an array of RecordingResult objects
+ */
+audioRecorder.prototype.getRecordingResults = function () {
+    if(this.isRecording) {
+        throw new Error("cannot get blobs because the AudioRecorder is still" +
+            "recording!");
+    }
+    //make sure the names are up to date before sending them off
+    this.updateNames();
+
+    var array = [];
+    var t = this;
+    this.recorders.forEach(function (recorder) {
+        array.push(
+            new RecordingResult(
+            new Blob(recorder.data, {type: t.fileType}),
+            recorder.name,
+            recorder.startTime)
+        );
+    });
+    return array;
+};
+
+/**
+ * Gets the mime type of the recorder audio
+ * @returns {String} the mime type of the recorder audio
+ */
+audioRecorder.prototype.getFileType = function () {
+    return this.fileType;
+};
+
+/**
+ * Creates a empty MediaStream object which can be used
+ * to add MediaStreamTracks to
+ * @returns MediaStream
+ */
+function createEmptyStream() {
+    // Firefox supports the MediaStream object, Chrome webkitMediaStream
+    if(typeof(MediaStream) !== 'undefined') {
+        return new MediaStream();
+    }
+    else if(typeof(webkitMediaStream) !== 'undefined') {
+        return new webkitMediaStream();
+    }
+    else {
+        throw new Error("cannot create a clean mediaStream");
+    }
+}
+
+/**
+ * export the main object audioRecorder
+ */
+module.exports = audioRecorder;
+},{"./recordingResult":34}],34:[function(require,module,exports){
+/**
+ * This object stores variables needed around the recording of an audio stream
+ * and passing this recording along with additional information along to
+ * different processes
+ * @param blob the recording audio stream as a single blob
+ * @param name the name of the person of the audio stream
+ * @param startTime the time in UTC when recording of the audiostream started
+ * @param wordArray the recorder audio stream transcribed as an array of Word
+ *                  objects
+ */
+var RecordingResult = function(blob, name, startTime, wordArray){
+    this.blob = blob;
+    this.name = name;
+    this.startTime = startTime;
+    this.wordArray = wordArray;
+};
+
+module.exports = RecordingResult;
+
+},{}],35:[function(require,module,exports){
+var AudioRecorder = require( './audioRecorder');
+var SphinxService = require(
+    './transcriptionServices/SphinxTranscriptionService');
+
+var BEFORE_STATE = "before";
+var RECORDING_STATE = "recording";
+var TRANSCRIBING_STATE = "transcribing";
+var FINISHED_STATE = "finished";
+
+//the amount of characters each line in the transcription will have
+var MAXIMUM_SENTENCE_LENGTH = 80;
+
+/**
+ * This is the main object for handing the Transcription. It interacts with
+ * the audioRecorder to record every person in a conference and sends the
+ * recorder audio to a transcriptionService. The returned speech-to-text result
+ * will be merged to create a transcript
+ * @param {AudioRecorder} audioRecorder An audioRecorder recording a conference
+ */
+var transcriber = function() {
+    //the object which can record all audio in the conference
+    this.audioRecorder = new AudioRecorder();
+    //this object can send the recorder audio to a speech-to-text service
+    this.transcriptionService =  new SphinxService();
+    //holds a counter to keep track if merging can start
+    this.counter = null;
+    //holds the date when transcription started which makes it possible
+    //to calculate the offset between recordings
+    this.startTime = null;
+    //will hold the transcription once it is completed
+    this.transcription = null;
+    //this will be a method which will be called once the transcription is done
+    //with the transcription as parameter
+    this.callback =  null;
+    //stores all the retrieved speech-to-text results to merge together
+    //this value will store an Array<Word> object
+    this.results = [];
+    // Stores the current state of the transcription process
+    this.state = BEFORE_STATE;
+    //Used in the updateTranscription method to add a new line when the
+    //sentence becomes to long
+    this.lineLength = 0;
+};
+
+/**
+ * Method to start the transcription process. It will tell the audioRecorder
+ * to start storing all audio streams and record the start time for merging
+ * purposes
+ */
+transcriber.prototype.start = function start() {
+    if(this.state !== BEFORE_STATE){
+        throw new Error("The transcription can only start when it's in the" +
+            "\"" + BEFORE_STATE + "\" state. It's currently in the " +
+            "\"" + this.state + "\" state");
+    }
+    this.state = RECORDING_STATE;
+    this.audioRecorder.start();
+    this.startTime = new Date();
+};
+
+/**
+ * Method to stop the transcription process. It will tell the audioRecorder to
+ * stop, and get all the recorded audio to send it to the transcription service
+
+ * @param callback a callback which will receive the transcription
+ */
+transcriber.prototype.stop = function stop(callback) {
+    if(this.state !== RECORDING_STATE){
+        throw new Error("The transcription can only stop when it's in the" +
+            "\"" + RECORDING_STATE + "\" state. It's currently in the " +
+            "\"" + this.state + "\" state");
+    }
+    //stop the recording
+    console.log("stopping recording and sending audio files");
+    this.audioRecorder.stop();
+    //and send all recorded audio the the transcription service
+    var t = this;
+
+    var callBack = blobCallBack.bind(this);
+    this.audioRecorder.getRecordingResults().forEach(function(recordingResult){
+        t.transcriptionService.send(recordingResult, callBack);
+        t.counter++;
+    });
+    //set the state to "transcribing" so that maybeMerge() functions correctly
+    this.state = TRANSCRIBING_STATE;
+    //and store the callback for later
+    this.callback = callback;
+};
+
+/**
+ * This method gets the answer from the transcription service, calculates the
+ * offset and adds is to every Word object. It will also start the merging
+ * when every send request has been received
+ *
+ * note: Make sure to bind this as a Transcription object
+ *
+ * @param {RecordingResult} answer a RecordingResult object with a defined
+ * WordArray
+ */
+var blobCallBack = function(answer){
+    console.log("retrieved an answer from the transcription service. The" +
+        " answer has an array of length: " + answer.wordArray.length);
+    //first add the offset between the start of the transcription and
+    //the start of the recording to all start and end times
+    if(answer.wordArray.length > 0) {
+        var offset = answer.startTime.getUTCMilliseconds() -
+            this.startTime.getUTCMilliseconds();
+        //transcriber time will always be earlier
+        if (offset < 0) {
+            offset = 0; //presume 0 if it somehow not earlier
+        }
+
+        var array = "[";
+        answer.wordArray.forEach(function(wordObject) {
+            wordObject.begin += offset;
+            wordObject.end += offset;
+            array += wordObject.word+",";
+        });
+        array += "]";
+        console.log(array);
+        //give a name value to the Array object so that the merging can access
+        //the name value without having to use the whole recordingResult object
+        //in the algorithm
+        answer.wordArray.name = answer.name;
+    }
+    //then store the array and decrease the counter
+    this.results.push(answer.wordArray);
+    this.counter--;
+    console.log("current counter: " + this.counter);
+    //and check if all results have been received.
+    this.maybeMerge();
+};
+
+/**
+ * this method will check if the counter is zero. If it is, it will call
+ * the merging method
+ */
+transcriber.prototype.maybeMerge = function(){
+    if(this.state === TRANSCRIBING_STATE && this.counter === 0){
+        //make sure to include the events in the result arrays before
+        //merging starts
+        this.merge();
+    }
+};
+
+/**
+ * This method will merge all speech-to-text arrays together in one
+ * readable transcription string
+ */
+transcriber.prototype.merge = function() {
+    console.log("starting merge process!\n The length of the array: " +
+        this.results.length);
+    this.transcription = "";
+    //the merging algorithm will look over all Word objects who are at pos 0 in
+    //every array. It will then select the one closest in time to the
+    //previously placed word, while removing the selected word from its array
+    //note: words can be skipped the skipped word's begin and end time somehow
+    //end up between the closest word start and end time
+    var arrays = this.results;
+    //arrays of Word objects
+    var potentialWords = []; //array of the first Word objects
+    //check if any arrays are already empty and remove them
+    hasPopulatedArrays(arrays);
+
+    //populate all the potential Words for a first time
+    arrays.forEach(function (array){
+        pushWordToSortedArray(potentialWords, array);
+    });
+
+    //keep adding words to transcription until all arrays are exhausted
+    var lowestWordArray;
+    var wordToAdd;
+    var foundSmaller;
+    while(hasPopulatedArrays(arrays)){
+        //first select the lowest array;
+        lowestWordArray = arrays[0];
+        arrays.forEach(function(wordArray){
+           if(wordArray[0].begin < lowestWordArray[0].begin){
+               lowestWordArray = wordArray;
+           }
+        });
+        //put the word in the transcription
+        wordToAdd = lowestWordArray.shift();
+        this.updateTranscription(wordToAdd,lowestWordArray.name);
+
+        //keep going until a word in another array has a smaller time
+        //or the array is empty
+        while(!foundSmaller && lowestWordArray.length > 0){
+            arrays.forEach(function(wordArray){
+                if(wordArray[0].begin < lowestWordArray[0].begin){
+                    foundSmaller = true;
+                }
+            });
+            //add next word if no smaller time has been found
+            if(!foundSmaller){
+                wordToAdd = lowestWordArray.shift();
+                this.updateTranscription(wordToAdd, null);
+            }
+        }
+
+    }
+
+    //set the state to finished and do the necessary left-over tasks
+    this.state = FINISHED_STATE;
+    if(this.callback){
+        this.callback(this.transcription);
+    }
+};
+
+/**
+ * Appends a word object to the transcription. It will make a new line with a
+ * name if a name is specified
+ * @param {Word} word the Word object holding the word to append
+ * @param {String|null} name the name of a new speaker. Null if not applicable
+ */
+transcriber.prototype.updateTranscription = function(word, name){
+    if(name !== undefined && name !== null){
+        this.transcription += "\n" + name + ":";
+        this.lineLength = name.length + 1; //+1 for the semi-colon
+    }
+    if(this.lineLength + word.word.length > MAXIMUM_SENTENCE_LENGTH){
+        this.transcription += "\n    ";
+        this.lineLength = 4; //because of the 4 spaces after the new line
+    }
+    this.transcription += " " + word.word;
+    this.lineLength += word.word.length + 1; //+1 for the space
+};
+
+/**
+ * Check if the given 2 dimensional array has any non-zero Word-arrays in them.
+ * All zero-element arrays inside will be removed
+ * If any non-zero-element arrays are found, the method will return true.
+ * otherwise it will return false
+ * @param {Array<Array>} twoDimensionalArray the array to check
+ * @returns {boolean} true if any non-zero arrays inside, otherwise false
+ */
+var hasPopulatedArrays = function(twoDimensionalArray){
+    var i;
+    for(i = 0; i < twoDimensionalArray.length; i++){
+        if(twoDimensionalArray[i].length === 0){
+            twoDimensionalArray.splice(i, 1);
+        }
+    }
+    return twoDimensionalArray.length > 0;
+};
+
+/**
+ * Push a word to the right location in a sorted array. The array is sorted
+ * from lowest to highest start time. Every word is stored in an object which
+ * includes the name of the person saying the word.
+ *
+ * @param {Array<Word>} array the sorted array to push to
+ * @param {Word} word the word to push into the array
+ */
+var pushWordToSortedArray = function(array, word){
+    if(array.length === 0) {
+        array.push(word);
+    }
+    else{
+        if(array[array.length - 1].begin <= word.begin){
+            array.push(word);
+            return;
+        }
+        var i;
+        for(i = 0; i < array.length; i++){
+            if(word.begin < array[i].begin){
+                array.splice(i, 0, word);
+                return;
+            }
+        }
+        array.push(word); //fail safe
+    }
+};
+
+/**
+ * Gives the transcriber a JitsiTrack holding an audioStream to transcribe.
+ * The JitsiTrack is given to the audioRecorder. If it doesn't hold an
+ * audiostream, it will not be added by the audioRecorder
+ * @param {JitsiTrack} track the track to give to the audioRecorder
+ */
+transcriber.prototype.addTrack = function(track){
+    this.audioRecorder.addTrack(track);
+};
+
+/**
+ * Remove the given track from the auioRecorder
+ * @param track
+ */
+transcriber.prototype.removeTrack = function(track){
+    this.audioRecorder.removeTrack(track);
+};
+
+/**
+ * Will return the created transcription if it's avialable or throw an error
+ * when it's not done yet
+ * @returns {String} the transcription as a String
+ */
+transcriber.prototype.getTranscription = function(){
+    if(this.state !== FINISHED_STATE){
+        throw new Error("The transcription can only be retrieved when it's in" +
+            " the\"" + FINISHED_STATE + "\" state. It's currently in the " +
+            "\"" + this.state + "\" state");
+    }
+    return this.transcription;
+};
+
+/**
+ * Returns the current state of the transcription process
+ */
+transcriber.prototype.getState = function(){
+    return this.state;
+};
+
+/**
+ * Resets the state to the "before" state, such that it's again possible to
+ * call the start method
+ */
+transcriber.prototype.reset = function() {
+    this.state = BEFORE_STATE;
+    this.counter = null;
+    this.transcription = null;
+    this.startTime = null;
+    this.callback = null;
+    this.results = [];
+    this.lineLength = 0;
+};
+
+module.exports = transcriber;
+},{"./audioRecorder":33,"./transcriptionServices/SphinxTranscriptionService":37}],36:[function(require,module,exports){
+/**
+ * Abstract class representing an interface to implement a speech-to-text
+ * service on.
+ */
+var TranscriptionService = function() {
+    throw new Error("TranscriptionService is abstract and cannot be" +
+        "created");
+};
+
+/**
+ * This method can be used to send the recorder audio stream and
+ * retrieve the answer from the transcription service from the callback
+ *
+ * @param {RecordingResult} recordingResult a recordingResult object which
+ * includes the recorded audio stream as a blob
+ * @param {Function} callback  which will retrieve the a RecordingResult with
+ *        the answer as a WordArray
+ */
+TranscriptionService.prototype.send = function send(recordingResult, callback){
+    var t = this;
+    this.sendRequest(recordingResult.blob, function(response){
+        if(!t.verify(response)){
+               console.log("the retrieved response from the server" +
+                   " is not valid!");
+            recordingResult.wordArray = [];
+            callback(recordingResult);
+        }
+        else{
+            recordingResult.wordArray = t.formatResponse(response);
+            callback(recordingResult);
+        }
+    });
+};
+
+/**
+ * Abstract method which will rend the recorder audio stream to the implemented
+ * transcription service and will retrieve an answer, which will be
+ * called on the given callback method
+ *
+ * @param {Blob} audioBlob the recorded audio stream as a single Blob
+ * @param {function} callback function which will retrieve the answer
+ *                            from the service
+ */
+TranscriptionService.prototype.sendRequest = function(audioBlob, callback) {
+    throw new Error("TranscriptionService.sendRequest is abstract");
+};
+
+/**
+ * Abstract method which will parse the output from the implemented
+ * transcription service to the expected format
+ *
+ * The transcriber class expect an array of word objects, where each word
+ * object is one transcribed word by the service.
+ *
+ * The expected output of this method is an array of word objects, in
+ * the correct order. That is, the first object in the array is the first word
+ * being said, and the last word in the array is the last word being said
+ *
+ * @param response the answer from the speech-to-text server which needs to be
+ *                 formatted
+ * @return {Array<Word>} an array of Word objects
+ */
+TranscriptionService.prototype.formatResponse = function(response){
+    throw new Error("TranscriptionService.format is abstract");
+};
+
+/**
+ * Abstract method which will verify that the response from the server is valid
+ *
+ * @param response the response from the server
+ * @return {boolean} true if response is valid, false otherwise
+ */
+TranscriptionService.prototype.verify = function(response){
+      throw new Error("TranscriptionService.verify is abstract");
+};
+
+module.exports = TranscriptionService;
+},{}],37:[function(require,module,exports){
+/* global config,  XMLHttpRequest, console, APP, JSON */
+
+var TranscriptionService = require("./AbstractTranscriptionService");
+var Word = require( "../word");
+var audioRecorder = require("./../audioRecorder");
+
+/**
+ * Implements a TranscriptionService for a Sphinx4 http server
+ */
+var SphinxService = function() {
+    //set the correct url
+    this.url = getURL();
+};
+
+/**
+ * Subclass of AbstractTranscriptionService
+ */
+SphinxService.prototype = Object.create(TranscriptionService.prototype);
+
+/**
+ * Set the right constructor
+ */
+SphinxService.constructor = SphinxService;
+
+/**
+ * Overrides the sendRequest method from AbstractTranscriptionService
+ * it will send the audio stream the a Sphinx4 server to get the transcription
+ *
+ * @param audioFileBlob the recorder audio stream an a single Blob
+ * @param callback the callback function retrieving the server response
+ */
+SphinxService.prototype.sendRequest = function(audioFileBlob, callback) {
+    console.log("sending an audio file  to " + this.url);
+    console.log("the audio file being sent: " + audioFileBlob);
+    var request = new XMLHttpRequest();
+    request.onreadystatechange = function() {
+        if(request.readyState === XMLHttpRequest.DONE && request.status === 200)
+        {
+            callback(request.responseText);
+        }
+        else if (request.readyState === XMLHttpRequest.DONE) {
+            throw new Error("unable to accept response from sphinx server." +
+                "status: " + request.status);
+        }
+        //if not ready no point to throw an error
+    };
+    request.open("POST", this.url);
+    request.setRequestHeader("Content-Type",
+        audioRecorder.determineCorrectFileType());
+    request.send(audioFileBlob);
+    console.log("send " + audioFileBlob);
+};
+
+/**
+ * Overrides the formatResponse method from AbstractTranscriptionService
+ * It will parse the answer from the server in the expected format
+ *
+ * @param response the JSON body retrieved from the Sphinx4 server
+ */
+SphinxService.prototype.formatResponse = function(response) {
+    var result = JSON.parse(response).objects;
+    //make sure to delete the session id object, which is always
+    //the first value in the JSON array
+    result.shift();
+    var array = [];
+    result.forEach(function(word){
+        if(!word.filler) {
+            array.push(new Word(word.word, word.start, word.end));
+        }
+    });
+    return array;
+};
+
+/**
+ * checks wether the reply is empty, or doesn't contain a correct JSON object
+ * @param response the server response
+ * @return {boolean} whether the response is valid
+ */
+SphinxService.prototype.verify = function(response){
+    console.log("response from server:" + response.toString());
+    //test if server responded with a string object
+    if(typeof(response) !== "string"){
+        return false;
+    }
+    //test if the string can be parsed into valid JSON
+    var json;
+    try{
+        json = JSON.parse(response);
+    }
+    catch (error){
+        console.log(error);
+        return false;
+    }
+    //check if the JSON has a "objects" value
+    if(json.objects === undefined){
+        return false;
+    }
+    //get the "objects" value and check for a session ID
+    var array = json.objects;
+    if(!(array[0] && array[0]["session-id"])){
+        return false;
+    }
+    //everything seems to be in order
+    return true;
+};
+
+/**
+ * Gets the URL to the Sphinx4 server from the config file. If it's not there,
+ * it will throw an error
+ *
+ * @returns {string} the URL to the sphinx4 server
+ */
+function getURL() {
+    var message = "config does not contain an url to a " +
+    "Sphinx4 https server";
+    if(config.sphinxURL === undefined){
+        console.log(message);
+    }
+    else {
+        var toReturn = config.sphinxURL;
+        if(toReturn.includes !== undefined && toReturn.includes("https://")){
+            return toReturn;
+        }
+        else{
+            console.log(message);
+        }
+    }
+}
+
+module.exports = SphinxService;
+},{"../word":38,"./../audioRecorder":33,"./AbstractTranscriptionService":36}],38:[function(require,module,exports){
+/**
+ * An object representing a transcribed word, with some additional information
+ * @param word the word 
+ * @param begin the time the word was started being uttered
+ * @param end the tome the word stopped being uttered
+ */
+var Word = function (word, begin, end, name) {
+    this.word = word;
+    this.begin = begin;
+    this.end = end;
+};
+
+/**
+ * Get the string representation of the word
+ * @returns {*} the word as a string
+ */
+Word.prototype.getWord = function() {
+    return this.word;  
+};
+
+/**
+ * Get the time the word started being uttered
+ * @returns {*} the start time as an integer
+ */
+Word.prototype.getBeginTime = function () {
+    return this.begin;
+};
+
+/**
+ * Get the time the word stopped being uttered
+ * @returns {*} the end time as an integer
+ */
+Word.prototype.getEndTime = function () {
+    return this.end;
+};
+
+module.exports = Word;
+},{}],39:[function(require,module,exports){
+var AuthUtil = {
+    /**
+     * Creates the URL pointing to JWT token authentication service. It is
+     * formatted from the 'urlPattern' argument which can contain the following
+     * constants:
+     * '{room}' - name of the conference room passed as <tt>roomName</tt>
+     * argument to this method.
+     * '{roleUpgrade}' - will contain 'true' if the URL will be used for
+     * the role upgrade scenario, where user connects from anonymous domain and
+     * then gets upgraded to the moderator by logging-in from the popup window.
+     *
+     * @param urlPattern a URL pattern pointing to the login service
+     * @param roomName the name of the conference room for which the user will
+     * be authenticated
+     * @param {bool} roleUpgrade <tt>true</tt> if the URL will be used for role
+     * upgrade scenario, where the user logs-in from the popup window in order
+     * to have the moderator rights granted
+     *
+     * @returns {string|null} the URL pointing to JWT login service or
+     * <tt>null</tt> if 'urlPattern' is not a string and the URL can not be
+     * constructed.
+     */
+    getTokenAuthUrl: function (urlPattern, roomName, roleUpgrade) {
+        var url = urlPattern;
+        if (typeof url !== "string") {
+            return null;
+        }
+        return url.replace("{room}", roomName)
+            .replace("{roleUpgrade}", roleUpgrade === true);
+    }
+};
+
+module.exports = AuthUtil;
+
+},{}],40:[function(require,module,exports){
+var EventEmitter = require("events");
+
+/**
+ * Implements utility to forward events from one eventEmitter to another.
+ * @param src {object} instance of EventEmitter or another class that implements
+ * addListener method which will register listener to EventEmitter instance.
+ * @param dest {object} instance of EventEmitter or another class that
+ * implements emit method which will emit an event.
+ */
+function EventEmitterForwarder (src, dest) {
+    if (!src || !dest || typeof(src.addListener) !== "function" ||
+        typeof(dest.emit) !== "function")
+        throw new Error("Invalid arguments passed to EventEmitterForwarder");
+    this.src = src;
+    this.dest = dest;
+}
+
+/**
+ * Adds event to be forwarded from src to dest.
+ * @param srcEvent {string} the event that EventEmitterForwarder is listening
+ * for.
+ * @param dstEvent {string} the event that will be fired from dest.
+ * @param arguments all other passed arguments are going to be fired with
+ * dstEvent.
+ */
+EventEmitterForwarder.prototype.forward = function () {
+    // This line is only for fixing jshint errors.
+    var args = arguments;
+    var srcEvent = args[0];
+    //This will be the "this" value for emit function.
+    args[0] = this.dest;
+    //Using bind.apply to pass the arguments as Array-like object ("arguments")
+    this.src.addListener(srcEvent,
+        Function.prototype.bind.apply(this.dest.emit, args));
+};
+
+module.exports = EventEmitterForwarder;
+
+},{"events":63}],41:[function(require,module,exports){
+/**
+ * This utility class defines custom onerror and onunhandledrejection functions.
+ * The custom error handlers respect the previously-defined error handlers.
+ * GlobalOnErrorHandler class provides utilities to add many custom error
+ * handlers and to execute the error handlers directly.
+ */
+
+
+/**
+ * List with global error handlers that will be executed.
+ */
+var handlers = [];
+
+// If an old handler exists, also fire its events.
+var oldOnErrorHandler = window.onerror;
+
+/**
+ * Custom error handler that calls the old global error handler and executes
+ * all handlers that were previously added.
+ */
+function JitsiGlobalErrorHandler(message, source, lineno, colno, error) {
+    handlers.forEach(function (handler) {
+        handler(message, source, lineno, colno, error);
+    });
+    if (oldOnErrorHandler)
+        oldOnErrorHandler(message, source, lineno, colno, error);
+}
+
+// If an old handler exists, also fire its events.
+var oldOnUnhandledRejection = window.onunhandledrejection;
+
+/**
+ * Custom handler that calls the old global handler and executes all handlers
+ * that were previously added. This handler handles rejected Promises.
+ */
+function JitsiGlobalUnhandledRejection(event) {
+    handlers.forEach(function (handler) {
+        handler(null, null, null, null, event.reason);
+    });
+    if(oldOnUnhandledRejection)
+        oldOnUnhandledRejection(event);
+}
+
+// Setting the custom error handlers.
+window.onerror = JitsiGlobalErrorHandler;
+window.onunhandledrejection = JitsiGlobalUnhandledRejection;
+
+
+var GlobalOnErrorHandler = {
+    /**
+     * Adds new error handlers.
+     * @param handler the new handler.
+     */
+    addHandler: function (handler) {
+        handlers.push(handler);
+    },
+    /**
+     * Calls the global error handler if there is one.
+     * @param error the error to pass to the error handler
+     */
+    callErrorHandler: function (error) {
+        var errHandler = window.onerror;
+        if(!errHandler)
+            return;
+        errHandler(null, null, null, null, error);
+    },
+    /**
+     * Calls the global rejection handler if there is one.
+     * @param error the error to pass to the rejection handler.
+     */
+    callUnhandledRejectionHandler: function (error) {
+        var errHandler = window.onunhandledrejection;
+        if(!errHandler)
+            return;
+        errHandler(error);
+    }
+};
+
+
+module.exports = GlobalOnErrorHandler;
+
+},{}],42:[function(require,module,exports){
 /**
 /**
  * @const
@@ -8550,7 +12079,10 @@ var RandomUtil = {
 
 module.exports = RandomUtil;
 
-},{}],29:[function(require,module,exports){
+},{}],43:[function(require,module,exports){
+var currentExecutingScript = require("current-executing-script");
+
+
 /**
  * Implements utility functions which facilitate the dealing with scripts such
  * as the download and execution of a JavaScript file.
@@ -8565,26 +12097,51 @@ var ScriptUtil = {
      * @param prepend true to schedule the loading of the script as soon as
      * possible or false to schedule the loading of the script at the end of the
      * scripts known at the time
+     * @param relativeURL whether we need load the library from url relative
+     * to the url that lib-jitsi-meet was loaded. Useful when sourcing the
+     * library from different location than the app that is using it
+     * @param loadCallback on load callback function
+     * @param errorCallback callback to be called on error loading the script
      */
-    loadScript: function (src, async, prepend) {
+    loadScript: function (src, async, prepend, relativeURL,
+                          loadCallback, errorCallback) {
         var d = document;
         var tagName = 'script';
         var script = d.createElement(tagName);
         var referenceNode = d.getElementsByTagName(tagName)[0];
 
         script.async = async;
+
+        if (relativeURL) {
+            // finds the src url of the current loaded script
+            // and use it as base of the src supplied argument
+            var scriptEl = currentExecutingScript();
+            if(scriptEl) {
+                var scriptSrc = scriptEl.src;
+                var baseScriptSrc
+                    = scriptSrc.substring(0, scriptSrc.lastIndexOf('/') + 1);
+                if (scriptSrc && baseScriptSrc)
+                    src = baseScriptSrc + src;
+            }
+        }
+
+        if (loadCallback)
+            script.onload = loadCallback;
+        if (errorCallback)
+            script.onerror = errorCallback;
+
         script.src = src;
         if (prepend) {
             referenceNode.parentNode.insertBefore(script, referenceNode);
         } else {
             referenceNode.parentNode.appendChild(script);
         }
-    },
+    }
 };
 
 module.exports = ScriptUtil;
 
-},{}],30:[function(require,module,exports){
+},{"current-executing-script":65}],44:[function(require,module,exports){
 var RandomUtil = require('./RandomUtil');
 
 /**
@@ -9015,9 +12572,10 @@ module.exports = {
   generateUsername: generateUsername
 };
 
-},{"./RandomUtil":28}],31:[function(require,module,exports){
+},{"./RandomUtil":42}],45:[function(require,module,exports){
 (function (__filename){
 var logger = require("jitsi-meet-logger").getLogger(__filename);
+var Statistics = require("../statistics/statistics");
 
 /**
  * The constant for the name of the focus component.
@@ -9030,41 +12588,43 @@ ComponentsVersions.FOCUS_COMPONENT = "focus";
  */
 ComponentsVersions.VIDEOBRIDGE_COMPONENT = "videobridge";
 /**
- * The contant for the name of the XMPP server component.
+ * The constant for the name of the XMPP server component.
  * @type {string}
  */
 ComponentsVersions.XMPP_SERVER_COMPONENT = "xmpp";
 
 /**
  * Creates new instance of <tt>ComponentsVersions</tt> which will be discovering
- * the versions of conferencing system components in given <tt>ChatRoom</tt>.
- * @param chatRoom <tt>ChatRoom</tt> instance which will be used to listen for
- *        focus presence updates.
+ * the versions of conferencing system components in given
+ * <tt>JitsiConference</tt>.
+ * @param conference <tt>JitsiConference</tt> instance which will be used to
+ *        listen for focus presence updates.
  * @constructor
  */
-function ComponentsVersions(chatRoom) {
+function ComponentsVersions(conference) {
 
     this.versions = {};
 
-    this.chatRoom = chatRoom;
-    this.chatRoom.addPresenceListener(
+    this.conference = conference;
+    this.conference.addCommandListener(
         'versions', this.processPresence.bind(this));
 }
 
 ComponentsVersions.prototype.processPresence =
-function(node, mucResource, mucJid) {
+    function(node, mucResource, mucJid) {
 
     if (node.attributes.xmlns !== 'http://jitsi.org/jitmeet') {
         logger.warn("Ignored presence versions node - invalid xmlns", node);
         return;
     }
 
-    if (!this.chatRoom.isFocus(mucJid)) {
+    if (!this.conference._isFocus(mucJid)) {
         logger.warn(
             "Received versions not from the focus user: " + node, mucJid);
         return;
     }
 
+    var log = [];
     node.children.forEach(function(item){
 
         var componentName = item.attributes.name;
@@ -9081,8 +12641,17 @@ function(node, mucResource, mucJid) {
         if (this.versions[componentName] !== version) {
             this.versions[componentName] = version;
             logger.info("Got " + componentName + " version: " + version);
+
+            log.push({
+                id: "component_version",
+                component: componentName,
+                version: version});
         }
     }.bind(this));
+
+    // logs versions to stats
+    if (log.length > 0)
+        Statistics.sendLog(JSON.stringify(log));
 };
 
 /**
@@ -9098,10 +12667,9 @@ ComponentsVersions.prototype.getComponentVersion = function(componentName) {
 
 module.exports = ComponentsVersions;
 
-
 }).call(this,"/modules/version/ComponentsVersions.js")
 
-},{"jitsi-meet-logger":82}],32:[function(require,module,exports){
+},{"../statistics/statistics":32,"jitsi-meet-logger":68}],46:[function(require,module,exports){
 (function (__filename){
 /* global Strophe, $, $pres, $iq, $msg */
 /* jshint -W101,-W069 */
@@ -9111,6 +12679,8 @@ var MediaType = require("../../service/RTC/MediaType");
 var Moderator = require("./moderator");
 var EventEmitter = require("events");
 var Recorder = require("./recording");
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
+
 var JIBRI_XMLNS = 'http://jitsi.org/protocol/jibri';
 
 var parser = {
@@ -9177,7 +12747,7 @@ function ChatRoom(connection, jid, password, XMPP, options, settings) {
     this.presMap = {};
     this.presHandlers = {};
     this.joined = false;
-    this.role = 'none';
+    this.role = null;
     this.focusMucJid = null;
     this.bridgeIsDown = false;
     this.options = options || {};
@@ -9190,6 +12760,9 @@ function ChatRoom(connection, jid, password, XMPP, options, settings) {
     this.phoneNumber = null;
     this.phonePin = null;
     this.connectionTimes = {};
+    this.participantPropertyListener = null;
+
+    this.locked = false;
 }
 
 ChatRoom.prototype.initPresenceMap = function () {
@@ -9239,13 +12812,20 @@ ChatRoom.prototype.sendPresence = function (fromJoin) {
     }
 
     var pres = $pres({to: to });
-    pres.c('x', {xmlns: this.presMap['xns']});
 
-    if (this.password) {
-        pres.c('password').t(this.password).up();
+    // xep-0045 defines: "including in the initial presence stanza an empty
+    // <x/> element qualified by the 'http://jabber.org/protocol/muc' namespace"
+    // and subsequent presences should not include that or it can be considered
+    // as joining, and server can send us the message history for the room on
+    // every presence
+    if (fromJoin) {
+        pres.c('x', {xmlns: this.presMap['xns']});
+
+        if (this.password) {
+            pres.c('password').t(this.password).up();
+        }
+        pres.up();
     }
-
-    pres.up();
 
     // Send XEP-0115 'c' stanza that contains our capabilities info
     var connection = this.connection;
@@ -9288,6 +12868,24 @@ ChatRoom.prototype.doLeave = function () {
     this.connection.flush();
 };
 
+ChatRoom.prototype.discoRoomInfo = function () {
+  // https://xmpp.org/extensions/xep-0045.html#disco-roominfo
+
+  var getInfo = $iq({type: 'get', to: this.roomjid})
+    .c('query', {xmlns: Strophe.NS.DISCO_INFO});
+
+  this.connection.sendIQ(getInfo, function (result) {
+    var locked = $(result).find('>query>feature[var="muc_passwordprotected"]').length;
+    if (locked != this.locked) {
+      this.eventEmitter.emit(XMPPEvents.MUC_LOCK_CHANGED, locked);
+      this.locked = locked;
+    }
+  }.bind(this), function (error) {
+    GlobalOnErrorHandler.callErrorHandler(error);
+    logger.error("Error getting room info: ", error);
+  }.bind(this));
+};
+
 
 ChatRoom.prototype.createNonAnonymousRoom = function () {
     // http://xmpp.org/extensions/xep-0045.html#createroom-reserved
@@ -9303,8 +12901,9 @@ ChatRoom.prototype.createNonAnonymousRoom = function () {
         if (!$(form).find(
                 '>query>x[xmlns="jabber:x:data"]' +
                 '>field[var="muc#roomconfig_whois"]').length) {
-
-            logger.error('non-anonymous rooms not supported');
+            var errmsg = "non-anonymous rooms not supported";
+            GlobalOnErrorHandler.callErrorHandler(new Error(errmsg));
+            logger.error(errmsg);
             return;
         }
 
@@ -9323,7 +12922,8 @@ ChatRoom.prototype.createNonAnonymousRoom = function () {
         self.connection.sendIQ(formSubmit);
 
     }, function (error) {
-        logger.error("Error getting room configuration form");
+        GlobalOnErrorHandler.callErrorHandler(error);
+        logger.error("Error getting room configuration form: ", error);
     });
 };
 
@@ -9342,11 +12942,9 @@ ChatRoom.prototype.onPresence = function (pres) {
     var jid = mucUserItem.attr('jid');
     member.jid = jid;
     member.isFocus
-        = !!jid && jid.indexOf(this.moderator.getFocusUserJid() + "/") === 0;
-
+        = jid && jid.indexOf(this.moderator.getFocusUserJid() + "/") === 0;
     member.isHiddenDomain
-        = !!jid && jid.indexOf("@") > 0
-            && this.options.hiddenDomain
+        = jid && jid.indexOf("@") > 0
             && this.options.hiddenDomain
                 === jid.substring(jid.indexOf("@") + 1, jid.indexOf("/"))
 
@@ -9372,8 +12970,9 @@ ChatRoom.prototype.onPresence = function (pres) {
     }
 
     if (from == this.myroomjid) {
-        if (member.affiliation == 'owner' && this.role !== member.role) {
-            this.role = member.role;
+        var newRole = member.affiliation == "owner"? member.role : "none";
+        if (this.role !== newRole) {
+            this.role = newRole;
             this.eventEmitter.emit(XMPPEvents.LOCAL_ROLE_CHANGED, this.role);
         }
         if (!this.joined) {
@@ -9388,17 +12987,8 @@ ChatRoom.prototype.onPresence = function (pres) {
         this.members[from] = member;
         logger.log('entered', from, member);
         if (member.isFocus) {
-            this.focusMucJid = from;
-            if(!this.recording) {
-                this.recording = new Recorder(this.options.recordingType,
-                    this.eventEmitter, this.connection, this.focusMucJid,
-                    this.options.jirecon, this.roomjid);
-                if(this.lastJibri)
-                    this.recording.handleJibriPresence(this.lastJibri);
-            }
-            logger.info("Ignore focus: " + from + ", real JID: " + jid);
-        }
-        else {
+            this._initFocus(from, jid);
+        } else {
             this.eventEmitter.emit(
                 XMPPEvents.MUC_MEMBER_JOINED,
                 from, member.nick, member.role, member.isHiddenDomain);
@@ -9411,6 +13001,19 @@ ChatRoom.prototype.onPresence = function (pres) {
             memberOfThis.role = member.role;
             this.eventEmitter.emit(
                 XMPPEvents.MUC_ROLE_CHANGED, from, member.role);
+        }
+
+        if (member.isFocus) {
+            // From time to time first few presences of the focus are not
+            // containing it's jid. That way we can mark later the focus member
+            // instead of not marking it at all and not starting the conference.
+            // FIXME: Maybe there is a better way to handle this issue. It seems
+            // there is some period of time in prosody that the configuration
+            // form is received but not applied. And if any participant joins
+            // during that period of time the first presence from the focus
+            // won't conain <item jid="focus..." />.
+            memberOfThis.isFocus = true;
+            this._initFocus(from, jid);
         }
 
         // store the new display name
@@ -9427,8 +13030,8 @@ ChatRoom.prototype.onPresence = function (pres) {
         {
             case "nick":
                 if(!member.isFocus) {
-                    var displayName = !this.xmpp.options.displayJids
-                        ? member.nick : Strophe.getResourceFromJid(from);
+                    var displayName = this.xmpp.options.displayJids
+                        ? Strophe.getResourceFromJid(from) : member.nick;
 
                     if (displayName && displayName.length > 0) {
                         this.eventEmitter.emit(
@@ -9437,7 +13040,7 @@ ChatRoom.prototype.onPresence = function (pres) {
                 }
                 break;
             case "bridgeIsDown":
-                if(!this.bridgeIsDown) {
+                if (member.isFocus && !this.bridgeIsDown) {
                     this.bridgeIsDown = true;
                     this.eventEmitter.emit(XMPPEvents.BRIDGE_DOWN);
                 }
@@ -9453,7 +13056,7 @@ ChatRoom.prototype.onPresence = function (pres) {
                 this.phonePin = att.pin || null;
                 this.eventEmitter.emit(XMPPEvents.PHONE_NUMBER_CHANGED);
                 break;
-            default :
+            default:
                 this.processNode(node, from);
         }
     }
@@ -9471,16 +13074,46 @@ ChatRoom.prototype.onPresence = function (pres) {
     }
 };
 
+/**
+ * Initialize some properties when the focus participant is verified.
+ * @param from jid of the focus
+ * @param mucJid the jid of the focus in the muc
+ */
+ChatRoom.prototype._initFocus = function (from, mucJid) {
+    this.focusMucJid = from;
+    if(!this.recording) {
+        this.recording = new Recorder(this.options.recordingType,
+            this.eventEmitter, this.connection, this.focusMucJid,
+            this.options.jirecon, this.roomjid);
+        if(this.lastJibri)
+            this.recording.handleJibriPresence(this.lastJibri);
+    }
+    logger.info("Ignore focus: " + from + ", real JID: " + mucJid);
+}
+
+/**
+ * Sets the special listener to be used for "command"s whose name starts with
+ * "jitsi_participant_".
+ */
+ChatRoom.prototype.setParticipantPropertyListener = function (listener) {
+    this.participantPropertyListener = listener;
+};
+
 ChatRoom.prototype.processNode = function (node, from) {
     // make sure we catch all errors coming from any handler
     // otherwise we can remove the presence handler from strophe
     try {
-        if(this.presHandlers[node.tagName])
-            this.presHandlers[node.tagName](
-                node, Strophe.getResourceFromJid(from), from);
+        var tagHandler = this.presHandlers[node.tagName];
+        if (node.tagName.startsWith("jitsi_participant_")) {
+            tagHandler = this.participantPropertyListener;
+        }
+
+        if(tagHandler) {
+            tagHandler(node, Strophe.getResourceFromJid(from), from);
+        }
     } catch (e) {
-        logger.error('Error processing:' + node.tagName
-            + ' node.', e);
+        GlobalOnErrorHandler.callErrorHandler(e);
+        logger.error('Error processing:' + node.tagName + ' node.', e);
     }
 };
 
@@ -9500,10 +13133,19 @@ ChatRoom.prototype.setSubject = function (subject) {
     this.connection.send(msg);
 };
 
-
-ChatRoom.prototype.onParticipantLeft = function (jid) {
+/**
+ * Called when participant leaves.
+ * @param jid the jid of the participant that leaves
+ * @param skipEvents optional params to skip any events, including check
+ * whether this is the focus that left
+ */
+ChatRoom.prototype.onParticipantLeft = function (jid, skipEvents) {
 
     delete this.lastPresences[jid];
+
+    if(skipEvents)
+        return;
+
     this.eventEmitter.emit(XMPPEvents.MUC_MEMBER_LEFT, jid);
 
     this.moderator.onMucMemberLeft(jid);
@@ -9531,7 +13173,7 @@ ChatRoom.prototype.onPresenceUnavailable = function (pres, from) {
     // Status code 110 indicates that this notification is "self-presence".
     if (!$(pres).find('>x[xmlns="http://jabber.org/protocol/muc#user"]>status[code="110"]').length) {
         delete this.members[from];
-        this.onParticipantLeft(from);
+        this.onParticipantLeft(from, false);
     }
     // If the status code is 110 this means we're leaving and we would like
     // to remove everyone else from our view, so we trigger the event.
@@ -9539,12 +13181,12 @@ ChatRoom.prototype.onPresenceUnavailable = function (pres, from) {
         for (var i in this.members) {
             var member = this.members[i];
             delete this.members[i];
-            this.onParticipantLeft(member);
+            this.onParticipantLeft(i, member.isFocus);
         }
     }
     if ($(pres).find('>x[xmlns="http://jabber.org/protocol/muc#user"]>status[code="307"]').length) {
         if (this.myroomjid === from) {
-            this.leave();
+            this.leave(true);
             this.eventEmitter.emit(XMPPEvents.KICKED);
         }
     }
@@ -9585,6 +13227,10 @@ ChatRoom.prototype.onMessage = function (msg, from) {
             var dateParts = stamp.match(/(\d{4})(\d{2})(\d{2}T\d{2}:\d{2}:\d{2})/);
             stamp = dateParts[1] + "-" + dateParts[2] + "-" + dateParts[3] + "Z";
         }
+    }
+
+    if (from==this.roomjid && $(msg).find('>x[xmlns="http://jabber.org/protocol/muc#user"]>status[code="104"]').length) {
+      this.discoRoomInfo();
     }
 
     if (txt) {
@@ -9662,15 +13308,14 @@ ChatRoom.prototype.lockRoom = function (key, onSuccess, onError, onNotSupported)
 
 ChatRoom.prototype.addToPresence = function (key, values) {
     values.tagName = key;
-    this.presMap["nodes"].push(values);
+    this.removeFromPresence(key);
+    this.presMap.nodes.push(values);
 };
 
 ChatRoom.prototype.removeFromPresence = function (key) {
-    for(var i = 0; i < this.presMap.nodes.length; i++)
-    {
-        if(key === this.presMap.nodes[i].tagName)
-            this.presMap.nodes.splice(i, 1);
-    }
+    var nodes = this.presMap.nodes.filter(function(node) {
+        return key !== node.tagName;});
+    this.presMap.nodes = nodes;
 };
 
 ChatRoom.prototype.addPresenceListener = function (name, handler) {
@@ -9711,29 +13356,39 @@ ChatRoom.prototype.setJingleSession = function(session){
     this.session = session;
 };
 
-
-ChatRoom.prototype.removeStream = function (stream, callback, ssrcInfo) {
+/**
+ * Remove stream.
+ * @param stream stream that will be removed.
+ * @param callback callback executed after successful stream removal.
+ * @param errorCallback callback executed if stream removal fail.
+ * @param ssrcInfo object with information about the SSRCs associated with the
+ * stream.
+ */
+ChatRoom.prototype.removeStream = function (stream, callback, errorCallback,
+    ssrcInfo) {
     if(!this.session) {
         callback();
         return;
     }
-    this.session.removeStream(stream, callback, ssrcInfo);
+    this.session.removeStream(stream, callback, errorCallback, ssrcInfo);
 };
 
 /**
  * Adds stream.
  * @param stream new stream that will be added.
  * @param callback callback executed after successful stream addition.
+ * @param errorCallback callback executed if stream addition fail.
  * @param ssrcInfo object with information about the SSRCs associated with the
  * stream.
  * @param dontModifySources {boolean} if true _modifySources won't be called.
  * Used for streams added before the call start.
  */
-ChatRoom.prototype.addStream = function (stream, callback, ssrcInfo,
-    dontModifySources) {
+ChatRoom.prototype.addStream = function (stream, callback, errorCallback,
+    ssrcInfo, dontModifySources) {
     if(this.session) {
         // FIXME: will block switchInProgress on true value in case of exception
-        this.session.addStream(stream, callback, ssrcInfo, dontModifySources);
+        this.session.addStream(stream, callback, errorCallback, ssrcInfo,
+            dontModifySources);
     } else {
         // We are done immediately
         logger.warn("No conference handler or conference not started yet");
@@ -9809,13 +13464,18 @@ ChatRoom.prototype.removeListener = function (type, listener) {
 ChatRoom.prototype.remoteTrackAdded = function(data) {
     // Will figure out current muted status by looking up owner's presence
     var pres = this.lastPresences[data.owner];
-    var mediaType = data.mediaType;
     if(pres) {
+        var mediaType = data.mediaType;
         var mutedNode = null;
         if (mediaType === MediaType.AUDIO) {
             mutedNode = filterNodeFromPresenceJSON(pres, "audiomuted");
         } else if (mediaType === MediaType.VIDEO) {
             mutedNode = filterNodeFromPresenceJSON(pres, "videomuted");
+            var videoTypeNode = filterNodeFromPresenceJSON(pres, "videoType");
+            if(videoTypeNode
+                && videoTypeNode.length > 0
+                && videoTypeNode[0])
+                data.videoType = videoTypeNode[0]["value"];
         } else {
             logger.warn("Unsupported media type: " + mediaType);
             data.muted = null;
@@ -9959,13 +13619,15 @@ ChatRoom.prototype.onMute = function (iq) {
 
 /**
  * Leaves the room. Closes the jingle session.
+ * @parama voidSendingPresence avoids sending the presence when leaving
  */
-ChatRoom.prototype.leave = function () {
+ChatRoom.prototype.leave = function (avoidSendingPresence) {
     if (this.session) {
         this.session.close();
     }
     this.eventEmitter.emit(XMPPEvents.DISPOSE_CONFERENCE);
-    this.doLeave();
+    if(!avoidSendingPresence)
+        this.doLeave();
     this.connection.emuc.doLeave(this.roomjid);
 };
 
@@ -9973,7 +13635,7 @@ module.exports = ChatRoom;
 
 }).call(this,"/modules/xmpp/ChatRoom.js")
 
-},{"../../service/RTC/MediaType":129,"../../service/xmpp/XMPPEvents":136,"./moderator":39,"./recording":40,"events":54,"jitsi-meet-logger":82}],33:[function(require,module,exports){
+},{"../../service/RTC/MediaType":147,"../../service/xmpp/XMPPEvents":154,"../util/GlobalOnErrorHandler":41,"./moderator":53,"./recording":54,"events":63,"jitsi-meet-logger":68}],47:[function(require,module,exports){
 (function (__filename){
 /*
  * JingleSession provides an API to manage a single Jingle session. We will
@@ -10046,9 +13708,11 @@ function JingleSession(me, sid, peerjid, connection,
  */
 JingleSession.prototype.initialize = function(isInitiator, room) {
     if (this.state !== null) {
-        logger.error('attempt to initiate on session ' + this.sid +
-        'in state ' + this.state);
-        return;
+        var errmsg
+            = 'attempt to initiate on session ' + this.sid + 'in state '
+                + this.state;
+        logger.error(errmsg);
+        throw new Error(errmsg);
     }
     this.room = room;
     this.state = 'pending';
@@ -10113,7 +13777,7 @@ module.exports = JingleSession;
 
 }).call(this,"/modules/xmpp/JingleSession.js")
 
-},{"jitsi-meet-logger":82}],34:[function(require,module,exports){
+},{"jitsi-meet-logger":68}],48:[function(require,module,exports){
 (function (__filename){
 /* jshint -W117 */
 
@@ -10128,6 +13792,8 @@ var async = require("async");
 var XMPPEvents = require("../../service/xmpp/XMPPEvents");
 var RTCBrowserType = require("../RTC/RTCBrowserType");
 var RTC = require("../RTC/RTC");
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
+var Statistics = require("../statistics/statistics");
 
 /**
  * Constant tells how long we're going to wait for IQ response, before timeout
@@ -10142,18 +13808,24 @@ function JingleSessionPC(me, sid, peerjid, connection,
     JingleSession.call(this, me, sid, peerjid, connection,
                        media_constraints, ice_config, service, eventEmitter);
     this.localSDP = null;
-    this.remoteSDP = null;
 
-    this.hadstuncandidate = false;
-    this.hadturncandidate = false;
     this.lasticecandidate = false;
     this.closed = false;
 
     this.addssrc = [];
     this.removessrc = [];
-    this.pendingop = null;
     this.modifyingLocalStreams = false;
     this.modifiedSSRCs = {};
+
+    /**
+     * The local ICE username fragment for this session.
+     */
+    this.localUfrag = null;
+
+    /**
+     * The remote ICE username fragment for this session.
+     */
+    this.remoteUfrag = null;
 
     /**
      * A map that stores SSRCs of remote streams. And is used only locally
@@ -10165,38 +13837,19 @@ function JingleSessionPC(me, sid, peerjid, connection,
      */
     this.ssrcOwners = {};
 
+    this.jingleOfferIq = null;
     this.webrtcIceUdpDisable = !!this.service.options.webrtcIceUdpDisable;
     this.webrtcIceTcpDisable = !!this.service.options.webrtcIceTcpDisable;
 
     this.modifySourcesQueue = async.queue(this._modifySources.bind(this), 1);
-    // We start with the queue paused. We resume it when the signaling state is
-    // stable and the ice connection state is connected.
-    this.modifySourcesQueue.pause();
 }
-//XXX this is badly broken...
-JingleSessionPC.prototype = JingleSession.prototype;
+
+JingleSessionPC.prototype = Object.create(JingleSession.prototype);
 JingleSessionPC.prototype.constructor = JingleSessionPC;
 
 
-JingleSessionPC.prototype.updateModifySourcesQueue = function() {
-	
-	console.info(">>> updateModifySourcesQueue");
-    var signalingState = this.peerconnection.signalingState;
-    var iceConnectionState = this.peerconnection.iceConnectionState;
-    if (signalingState === 'stable' && iceConnectionState === 'connected') {
-		
-        console.info(">>> resuming");
-        this.modifySourcesQueue.resume();
-    } else {
-        this.modifySourcesQueue.pause();
-    }
-};
-
 JingleSessionPC.prototype.doInitialize = function () {
     var self = this;
-
-    this.hadstuncandidate = false;
-    this.hadturncandidate = false;
     this.lasticecandidate = false;
     // True if reconnect is in progress
     this.isreconnect = false;
@@ -10217,6 +13870,7 @@ JingleSessionPC.prototype.doInitialize = function () {
             // complete.
             return;
         }
+        // XXX this is broken, candidate is not parsed.
         var candidate = ev.candidate;
         if (candidate) {
             // Discard candidates of disabled protocols.
@@ -10246,7 +13900,6 @@ JingleSessionPC.prototype.doInitialize = function () {
         if (self.peerconnection.signalingState === 'stable') {
             self.wasstable = true;
         }
-        self.updateModifySourcesQueue();
     };
     /**
      * The oniceconnectionstatechange event handler contains the code to execute when the iceconnectionstatechange event,
@@ -10263,7 +13916,8 @@ JingleSessionPC.prototype.doInitialize = function () {
             self.peerconnection.iceConnectionState] = now;
         logger.log("(TIME) ICE " + self.peerconnection.iceConnectionState +
                     ":\t", now);
-        self.updateModifySourcesQueue();
+        Statistics.analytics.sendEvent(
+            'ice.' + self.peerconnection.iceConnectionState, now);
         switch (self.peerconnection.iceConnectionState) {
             case 'connected':
 
@@ -10298,16 +13952,12 @@ JingleSessionPC.prototype.sendIceCandidate = function (candidate) {
         var ice = SDPUtil.iceparams(this.localSDP.media[candidate.sdpMLineIndex], this.localSDP.session);
         var jcand = SDPUtil.candidateToJingle(candidate.candidate);
         if (!(ice && jcand)) {
-            logger.error('failed to get ice && jcand');
+            var errorMesssage = "failed to get ice && jcand";
+            GlobalOnErrorHandler.callErrorHandler(new Error(errorMesssage));
+            logger.error(errorMesssage);
             return;
         }
         ice.xmlns = 'urn:xmpp:jingle:transports:ice-udp:1';
-
-        if (jcand.type === 'srflx') {
-            this.hadstuncandidate = true;
-        } else if (jcand.type === 'relay') {
-            this.hadturncandidate = true;
-        }
 
         if (this.usedrip) {
             if (this.drip_container.length === 0) {
@@ -10326,8 +13976,6 @@ JingleSessionPC.prototype.sendIceCandidate = function (candidate) {
         logger.log('sendIceCandidate: last candidate.');
         // FIXME: remember to re-think in ICE-restart
         this.lasticecandidate = true;
-        logger.log('Have we encountered any srflx candidates? ' + this.hadstuncandidate);
-        logger.log('Have we encountered any relay candidates? ' + this.hadturncandidate);
     }
 };
 
@@ -10370,7 +14018,10 @@ JingleSessionPC.prototype.sendIceCandidates = function (candidates) {
     // might merge last-candidate notification into this, but it is called alot later. See webrtc issue #2340
     //logger.log('was this the last candidate', this.lasticecandidate);
     this.connection.sendIQ(
-        cand, null, this.newJingleErrorHandler(cand), IQ_TIMEOUT);
+        cand, null, this.newJingleErrorHandler(cand, function (error) {
+            GlobalOnErrorHandler.callErrorHandler(
+                new Error("Jingle error: " + JSON.stringify(error)));
+        }), IQ_TIMEOUT);
 };
 
 JingleSessionPC.prototype.readSsrcInfo = function (contents) {
@@ -10430,118 +14081,14 @@ JingleSessionPC.prototype.acceptOffer = function(jingleOffer,
 JingleSessionPC.prototype.setOfferCycle = function (jingleOfferIq,
                                                           success,
                                                           failure) {
-    // Set Jingle offer as RD
-    this.setOffer(jingleOfferIq,
-        function() {
-            // Set offer OK, now let's try create an answer
-            this.createAnswer(function(answer) {
-                    // Create answer OK, set it as local SDP
-                    this.setLocalDescription(answer, success, failure);
-                }.bind(this),
-                failure);
-        }.bind(this),
-        failure);
-};
-
-/**
- * Sets remote offer on PeerConnection by converting given Jingle offer IQ into
- * SDP and setting it as remote description.
- * @param jingleOfferIq  jQuery selector pointing to the jingle element of
- *        the offer IQ
- * @param success callback called when setRemoteDescription on PeerConnection
- *        succeeds
- * @param failure callback called with an error argument when
- *        setRemoteDescription fails.
- */
-JingleSessionPC.prototype.setOffer = function (jingleOfferIq, success, failure) {
-    this.remoteSDP = new SDP('');
-    if (this.webrtcIceTcpDisable) {
-        this.remoteSDP.removeTcpCandidates = true;
-    }
-    if (this.webrtcIceUdpDisable) {
-        this.remoteSDP.removeUdpCandidates = true;
-    }
-
-    this.remoteSDP.fromJingle(jingleOfferIq);
-    this.readSsrcInfo($(jingleOfferIq).find(">content"));
-    var remotedesc
-        = new RTCSessionDescription({type: 'offer', sdp: this.remoteSDP.raw});
-
-    this.peerconnection.setRemoteDescription(remotedesc,
-        function () {
-            //logger.log('setRemoteDescription success');
-            if (success) {
-                success();
-            }
-        },
-        function (e) {
-            logger.error('setRemoteDescription error', e);
-            if (failure)
-                failure(e);
-            JingleSessionPC.onJingleFatalError(this, e);
-        }.bind(this)
-    );
-};
-
-/**
- * This is a wrapper to PeerConnection.createAnswer in order to generate failure
- * event when error occurs. It also includes "media_constraints" if any are set
- * on this JingleSessionPC instance.
- * @param success callback called when PC.createAnswer succeeds, SDP will be
- *        the first argument
- * @param failure callback called with error argument when setAnswer fails
- */
-JingleSessionPC.prototype.createAnswer = function (success, failure) {
-    //logger.log('createAnswer');
-    var self = this;
-    this.peerconnection.createAnswer(
-        function (answer) {
-            var modifiedAnswer = new SDP(answer.sdp);
-            JingleSessionPC._fixAnswerRFC4145Setup(
-                /* offer */ self.remoteSDP,
-                /* answer */ modifiedAnswer);
-            answer.sdp = modifiedAnswer.raw;
-            success(answer);
-        },
-        function (error) {
-            logger.error("createAnswer failed", error);
-            if (failure)
-                failure(error);
-            self.room.eventEmitter.emit(
-                    XMPPEvents.CONFERENCE_SETUP_FAILED, error);
-        },
-        this.media_constraints
-    );
-};
-
-JingleSessionPC.prototype.setLocalDescription = function (sdp, success,
-                                                               failure) {
-    var self = this;
-    this.localSDP = new SDP(sdp.sdp);
-    sdp.sdp = this.localSDP.raw;
-    this.peerconnection.setLocalDescription(sdp,
-        function () {
-            if (success)
-                success();
-        },
-        function (error) {
-            logger.error('setLocalDescription failed', error);
-            if (failure)
-                failure(error);
-            self.room.eventEmitter.emit(XMPPEvents.CONFERENCE_SETUP_FAILED);
-        }
-    );
-    // Some checks for STUN and TURN candiates present in local SDP
-    // Eventually could be removed as we don't really care
-    var cands = SDPUtil.find_lines(this.localSDP.raw, 'a=candidate:');
-    for (var j = 0; j < cands.length; j++) {
-        var cand = SDPUtil.parse_icecandidate(cands[j]);
-        if (cand.type == 'srflx') {
-            this.hadstuncandidate = true;
-        } else if (cand.type == 'relay') {
-            this.hadturncandidate = true;
-        }
-    }
+    this.jingleOfferIq = jingleOfferIq;
+    this.modifySourcesQueue.push(success, function (error) {
+        if(!error)
+            return;
+        if (failure)
+            failure(error);
+        JingleSessionPC.onJingleFatalError(this, error);
+    }.bind(this));
 };
 
 /**
@@ -10614,13 +14161,29 @@ JingleSessionPC._fixAnswerRFC4145Setup = function (offer, answer) {
 JingleSessionPC.prototype.replaceTransport = function (jingleOfferElem,
                                                        success,
                                                        failure) {
-    // Set offer as RD
-    this.setOfferCycle(jingleOfferElem,
-        function () {
-            // Set local description OK, now localSDP up to date
-            this.sendTransportAccept(this.localSDP, success, failure);
-        }.bind(this),
-        failure);
+
+    // We need to first set an offer without the 'data' section to have the SCTP
+    // stack cleaned up. After that the original offer is set to have the SCTP
+    // connection established with the new bridge.
+    this.room.eventEmitter.emit(XMPPEvents.ICE_RESTARTING);
+    var originalOffer = jingleOfferElem.clone();
+    jingleOfferElem.find(">content[name='data']").remove();
+
+    var self = this;
+    // First set an offer without the 'data' section
+    this.setOfferCycle(
+        jingleOfferElem,
+        function() {
+            // Now set the original offer(with the 'data' section)
+            self.setOfferCycle(originalOffer,
+                function () {
+                    // Set local description OK, now localSDP up to date
+                    self.sendTransportAccept(self.localSDP, success, failure);
+                },
+                failure);
+        },
+        failure
+    );
 };
 
 /**
@@ -10655,15 +14218,34 @@ JingleSessionPC.prototype.sendSessionAccept = function (localSDP,
     // Calling tree() to print something useful
     accept = accept.tree();
     logger.info("Sending session-accept", accept);
-
+    var self = this;
     this.connection.sendIQ(accept,
         success,
-        this.newJingleErrorHandler(accept, failure),
+        this.newJingleErrorHandler(accept, function (error) {
+            failure(error);
+            // 'session-accept' is a critical timeout and we'll have to restart
+            self.room.eventEmitter.emit(XMPPEvents.SESSION_ACCEPT_TIMEOUT);
+        }),
         IQ_TIMEOUT);
     // XXX Videobridge needs WebRTC's answer (ICE ufrag and pwd, DTLS
     // fingerprint and setup) ASAP in order to start the connection
     // establishment.
-    this.connection.flush();
+    //
+    // FIXME Flushing the connection at this point triggers an issue with BOSH
+    // request handling in Prosody on slow connections.
+    //
+    // The problem is that this request will be quite large and it may take time
+    // before it reaches Prosody. In the meantime Strophe may decide to send
+    // the next one. And it was observed that a small request with
+    // 'transport-info' usually follows this one. It does reach Prosody before
+    // the previous one was completely received. 'rid' on the server is
+    // increased and Prosody ignores the request with 'session-accept'. It will
+    // never reach Jicofo and everything in the request table is lost. Removing
+    // the flush does not guarantee it will never happen, but makes it much less
+    // likely('transport-info' is bundled with 'session-accept' and any
+    // immediate requests).
+    //
+    // this.connection.flush();
 };
 
 /**
@@ -10731,6 +14313,7 @@ JingleSessionPC.prototype.sendTransportReject = function(success, failure) {
         IQ_TIMEOUT);
 };
 
+//FIXME: I think this method is not used!
 JingleSessionPC.prototype.terminate = function (reason,  text,
                                                 success, failure) {
     var term = $iq({to: this.peerjid,
@@ -10774,7 +14357,6 @@ JingleSessionPC.prototype.onTerminated = function (reasonCondition,
  * @param elem An array of Jingle "content" elements.
  */
 JingleSessionPC.prototype.addSource = function (elem) {
-
     var self = this;
     // FIXME: dirty waiting
     if (!this.peerconnection.localDescription)
@@ -10860,7 +14442,6 @@ JingleSessionPC.prototype.addSource = function (elem) {
  * @param elem An array of Jingle "content" elements.
  */
 JingleSessionPC.prototype.removeSource = function (elem) {
-
     var self = this;
     // FIXME: dirty waiting
     if (!this.peerconnection.localDescription) {
@@ -10897,7 +14478,10 @@ JingleSessionPC.prototype.removeSource = function (elem) {
             var ssrc = $(this).attr('ssrc');
             // This should never happen, but can be useful for bug detection
             if(mySdp.containsSSRC(ssrc)){
-                logger.error("Got remove stream request for my own ssrc: "+ssrc);
+                var errmsg
+                    = "Got remove stream request for my own ssrc: " + ssrc;
+                GlobalOnErrorHandler.callErrorHandler(new Error(errmsg));
+                logger.error(errmsg);
                 return;
             }
             ssrcs.push(ssrc);
@@ -10936,11 +14520,11 @@ JingleSessionPC.prototype.removeSource = function (elem) {
 };
 
 JingleSessionPC.prototype._modifySources = function (successCallback, queueCallback) {
-    var self = this;
+    var self = this, sdp = null, media_constraints;
 
     if (this.peerconnection.signalingState == 'closed') return;
-    if (!(this.addssrc.length || this.removessrc.length || this.pendingop !== null
-        || this.modifyingLocalStreams)){
+    if (!(this.addssrc.length || this.removessrc.length
+        || this.modifyingLocalStreams || this.jingleOfferIq !== null)){
         // There is nothing to do since scheduled job might have been
         // executed by another succeeding call
         if(successCallback){
@@ -10950,10 +14534,25 @@ JingleSessionPC.prototype._modifySources = function (successCallback, queueCallb
         return;
     }
 
-    // Reset switch streams flags
-    this.modifyingLocalStreams = false;
+    if(this.jingleOfferIq) {
+        sdp = new SDP('');
+        if (this.webrtcIceTcpDisable) {
+            sdp.removeTcpCandidates = true;
+        }
+        if (this.webrtcIceUdpDisable) {
+            sdp.removeUdpCandidates = true;
+        }
 
-    var sdp = new SDP(this.peerconnection.remoteDescription.sdp);
+        sdp.fromJingle(this.jingleOfferIq);
+        this.readSsrcInfo($(this.jingleOfferIq).find(">content"));
+        this.jingleOfferIq = null;
+        media_constraints = this.media_constraints;
+    } else {
+        // Reset switch streams flags
+        this.modifyingLocalStreams = false;
+
+        sdp = new SDP(this.peerconnection.remoteDescription.sdp);
+    }
 
     // add sources
     this.addssrc.forEach(function(lines, idx) {
@@ -10972,79 +14571,89 @@ JingleSessionPC.prototype._modifySources = function (successCallback, queueCallb
     this.removessrc = [];
 
     sdp.raw = sdp.session + sdp.media.join('');
-    this.peerconnection.setRemoteDescription(new RTCSessionDescription({type: 'offer', sdp: sdp.raw}),
-        function() {
+    /**
+     * Implements a failure callback which reports an error message and an
+     * optional error through (1) logger, (2) GlobalOnErrorHandler, and (3)
+     * queueCallback.
+     *
+     * @param {string} errmsg the error messsage to report
+     * @param {*} error an optional error to report in addition to errmsg
+     */
+    function reportError(errmsg, err) {
+        if (err) {
+           errmsg = errmsg + ': ' + err; // for logger and GlobalOnErrorHandler
+           logger.error(errmsg, err);
+        } else {
+           logger.error(errmsg);
+           err = new Error(errmsg); // for queueCallback
+        }
+        GlobalOnErrorHandler.callErrorHandler(new Error(errmsg));
+        queueCallback(err);
+    };
 
+    var ufrag = getUfrag(sdp.raw);
+    if (ufrag != self.remoteUfrag) {
+        self.remoteUfrag = ufrag;
+        self.room.eventEmitter.emit(
+                XMPPEvents.REMOTE_UFRAG_CHANGED, ufrag);
+    }
+
+    this.peerconnection.setRemoteDescription(
+        new RTCSessionDescription({type: 'offer', sdp: sdp.raw}),
+        function() {
             if(self.signalingState == 'closed') {
-                logger.error("createAnswer attempt on closed state");
-                queueCallback("createAnswer attempt on closed state");
+                reportError("createAnswer attempt on closed state");
                 return;
             }
 
             self.peerconnection.createAnswer(
-                function(modifiedAnswer) {
-                    // change video direction, see https://github.com/jitsi/jitmeet/issues/41
-                    if (self.pendingop !== null) {
-                        var sdp = new SDP(modifiedAnswer.sdp);
-                        if (sdp.media.length > 1) {
-                            switch(self.pendingop) {
-                                case 'mute':
-                                    sdp.media[1] = sdp.media[1].replace('a=sendrecv', 'a=recvonly');
-                                    break;
-                                case 'unmute':
-                                    sdp.media[1] = sdp.media[1].replace('a=recvonly', 'a=sendrecv');
-                                    break;
-                            }
-                            sdp.raw = sdp.session + sdp.media.join('');
-                            modifiedAnswer.sdp = sdp.raw;
-                        }
-                        self.pendingop = null;
-                    }
-
+                function(answer) {
                     // FIXME: pushing down an answer while ice connection state
                     // is still checking is bad...
                     //logger.log(self.peerconnection.iceConnectionState);
 
-                    // trying to work around another chrome bug
-                    //modifiedAnswer.sdp = modifiedAnswer.sdp.replace(/a=setup:active/g, 'a=setup:actpass');
-                    self.peerconnection.setLocalDescription(modifiedAnswer,
+                    var modifiedAnswer = new SDP(answer.sdp);
+                    JingleSessionPC._fixAnswerRFC4145Setup(
+                        /* offer */ sdp,
+                        /* answer */ modifiedAnswer);
+                    answer.sdp = modifiedAnswer.raw;
+                    self.localSDP = new SDP(answer.sdp);
+                    answer.sdp = self.localSDP.raw;
+                    var ufrag = getUfrag(answer.sdp);
+                    if (ufrag != self.localUfrag) {
+                        self.localUfrag = ufrag;
+                        self.room.eventEmitter.emit(
+                                XMPPEvents.LOCAL_UFRAG_CHANGED, ufrag);
+                    }
+                    self.peerconnection.setLocalDescription(answer,
                         function() {
-                            if(successCallback){
-                                successCallback();
-                            }
+                            successCallback && successCallback();
                             queueCallback();
                         },
-                        function(error) {
-                            logger.error('modified setLocalDescription failed', error);
-                            queueCallback(error);
-                        }
+                        reportError.bind(
+                            undefined,
+                            "modified setLocalDescription failed")
                     );
-                },
-                function(error) {
-                    logger.error('modified answer failed', error);
-                    queueCallback(error);
-                }
+                }, reportError.bind(undefined, "modified answer failed"),
+                media_constraints
             );
         },
-        function(error) {
-            logger.error('modify failed', error);
-            queueCallback(error);
-        }
+        reportError.bind(undefined, 'modify failed')
     );
 };
 
 /**
  * Adds stream.
  * @param stream new stream that will be added.
- * @param success_callback callback executed after successful stream addition.
+ * @param callback callback executed after successful stream addition.
+ * @param errorCallback callback executed if stream addition fail.
  * @param ssrcInfo object with information about the SSRCs associated with the
  * stream.
  * @param dontModifySources {boolean} if true _modifySources won't be called.
  * Used for streams added before the call start.
- * @throws error if modifySourcesQueue is paused.
  */
-JingleSessionPC.prototype.addStream = function (stream, callback, ssrcInfo,
-    dontModifySources) {
+JingleSessionPC.prototype.addStream = function (stream, callback, errorCallback,
+    ssrcInfo, dontModifySources) {
     // Remember SDP to figure out added/removed SSRCs
     var oldSdp = null;
     if(this.peerconnection && this.peerconnection.localDescription) {
@@ -11067,14 +14676,6 @@ JingleSessionPC.prototype.addStream = function (stream, callback, ssrcInfo,
         return;
     }
 
-    if(this.modifySourcesQueue.paused) {
-        // if this.modifySourcesQueue.paused, modifySources won't be called and
-        // the SDPs won't be updated. Basically removeStream will fail. That's
-        // why we are throwing the error to inform the callers of the method.
-        throw new Error("modifySourcesQueue paused");
-        return;
-    }
-
     if(stream || ssrcInfo)
         this.peerconnection.addStream(stream, ssrcInfo);
 
@@ -11089,10 +14690,15 @@ JingleSessionPC.prototype.addStream = function (stream, callback, ssrcInfo,
                 self.modifiedSSRCs[ssrcInfo.type] || [];
             self.modifiedSSRCs[ssrcInfo.type].push(ssrcInfo);
         }
-        callback();
         var newSdp = new SDP(self.peerconnection.localDescription.sdp);
         logger.log("SDPs", oldSdp, newSdp);
         self.notifyMySSRCUpdate(oldSdp, newSdp);
+    }, function (error) {
+        if(!error) {
+            callback();
+        } else {
+            errorCallback(error);
+        }
     });
 }
 
@@ -11108,12 +14714,13 @@ JingleSessionPC.prototype.generateNewStreamSSRCInfo = function () {
 /**
  * Remove streams.
  * @param stream stream that will be removed.
- * @param success_callback callback executed after successful stream addition.
+ * @param callback callback executed after successful stream addition.
+ * @param errorCallback callback executed if stream addition fail.
  * @param ssrcInfo object with information about the SSRCs associated with the
  * stream.
- * @throws error if modifySourcesQueue is paused.
  */
-JingleSessionPC.prototype.removeStream = function (stream, callback, ssrcInfo) {
+JingleSessionPC.prototype.removeStream = function (stream, callback, errorCallback,
+    ssrcInfo) {
     // Conference is not active
     if(!this.peerconnection) {
         callback();
@@ -11151,16 +14758,9 @@ JingleSessionPC.prototype.removeStream = function (stream, callback, ssrcInfo) {
         }
 
         if(!track) {
-            logger.log("Cannot remove tracks: no tracks.");
-            callback();
-            return;
-        }
-
-        if(this.modifySourcesQueue.paused) {
-            // if this.modifySourcesQueue.paused, modifySources won't be called and
-            // the SDPs won't be updated. Basically removeStream will fail. That's
-            // why we are throwing the error to inform the callers of the method.
-            throw new Error("modifySourcesQueue paused");
+            var msg = "Cannot remove tracks: no tracks.";
+            logger.log(msg);
+            errorCallback(new Error(msg));
             return;
         }
 
@@ -11177,12 +14777,6 @@ JingleSessionPC.prototype.removeStream = function (stream, callback, ssrcInfo) {
         } else {
             logger.log("Cannot remove tracks: no RTPSender.");
         }
-    } else if(this.modifySourcesQueue.paused) {
-        // if this.modifySourcesQueue.paused, modifySources won't be called and
-        // the SDPs won't be updated. Basically removeStream will fail. That's
-        // why we are throwing the error to inform the callers of the method.
-        throw new Error("modifySourcesQueue paused");
-        return;
     } else if(stream)
         this.peerconnection.removeStream(stream, false, ssrcInfo);
     // else
@@ -11192,12 +14786,10 @@ JingleSessionPC.prototype.removeStream = function (stream, callback, ssrcInfo) {
 
     this.modifyingLocalStreams = false;
     var self = this;
-	
+
 	console.info("this.modifySourcesQueue.paused ", this.modifySourcesQueue.paused);
     this.modifySourcesQueue.push(function() {
         logger.log('modify sources done');
-
-        callback();
 
         var newSdp = new SDP(self.peerconnection.localDescription.sdp);
         if(ssrcInfo) {
@@ -11207,6 +14799,12 @@ JingleSessionPC.prototype.removeStream = function (stream, callback, ssrcInfo) {
         }
         logger.log("SDPs", oldSdp, newSdp);
         self.notifyMySSRCUpdate(oldSdp, newSdp);
+    }, function (error) {
+        if(!error) {
+            callback();
+        } else {
+            errorCallback(error);
+        }
     });
 }
 
@@ -11239,7 +14837,10 @@ JingleSessionPC.prototype.notifyMySSRCUpdate = function (old_sdp, new_sdp) {
     if (removed && remove) {
         logger.info("Sending source-remove", remove.tree());
         this.connection.sendIQ(
-            remove, null, this.newJingleErrorHandler(remove), IQ_TIMEOUT);
+            remove, null, this.newJingleErrorHandler(remove, function (error) {
+                GlobalOnErrorHandler.callErrorHandler(
+                    new Error("Jingle error: " + JSON.stringify(error)));
+            }), IQ_TIMEOUT);
     } else {
         logger.log('removal not necessary');
     }
@@ -11261,7 +14862,10 @@ JingleSessionPC.prototype.notifyMySSRCUpdate = function (old_sdp, new_sdp) {
     if (added && add) {
         logger.info("Sending source-add", add.tree());
         this.connection.sendIQ(
-            add, null, this.newJingleErrorHandler(add), IQ_TIMEOUT);
+            add, null, this.newJingleErrorHandler(add, function (error) {
+                GlobalOnErrorHandler.callErrorHandler(
+                    new Error("Jingle error: " + JSON.stringify(error)));
+            }), IQ_TIMEOUT);
     } else {
         logger.log('addition not necessary');
     }
@@ -11308,21 +14912,21 @@ JingleSessionPC.prototype.newJingleErrorHandler = function(request, failureCb) {
             error.source = request.tree();
         }
 
-        error.session = this;
+        // Commented to fix JSON.stringify(error) exception for circular
+        // dependancies when we print that error.
+        // FIXME: Maybe we can include part of the session object
+        // error.session = this;
 
         logger.error("Jingle error", error);
         if (failureCb) {
             failureCb(error);
         }
-
-        this.room.eventEmitter.emit(XMPPEvents.JINGLE_ERROR, error);
-
     }.bind(this);
 };
 
 JingleSessionPC.onJingleFatalError = function (session, error)
 {
-    this.room.eventEmitter.emit(XMPPEvents.CONFERENCE_SETUP_FAILED);
+    this.room.eventEmitter.emit(XMPPEvents.CONFERENCE_SETUP_FAILED, error);
     this.room.eventEmitter.emit(XMPPEvents.JINGLE_FATAL_ERROR, session, error);
 };
 
@@ -11338,7 +14942,7 @@ JingleSessionPC.prototype.remoteStreamAdded = function (stream) {
         return;
     }
     // Bind 'addtrack'/'removetrack' event handlers
-    if (RTCBrowserType.isChrome()) {
+    if (RTCBrowserType.isChrome() || RTCBrowserType.isNWJS()) {
         stream.onaddtrack = function (event) {
             self.remoteTrackAdded(event.target, event.track);
         };
@@ -11376,45 +14980,50 @@ JingleSessionPC.prototype.remoteTrackAdded = function (stream, track) {
         owner: undefined, /* to be determined below */
         muted: null /* will be set in the ChatRoom */
     };
-
-    // look up an associated JID for a stream id
-    if (!mediaType) {
-        logger.error("MediaType undefined", track);
-        return;
-    }
-
-    var remoteSDP = new SDP(this.peerconnection.remoteDescription.sdp);
-    var medialines = remoteSDP.media.filter(function (mediaLines) {
-        return mediaLines.startsWith("m=" + mediaType);
-    });
-
-    if (!medialines.length) {
-        logger.error("No media for type " + mediaType + " found in remote SDP");
-        return;
-    }
-
-    var ssrclines = SDPUtil.find_lines(medialines[0], 'a=ssrc:');
-    ssrclines = ssrclines.filter(function (line) {
-        var msid = RTCBrowserType.isTemasysPluginUsed() ? 'mslabel' : 'msid';
-        return line.indexOf(msid + ':' + streamId) !== -1;
-    });
-
-    var thessrc;
-    if (ssrclines.length) {
-        thessrc = ssrclines[0].substring(7).split(' ')[0];
-        if (!this.ssrcOwners[thessrc]) {
-            logger.error("No SSRC owner known for: " + thessrc);
-            return;
+    try{
+        // look up an associated JID for a stream id
+        if (!mediaType) {
+            logger.error("MediaType undefined", track);
+            throw new Error("MediaType undefined for remote track");
         }
-        jitsiTrackAddedEvent.owner = this.ssrcOwners[thessrc];
-        logger.log('associated jid', this.ssrcOwners[thessrc], thessrc);
-    } else {
-        logger.error("No SSRC lines for ", streamId);
-        return;
-    }
-    jitsiTrackAddedEvent.ssrc = thessrc;
 
-    this.room.remoteTrackAdded(jitsiTrackAddedEvent);
+        var remoteSDP = new SDP(this.peerconnection.remoteDescription.sdp);
+        var medialines = remoteSDP.media.filter(function (mediaLines){
+            return mediaLines.startsWith("m=" + mediaType);
+        });
+        if (!medialines.length) {
+            logger.error("No media for type " + mediaType + " found in remote SDP");
+            throw new Error("No media for type " + mediaType +
+                " found in remote SDP for remote track");
+        }
+
+        var ssrclines = SDPUtil.find_lines(medialines[0], 'a=ssrc:');
+        ssrclines = ssrclines.filter(function (line) {
+            var msid = RTCBrowserType.isTemasysPluginUsed() ? 'mslabel' : 'msid';
+            return line.indexOf(msid + ':' + streamId) !== -1;
+        });
+
+        var thessrc;
+        if (ssrclines.length) {
+            thessrc = ssrclines[0].substring(7).split(' ')[0];
+            if (!this.ssrcOwners[thessrc]) {
+                logger.error("No SSRC owner known for: " + thessrc);
+                throw new Error("No SSRC owner known for: " + thessrc +
+                    " for remote track");
+            }
+            jitsiTrackAddedEvent.owner = this.ssrcOwners[thessrc];
+            logger.log('associated jid', this.ssrcOwners[thessrc], thessrc);
+        } else {
+            logger.error("No SSRC lines for ", streamId);
+            throw new Error("No SSRC lines for streamId " + streamId +
+                " for remote track");
+        }
+        jitsiTrackAddedEvent.ssrc = thessrc;
+
+        this.room.remoteTrackAdded(jitsiTrackAddedEvent);
+    } catch (error) {
+        GlobalOnErrorHandler.callErrorHandler(error);
+    }
 };
 
 /**
@@ -11448,13 +15057,21 @@ JingleSessionPC.prototype.remoteTrackRemoved = function (stream, track) {
     logger.info("Remote track removed", stream, track);
     var streamId = RTC.getStreamID(stream);
     var trackId = track && track.id;
-    if (!streamId) {
-        logger.error("No stream ID for", stream);
-    } else if (!trackId) {
-        logger.error("No track ID for", track);
-    } else {
+    try{
+        if (!streamId) {
+            logger.error("No stream ID for", stream);
+            throw new Error("Remote track removal failed - No stream ID");
+        }
+
+        if (!trackId) {
+            logger.error("No track ID for", track);
+            throw new Error("Remote track removal failed - No track ID");
+        }
+
         this.room.eventEmitter.emit(
             XMPPEvents.REMOTE_TRACK_REMOVED, streamId, trackId);
+    } catch (error) {
+        GlobalOnErrorHandler.callErrorHandler(error);
     }
 };
 
@@ -11492,7 +15109,9 @@ JingleSessionPC.prototype.fixJingle = function(jingle) {
             this.fixSourceRemoveJingle(jingle);
             break;
         default:
-            logger.error("Unknown jingle action!");
+            var errmsg = "Unknown jingle action!";
+            GlobalOnErrorHandler.callErrorHandler(errmsg);
+            logger.error(errmsg);
             return false;
     }
 
@@ -11645,10 +15264,22 @@ function createDescriptionNode(jingle, mtype) {
     return desc;
 }
 
+/**
+ * Extracts the ice username fragment from an SDP string.
+ */
+function getUfrag(sdp) {
+    var ufragLines = sdp.split('\n').filter(function(line) {
+        return line.startsWith("a=ice-ufrag:");});
+    if (ufragLines.length > 0) {
+        return ufragLines[0].substr("a=ice-ufrag:".length)
+    }
+}
+
 module.exports = JingleSessionPC;
+
 }).call(this,"/modules/xmpp/JingleSessionPC.js")
 
-},{"../../service/RTC/MediaType":129,"../../service/xmpp/XMPPEvents":136,"../RTC/RTC":17,"../RTC/RTCBrowserType":18,"./JingleSession":33,"./SDP":35,"./SDPDiffer":36,"./SDPUtil":37,"./TraceablePeerConnection":38,"async":50,"jitsi-meet-logger":82}],35:[function(require,module,exports){
+},{"../../service/RTC/MediaType":147,"../../service/xmpp/XMPPEvents":154,"../RTC/RTC":21,"../RTC/RTCBrowserType":22,"../statistics/statistics":32,"../util/GlobalOnErrorHandler":41,"./JingleSession":47,"./SDP":49,"./SDPDiffer":50,"./SDPUtil":51,"./TraceablePeerConnection":52,"async":62,"jitsi-meet-logger":68}],49:[function(require,module,exports){
 (function (__filename){
 /* jshint -W117 */
 
@@ -12293,7 +15924,7 @@ module.exports = SDP;
 
 }).call(this,"/modules/xmpp/SDP.js")
 
-},{"./SDPUtil":37,"jitsi-meet-logger":82}],36:[function(require,module,exports){
+},{"./SDPUtil":51,"jitsi-meet-logger":68}],50:[function(require,module,exports){
 var SDPUtil = require("./SDPUtil");
 
 function SDPDiffer(mySDP, otherSDP)
@@ -12462,7 +16093,7 @@ SDPDiffer.prototype.toJingle = function(modify) {
 };
 
 module.exports = SDPDiffer;
-},{"./SDPUtil":37}],37:[function(require,module,exports){
+},{"./SDPUtil":51}],51:[function(require,module,exports){
 (function (__filename){
 var logger = require("jitsi-meet-logger").getLogger(__filename);
 var RTCBrowserType = require("../RTC/RTCBrowserType");
@@ -12834,7 +16465,7 @@ module.exports = SDPUtil;
 
 }).call(this,"/modules/xmpp/SDPUtil.js")
 
-},{"../RTC/RTCBrowserType":18,"jitsi-meet-logger":82}],38:[function(require,module,exports){
+},{"../RTC/RTCBrowserType":22,"jitsi-meet-logger":68}],52:[function(require,module,exports){
 (function (__filename){
 /* global $ */
 var RTC = require('../RTC/RTC');
@@ -12843,6 +16474,7 @@ var RTCBrowserType = require("../RTC/RTCBrowserType.js");
 var XMPPEvents = require("../../service/xmpp/XMPPEvents");
 var transform = require('sdp-transform');
 var RandomUtil = require('../util/RandomUtil');
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 
 var SIMULCAST_LAYERS = 3;
 
@@ -12995,7 +16627,7 @@ var dumpSDP = function(description) {
 TraceablePeerConnection.prototype.ssrcReplacement = function (desc) {
     if (typeof desc !== 'object' || desc === null ||
         typeof desc.sdp !== 'string') {
-        console.warn('An empty description was passed as an argument.');
+        logger.warn('An empty description was passed as an argument.');
         return desc;
     }
 
@@ -13041,6 +16673,8 @@ TraceablePeerConnection.prototype.ssrcReplacement = function (desc) {
                         ssrcOperation.ssrc.ssrcs.length) {
                         ssrc = ssrcOperation.ssrc.ssrcs[0];
                     } else {
+                        GlobalOnErrorHandler.callErrorHandler(
+                            new Error("SSRC replacement error!"));
                         logger.error("SSRC replacement error!");
                         break;
                     }
@@ -13148,7 +16782,7 @@ TraceablePeerConnection.prototype.ssrcReplacement = function (desc) {
 function extractSSRCMap(desc) {
     if (typeof desc !== 'object' || desc === null ||
         typeof desc.sdp !== 'string') {
-        console.warn('An empty description was passed as an argument.');
+        logger.warn('An empty description was passed as an argument.');
         return desc;
     }
 
@@ -13307,17 +16941,10 @@ Object.keys(getters).forEach(function (prop) {
 
 TraceablePeerConnection.prototype.addStream = function (stream, ssrcInfo) {
     this.trace('addStream', stream? stream.id : "null");
-    try
-    {
-        if(stream)
-            this.peerconnection.addStream(stream);
-        if(ssrcInfo && this.replaceSSRCs[ssrcInfo.mtype])
-            this.replaceSSRCs[ssrcInfo.mtype].push(ssrcInfo);
-    }
-    catch (e)
-    {
-        logger.error(e);
-    }
+    if(stream)
+        this.peerconnection.addStream(stream);
+    if(ssrcInfo && this.replaceSSRCs[ssrcInfo.mtype])
+        this.replaceSSRCs[ssrcInfo.mtype].push(ssrcInfo);
 };
 
 TraceablePeerConnection.prototype.removeStream = function (stream, stopStreams,
@@ -13326,28 +16953,23 @@ ssrcInfo) {
     if(stopStreams) {
         RTC.stopMediaStream(stream);
     }
-
-    try {
-        // FF doesn't support this yet.
-        if (this.peerconnection.removeStream) {
-            this.peerconnection.removeStream(stream);
-            // Removing all cached ssrcs for the streams that are removed or
-            // muted.
-            if(ssrcInfo && this.replaceSSRCs[ssrcInfo.mtype]) {
-                for(i = 0; i < this.replaceSSRCs[ssrcInfo.mtype].length; i++) {
-                    var op = this.replaceSSRCs[ssrcInfo.mtype][i];
-                    if(op.type === "unmute" &&
-                        op.ssrc.ssrcs.join("_") ===
-                        ssrcInfo.ssrc.ssrcs.join("_")) {
-                        this.replaceSSRCs[ssrcInfo.mtype].splice(i, 1);
-                        break;
-                    }
+    // FF doesn't support this yet.
+    if (this.peerconnection.removeStream) {
+        this.peerconnection.removeStream(stream);
+        // Removing all cached ssrcs for the streams that are removed or
+        // muted.
+        if(ssrcInfo && this.replaceSSRCs[ssrcInfo.mtype]) {
+            for(i = 0; i < this.replaceSSRCs[ssrcInfo.mtype].length; i++) {
+                var op = this.replaceSSRCs[ssrcInfo.mtype][i];
+                if(op.type === "unmute" &&
+                    op.ssrc.ssrcs.join("_") ===
+                    ssrcInfo.ssrc.ssrcs.join("_")) {
+                    this.replaceSSRCs[ssrcInfo.mtype].splice(i, 1);
+                    break;
                 }
-                this.replaceSSRCs[ssrcInfo.mtype].push(ssrcInfo);
             }
+            this.replaceSSRCs[ssrcInfo.mtype].push(ssrcInfo);
         }
-    } catch (e) {
-        logger.error(e);
     }
 };
 
@@ -13436,32 +17058,45 @@ TraceablePeerConnection.prototype.createAnswer
     this.trace('createAnswer', JSON.stringify(constraints, null, ' '));
     this.peerconnection.createAnswer(
         function (answer) {
-            self.trace('createAnswerOnSuccess::preTransform', dumpSDP(answer));
-            // if we're running on FF, transform to Plan A first.
-            if (RTCBrowserType.usesUnifiedPlan()) {
-                answer = self.interop.toPlanB(answer);
-                self.trace('createAnswerOnSuccess::postTransform (Plan B)',
-                    dumpSDP(answer));
+            try {
+                self.trace(
+                    'createAnswerOnSuccess::preTransform', dumpSDP(answer));
+                // if we're running on FF, transform to Plan A first.
+                if (RTCBrowserType.usesUnifiedPlan()) {
+                    answer = self.interop.toPlanB(answer);
+                    self.trace('createAnswerOnSuccess::postTransform (Plan B)',
+                        dumpSDP(answer));
+                }
+
+                if (!self.session.room.options.disableSimulcast
+                    && self.simulcast.isSupported()) {
+                    answer = self.simulcast.mungeLocalDescription(answer);
+                    self.trace(
+                        'createAnswerOnSuccess::postTransform (simulcast)',
+                        dumpSDP(answer));
+                }
+
+                if (!RTCBrowserType.isFirefox())
+                {
+                    answer = self.ssrcReplacement(answer);
+                    self.trace('createAnswerOnSuccess::mungeLocalVideoSSRC',
+                        dumpSDP(answer));
+                }
+
+                self.eventEmitter.emit(XMPPEvents.SENDRECV_STREAMS_CHANGED,
+                    extractSSRCMap(answer));
+
+                successCallback(answer);
+            } catch (e) {
+                // there can be error modifying the answer, for example
+                // for ssrcReplacement there was a track with ssrc that is null
+                // and if we do not catch the error no callback is called
+                // at all
+                self.trace('createAnswerOnError', e);
+                self.trace('createAnswerOnError', dumpSDP(answer));
+                logger.error('createAnswerOnError', e, dumpSDP(answer));
+                failureCallback(e);
             }
-
-            if (!self.session.room.options.disableSimulcast
-                && self.simulcast.isSupported()) {
-                answer = self.simulcast.mungeLocalDescription(answer);
-                self.trace('createAnswerOnSuccess::postTransform (simulcast)',
-                    dumpSDP(answer));
-            }
-
-            if (!RTCBrowserType.isFirefox())
-            {
-                answer = self.ssrcReplacement(answer);
-                self.trace('createAnswerOnSuccess::mungeLocalVideoSSRC',
-                    dumpSDP(answer));
-            }
-
-            self.eventEmitter.emit(XMPPEvents.SENDRECV_STREAMS_CHANGED,
-                extractSSRCMap(answer));
-
-            successCallback(answer);
         },
         function(err) {
             self.trace('createAnswerOnFailure', err);
@@ -13494,7 +17129,9 @@ TraceablePeerConnection.prototype.addIceCandidate
 
 TraceablePeerConnection.prototype.getStats = function(callback, errback) {
     // TODO: Is this the correct way to handle Opera, Temasys?
-    if (RTCBrowserType.isFirefox() || RTCBrowserType.isTemasysPluginUsed()) {
+    if (RTCBrowserType.isFirefox()
+            || RTCBrowserType.isTemasysPluginUsed()
+            || RTCBrowserType.isReactNative()) {
         // ignore for now...
         if(!errback)
             errback = function () {};
@@ -13528,15 +17165,15 @@ module.exports = TraceablePeerConnection;
 
 }).call(this,"/modules/xmpp/TraceablePeerConnection.js")
 
-},{"../../service/xmpp/XMPPEvents":136,"../RTC/RTC":17,"../RTC/RTCBrowserType.js":18,"../util/RandomUtil":28,"jitsi-meet-logger":82,"sdp-interop":108,"sdp-simulcast":111,"sdp-transform":114}],39:[function(require,module,exports){
+},{"../../service/xmpp/XMPPEvents":154,"../RTC/RTC":21,"../RTC/RTCBrowserType.js":22,"../util/GlobalOnErrorHandler":41,"../util/RandomUtil":42,"jitsi-meet-logger":68,"sdp-interop":87,"sdp-simulcast":90,"sdp-transform":93}],53:[function(require,module,exports){
 (function (__filename){
 /* global $, $iq, Promise, Strophe */
 
 var logger = require("jitsi-meet-logger").getLogger(__filename);
 var XMPPEvents = require("../../service/xmpp/XMPPEvents");
-
 var AuthenticationEvents
     = require("../../service/authentication/AuthenticationEvents");
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 
 function createExpBackoffTimer(step) {
     var count = 1;
@@ -13606,7 +17243,7 @@ Moderator.prototype.isSipGatewayEnabled =  function () {
 Moderator.prototype.onMucMemberLeft =  function (jid) {
     logger.info("Someone left is it focus ? " + jid);
     var resource = Strophe.getResourceFromJid(jid);
-    if (resource === 'focus' && !this.xmppService.sessionTerminated) {
+    if (resource === 'focus') {
         logger.info(
             "Focus has left the room - leaving conference");
         this.eventEmitter.emit(XMPPEvents.FOCUS_LEFT);
@@ -13655,14 +17292,6 @@ Moderator.prototype.createConferenceIq =  function () {
 
     if (sessionId) {
         elem.attrs({ 'session-id': sessionId});
-    }
-    if (this.options.connection.hosts !== undefined
-        && this.options.connection.hosts.bridge !== undefined) {
-        elem.c(
-            'property', {
-                name: 'bridge',
-                value: this.options.connection.hosts.bridge
-            }).up();
     }
     if (this.options.connection.enforcedBridge !== undefined) {
         elem.c(
@@ -13714,6 +17343,20 @@ Moderator.prototype.createConferenceIq =  function () {
                 value: true
             }).up();
     //}
+    if (this.options.conference.enableLipSync !== undefined) {
+        elem.c(
+            'property', {
+                name: 'enableLipSync',
+                value: this.options.conference.enableLipSync
+            }).up();
+    }
+    if (this.options.conference.audioPacketDelay !== undefined) {
+        elem.c(
+            'property', {
+                name: 'audioPacketDelay',
+                value: this.options.conference.audioPacketDelay
+            }).up();
+    }
     if (this.options.conference.startBitrate) {
         elem.c(
             'property', {
@@ -13762,6 +17405,14 @@ Moderator.prototype.createConferenceIq =  function () {
             name: 'simulcastMode',
             value: 'rewriting'
         }).up();
+
+    if (this.options.conference.useRoomAsSharedDocumentName !== undefined) {
+        elem.c(
+            'property', {
+                name: 'useRoomAsSharedDocumentName',
+                value: this.options.conference.useRoomAsSharedDocumentName
+            }).up();
+    }
     elem.up();
     return elem;
 };
@@ -13791,7 +17442,7 @@ Moderator.prototype.parseConfigOptions =  function (resultIq) {
             '>conference>property' +
             '[name=\'externalAuth\'][value=\'true\']').length > 0;
 
-    console.info(
+    logger.info(
         'External authentication enabled: ' + this.externalAuthEnabled);
 
     if (!this.externalAuthEnabled) {
@@ -13895,8 +17546,16 @@ Moderator.prototype._allocateConferenceFocusError = function (error, callback) {
                 });
         return;
     }
+    if(this.retries >= this.maxRetries) {
+        self.eventEmitter.emit(
+                XMPPEvents.ALLOCATE_FOCUS_MAX_RETRIES_ERROR);
+        return;
+    }
+    this.retries++;
     var waitMs = self.getNextErrorTimeout();
-    logger.error("Focus error, retry after " + waitMs, error);
+    var errmsg = "Focus error, retry after "+ waitMs;
+    GlobalOnErrorHandler.callErrorHandler(new Error(errmsg));
+    logger.error(errmsg, error);
     // Show message
     var focusComponent = self.getFocusComponent();
     var retrySec = waitMs / 1000;
@@ -13965,61 +17624,60 @@ Moderator.prototype.authenticate = function () {
     });
 };
 
-Moderator.prototype.getLoginUrl =  function (urlCallback, failureCallback) {
+Moderator.prototype.getLoginUrl = function (urlCallback, failureCallback) {
+    this._getLoginUrl(/* popup */ false, urlCallback, failureCallback);
+};
+
+/**
+ *
+ * @param {boolean} popup false for {@link Moderator#getLoginUrl} or true for
+ * {@link Moderator#getPopupLoginUrl}
+ * @param urlCb
+ * @param failureCb
+ */
+Moderator.prototype._getLoginUrl = function (popup, urlCb, failureCb) {
     var iq = $iq({to: this.getFocusComponent(), type: 'get'});
-    iq.c('login-url', {
+    var attrs = {
         xmlns: 'http://jitsi.org/protocol/focus',
         room: this.roomName,
         'machine-uid': this.settings.getUserId()
-    });
+    };
+    var str = 'auth url'; // for logger
+    if (popup) {
+       attrs.popup = true;
+       str = 'POPUP ' + str;
+    }
+    iq.c('login-url', attrs);
+    /**
+     * Implements a failure callback which reports an error message and an error
+     * through (1) GlobalOnErrorHandler, (2) logger, and (3) failureCb.
+     *
+     * @param {string} errmsg the error messsage to report
+     * @param {*} error the error to report (in addition to errmsg)
+     */
+    function reportError(errmsg, err) {
+        GlobalOnErrorHandler.callErrorHandler(new Error(errmsg));
+        logger.error(errmsg, err);
+        failureCb(err);
+    }
     this.connection.sendIQ(
         iq,
         function (result) {
             var url = $(result).find('login-url').attr('url');
-            url = url = decodeURIComponent(url);
+            url = decodeURIComponent(url);
             if (url) {
-                logger.info("Got auth url: " + url);
-                urlCallback(url);
+                logger.info('Got ' + str + ': ' + url);
+                urlCb(url);
             } else {
-                logger.error(
-                    "Failed to get auth url from the focus", result);
-                failureCallback(result);
+                reportError('Failed to get ' + str + ' from the focus', result);
             }
         },
-        function (error) {
-            logger.error("Get auth url error", error);
-            failureCallback(error);
-        }
+        reportError.bind(undefined, 'Get ' + str + ' error')
     );
 };
 
 Moderator.prototype.getPopupLoginUrl = function (urlCallback, failureCallback) {
-    var iq = $iq({to: this.getFocusComponent(), type: 'get'});
-    iq.c('login-url', {
-        xmlns: 'http://jitsi.org/protocol/focus',
-        room: this.roomName,
-        'machine-uid': this.settings.getUserId(),
-        popup: true
-    });
-    this.connection.sendIQ(
-        iq,
-        function (result) {
-            var url = $(result).find('login-url').attr('url');
-            url = url = decodeURIComponent(url);
-            if (url) {
-                logger.info("Got POPUP auth url:  " + url);
-                urlCallback(url);
-            } else {
-                logger.error(
-                    "Failed to get POPUP auth url from the focus", result);
-               failureCallback(result);
-            }
-        },
-        function (error) {
-            logger.error('Get POPUP auth url error', error);
-            failureCallback(error);
-        }
-    );
+    this._getLoginUrl(/* popup */ true, urlCallback, failureCallback);
 };
 
 Moderator.prototype.logout =  function (callback) {
@@ -14045,7 +17703,9 @@ Moderator.prototype.logout =  function (callback) {
             callback(logoutUrl);
         }.bind(this),
         function (error) {
-            logger.error("Logout error", error);
+            var errmsg = "Logout error";
+            GlobalOnErrorHandler.callErrorHandler(new Error(errmsg));
+            logger.error(errmsg, error);
         }
     );
 };
@@ -14054,12 +17714,13 @@ module.exports = Moderator;
 
 }).call(this,"/modules/xmpp/moderator.js")
 
-},{"../../service/authentication/AuthenticationEvents":133,"../../service/xmpp/XMPPEvents":136,"jitsi-meet-logger":82}],40:[function(require,module,exports){
+},{"../../service/authentication/AuthenticationEvents":151,"../../service/xmpp/XMPPEvents":154,"../util/GlobalOnErrorHandler":41,"jitsi-meet-logger":68}],54:[function(require,module,exports){
 (function (__filename){
 /* global $, $iq, config, connection, focusMucJid, messageHandler,
    Toolbar, Util, Promise */
 var XMPPEvents = require("../../service/xmpp/XMPPEvents");
 var JitsiRecorderErrors = require("../../JitsiRecorderErrors");
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 
 var logger = require("jitsi-meet-logger").getLogger(__filename);
 
@@ -14098,7 +17759,10 @@ Recording.status = {
     OFF: "off",
     AVAILABLE: "available",
     UNAVAILABLE: "unavailable",
-    PENDING: "pending"
+    PENDING: "pending",
+    RETRYING: "retrying",
+    BUSY: "busy",
+    FAILED: "failed"
 };
 
 Recording.action = {
@@ -14135,10 +17799,11 @@ Recording.prototype.handleJibriPresence = function (jibri) {
     this.eventEmitter.emit(XMPPEvents.RECORDER_STATE_CHANGED, this.state);
 };
 
-Recording.prototype.setRecordingJibri = function (state, callback, errCallback,
-    options) {
+Recording.prototype.setRecordingJibri
+    = function (state, callback, errCallback, options) {
+
     if (state == this.state){
-        errCallback(new Error("Invalid state!"));
+        errCallback(JitsiRecorderErrors.INVALID_STATE);
     }
     options = options || {};
 
@@ -14259,7 +17924,9 @@ function (state, callback, errCallback, options) {
             this.setRecordingJibri(state, callback, errCallback, options);
             break;
         default:
-            logger.error("Unknown recording type!");
+            var errmsg = "Unknown recording type!";
+            GlobalOnErrorHandler.callErrorHandler(new Error(errmsg));
+            logger.error(errmsg);
             return;
     }
 };
@@ -14273,9 +17940,13 @@ Recording.prototype.toggleRecording = function (options, statusChangeHandler) {
     var oldState = this.state;
 
     // If the recorder is currently unavailable we throw an error.
-    if (oldState === Recording.status.UNAVAILABLE)
-        statusChangeHandler("error",
-            new Error(JitsiRecorderErrors.RECORDER_UNAVAILABLE));
+    if (oldState === Recording.status.UNAVAILABLE
+        || oldState === Recording.status.FAILED)
+        statusChangeHandler(Recording.status.FAILED,
+                            JitsiRecorderErrors.RECORDER_UNAVAILABLE);
+    else if (oldState === Recording.status.BUSY)
+        statusChangeHandler(Recording.status.BUSY,
+                            JitsiRecorderErrors.RECORDER_BUSY);
 
     // If we're about to turn ON the recording we need either a streamId or
     // an authentication token depending on the recording type. If we don't
@@ -14284,8 +17955,8 @@ Recording.prototype.toggleRecording = function (options, statusChangeHandler) {
         || oldState === Recording.status.AVAILABLE)
         && ((!options.token && this.type === Recording.types.COLIBRI) ||
         (!options.streamId && this.type === Recording.types.JIBRI))) {
-        statusChangeHandler("error",
-            new Error(JitsiRecorderErrors.NO_TOKEN));
+        statusChangeHandler(Recording.status.FAILED,
+                            JitsiRecorderErrors.NO_TOKEN);
         logger.error("No token passed!");
         return;
     }
@@ -14307,7 +17978,7 @@ Recording.prototype.toggleRecording = function (options, statusChangeHandler) {
                 statusChangeHandler(state);
             }
         }, function (error) {
-            statusChangeHandler("error", error);
+            statusChangeHandler(Recording.status.FAILED, error);
         }, options);
 };
 
@@ -14337,7 +18008,7 @@ module.exports = Recording;
 
 }).call(this,"/modules/xmpp/recording.js")
 
-},{"../../JitsiRecorderErrors":9,"../../service/xmpp/XMPPEvents":136,"jitsi-meet-logger":82}],41:[function(require,module,exports){
+},{"../../JitsiRecorderErrors":12,"../../service/xmpp/XMPPEvents":154,"../util/GlobalOnErrorHandler":41,"jitsi-meet-logger":68}],55:[function(require,module,exports){
 (function (__filename){
 /* jshint -W117 */
 /* a simple MUC connection plugin
@@ -14368,7 +18039,9 @@ module.exports = function(XMPP) {
         createRoom: function (jid, password, options, settings) {
             var roomJid = Strophe.getBareJidFromJid(jid);
             if (this.rooms[roomJid]) {
-                logger.error("You are already in the room!");
+                var errmsg = "You are already in the room!";
+                logger.error(errmsg);
+                throw new Error(errmsg);
                 return;
             }
             this.rooms[roomJid] = new ChatRoom(this.connection, jid,
@@ -14450,7 +18123,7 @@ module.exports = function(XMPP) {
 
 }).call(this,"/modules/xmpp/strophe.emuc.js")
 
-},{"./ChatRoom":32,"jitsi-meet-logger":82}],42:[function(require,module,exports){
+},{"./ChatRoom":46,"jitsi-meet-logger":68}],56:[function(require,module,exports){
 (function (__filename){
 /* jshint -W117 */
 
@@ -14459,7 +18132,8 @@ var logger = require("jitsi-meet-logger").getLogger(__filename);
 var JingleSession = require("./JingleSessionPC");
 var XMPPEvents = require("../../service/xmpp/XMPPEvents");
 var RTCBrowserType = require("../RTC/RTCBrowserType");
-
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
+var Statistics = require("../statistics/statistics");
 
 module.exports = function(XMPP, eventEmitter) {
     Strophe.addConnectionPlugin('jingle', {
@@ -14475,38 +18149,6 @@ module.exports = function(XMPP, eventEmitter) {
         },
         init: function (conn) {
             this.connection = conn;
-            var disco = conn.disco;
-            if (disco) {
-                // http://xmpp.org/extensions/xep-0167.html#support
-                // http://xmpp.org/extensions/xep-0176.html#support
-                disco.addFeature('urn:xmpp:jingle:1');
-                disco.addFeature('urn:xmpp:jingle:apps:rtp:1');
-                disco.addFeature('urn:xmpp:jingle:transports:ice-udp:1');
-                disco.addFeature('urn:xmpp:jingle:apps:dtls:0');
-                disco.addFeature('urn:xmpp:jingle:transports:dtls-sctp:1');
-                disco.addFeature('urn:xmpp:jingle:apps:rtp:audio');
-                disco.addFeature('urn:xmpp:jingle:apps:rtp:video');
-
-                // Lipsync
-                if (RTCBrowserType.isChrome() || RTCBrowserType.isiOSRTC()) {
-                    this.connection.disco.addFeature(
-                        'http://jitsi.org/meet/lipsync');
-                }
-
-                if (RTCBrowserType.isChrome() || RTCBrowserType.isOpera()
-                    || RTCBrowserType.isTemasysPluginUsed()|| RTCBrowserType.isiOSRTC()) {
-                    disco.addFeature('urn:ietf:rfc:4588');
-                }
-
-                // this is dealt with by SDP O/A so we don't need to announce this
-                //disco.addFeature('urn:xmpp:jingle:apps:rtp:rtcp-fb:0'); // XEP-0293
-                //disco.addFeature('urn:xmpp:jingle:apps:rtp:rtp-hdrext:0'); // XEP-0294
-
-                disco.addFeature('urn:ietf:rfc:5761'); // rtcp-mux
-                disco.addFeature('urn:ietf:rfc:5888'); // a=group, e.g. bundle
-
-                //disco.addFeature('urn:ietf:rfc:5576'); // a=ssrc
-            }
             this.connection.addHandler(this.onJingle.bind(this), 'urn:xmpp:jingle:1', 'iq', 'set', null, null);
         },
         onJingle: function (iq) {
@@ -14586,6 +18228,8 @@ module.exports = function(XMPP, eventEmitter) {
                             .up();
                         this.terminate(sess.sid);
                     }
+                    Statistics.analytics.sendEvent(
+                        'xmpp.session-initiate', now);
                     break;
                 case 'session-terminate':
                     logger.log('terminating...', sess.sid);
@@ -14599,15 +18243,21 @@ module.exports = function(XMPP, eventEmitter) {
                     this.terminate(sess.sid, reasonCondition, reasonText);
                     break;
                 case 'transport-replace':
-                    logger.info("(TIME) Start transport replace",
-                                window.performance.now());
+                    var now = window.performance.now();
+                    logger.info("(TIME) Start transport replace", now);
+                    Statistics.analytics.sendEvent(
+                        'xmpp.transport-replace.start', now);
+
                     sess.replaceTransport($(iq).find('>jingle'),
                         function () {
+                            var now = window.performance.now();
                             logger.info(
-                                "(TIME) Transport replace success!",
-                                window.performance.now());
+                                "(TIME) Transport replace success!", now);
+                            Statistics.analytics.sendEvent(
+                                'xmpp.transport-replace.success', now);
                         },
                         function(error) {
+                            GlobalOnErrorHandler.callErrorHandler(error);
                             logger.error('Transport replace failed', error);
                             sess.sendTransportReject();
                         });
@@ -14728,7 +18378,7 @@ module.exports = function(XMPP, eventEmitter) {
 
 }).call(this,"/modules/xmpp/strophe.jingle.js")
 
-},{"../../service/xmpp/XMPPEvents":136,"../RTC/RTCBrowserType":18,"./JingleSessionPC":34,"jitsi-meet-logger":82}],43:[function(require,module,exports){
+},{"../../service/xmpp/XMPPEvents":154,"../RTC/RTCBrowserType":22,"../statistics/statistics":32,"../util/GlobalOnErrorHandler":41,"./JingleSessionPC":48,"jitsi-meet-logger":68}],57:[function(require,module,exports){
 /* global Strophe */
 module.exports = function () {
 
@@ -14749,12 +18399,12 @@ module.exports = function () {
         }
     });
 };
-},{}],44:[function(require,module,exports){
+},{}],58:[function(require,module,exports){
 (function (__filename){
 /* global $, $iq, Strophe */
 
 var logger = require("jitsi-meet-logger").getLogger(__filename);
-
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 var XMPPEvents = require("../../service/xmpp/XMPPEvents");
 
 /**
@@ -14830,7 +18480,10 @@ module.exports = function (XMPP, eventEmitter) {
                         callback(ping.length > 0);
                     },
                     function (error) {
-                        logger.error("Ping feature discovery error", error);
+                        var errmsg = "Ping feature discovery error";
+                        GlobalOnErrorHandler.callErrorHandler(new Error(
+                            errmsg + ": " + error));
+                        logger.error(errmsg, error);
                         callback(false);
                     }
                 );
@@ -14849,7 +18502,9 @@ module.exports = function (XMPP, eventEmitter) {
          */
         startInterval: function (remoteJid, interval) {
             if (this.intervalId) {
-                logger.error("Ping task scheduled already");
+                var errmsg = "Ping task scheduled already";
+                GlobalOnErrorHandler.callErrorHandler(new Error(errmsg));
+                logger.error(errmsg);
                 return;
             }
             if (!interval)
@@ -14863,10 +18518,19 @@ module.exports = function (XMPP, eventEmitter) {
                 },
                 function (error) {
                     self.failedPings += 1;
-                    logger.error(
-                        "Ping " + (error ? "error" : "timeout"), error);
+                    var errmsg = "Ping " + (error ? "error" : "timeout");
                     if (self.failedPings >= PING_THRESHOLD) {
-                        self.connection.disconnect();
+                        GlobalOnErrorHandler.callErrorHandler(
+                            new Error(errmsg));
+                        logger.error(errmsg, error);
+                        // FIXME it doesn't help to disconnect when 3rd PING
+                        // times out, it only stops Strophe from retrying.
+                        // Not really sure what's the right thing to do in that
+                        // situation, but just closing the connection makes no
+                        // sense.
+                        //self.connection.disconnect();
+                    } else {
+                        logger.warn(errmsg, error);
                     }
                 }, PING_TIMEOUT);
             }, interval);
@@ -14889,7 +18553,7 @@ module.exports = function (XMPP, eventEmitter) {
 
 }).call(this,"/modules/xmpp/strophe.ping.js")
 
-},{"../../service/xmpp/XMPPEvents":136,"jitsi-meet-logger":82}],45:[function(require,module,exports){
+},{"../../service/xmpp/XMPPEvents":154,"../util/GlobalOnErrorHandler":41,"jitsi-meet-logger":68}],59:[function(require,module,exports){
 (function (__filename){
 /* jshint -W117 */
 var logger = require("jitsi-meet-logger").getLogger(__filename);
@@ -15008,24 +18672,37 @@ module.exports = function() {
 
 }).call(this,"/modules/xmpp/strophe.rayo.js")
 
-},{"jitsi-meet-logger":82}],46:[function(require,module,exports){
+},{"jitsi-meet-logger":68}],60:[function(require,module,exports){
 (function (__filename){
 /* global Strophe */
 /**
  * Strophe logger implementation. Logs from level WARN and above.
  */
 var logger = require("jitsi-meet-logger").getLogger(__filename);
+var GlobalOnErrorHandler = require("../util/GlobalOnErrorHandler");
 
 module.exports = function () {
 
     Strophe.log = function (level, msg) {
+        // Our global handler reports uncaught errors to the stats which may
+        // interpret those as partial call failure.
+        // Strophe log entry about secondary request timeout does not mean that
+        // it's a final failure(the request will be restarted), so we lower it's
+        // level here to a warning.
+        if (typeof msg === 'string' &&
+                msg.indexOf("Request ") !== -1 &&
+                msg.indexOf("timed out (secondary), restarting") !== -1) {
+            level = Strophe.LogLevel.WARN;
+        }
         switch (level) {
             case Strophe.LogLevel.WARN:
                 logger.warn("Strophe: " + msg);
                 break;
             case Strophe.LogLevel.ERROR:
             case Strophe.LogLevel.FATAL:
-                logger.error("Strophe: " + msg);
+                msg = "Strophe: " + msg;
+                GlobalOnErrorHandler.callErrorHandler(new Error(msg));
+                logger.error(msg);
                 break;
         }
     };
@@ -15058,18 +18735,20 @@ module.exports = function () {
 
 }).call(this,"/modules/xmpp/strophe.util.js")
 
-},{"jitsi-meet-logger":82}],47:[function(require,module,exports){
+},{"../util/GlobalOnErrorHandler":41,"jitsi-meet-logger":68}],61:[function(require,module,exports){
 (function (__filename){
 /* global $, APP, config, Strophe */
 
 var logger = require("jitsi-meet-logger").getLogger(__filename);
 var EventEmitter = require("events");
 var Pako = require("pako");
+var RandomUtil = require("../util/RandomUtil");
 var RTCEvents = require("../../service/RTC/RTCEvents");
 var XMPPEvents = require("../../service/xmpp/XMPPEvents");
 var JitsiConnectionErrors = require("../../JitsiConnectionErrors");
 var JitsiConnectionEvents = require("../../JitsiConnectionEvents");
 var RTC = require("../RTC/RTC");
+var RTCBrowserType = require("../RTC/RTCBrowserType");
 
 var authenticatedUser = false;
 
@@ -15102,9 +18781,18 @@ function XMPP(options, token) {
     this.connectionTimes = {};
     this.forceMuted = false;
     this.options = options;
+    this.connectParams = {};
+    this.token = token;
     initStrophePlugins(this);
 
     this.connection = createConnection(options.bosh, token);
+
+    if(!this.connection.disco || !this.connection.caps)
+        throw new Error(
+            "Missing strophe-plugins (disco and caps plugins are required)!");
+
+    // Initialize features advertised in disco-info
+    this.initFeaturesList();
 
     // Setup a disconnect on unload as a way to facilitate API consumers. It
     // sounds like they would want that. A problem for them though may be if
@@ -15113,6 +18801,72 @@ function XMPP(options, token) {
     // registering their unload handler before us.
     $(window).on('beforeunload unload', this.disconnect.bind(this));
 }
+
+/**
+ * Reloads the XMPP module
+ */
+XMPP.prototype.reload = function () {
+    this.disconnect();
+    this.connection.pause();
+    this.connection = createConnection(this.options.bosh, this.token);
+
+    // Initialize features advertised in disco-info
+    this.initFeaturesList();
+
+    //getData for attach
+    if(this.options.prebindURL &&
+        typeof(createConnectionExternally) === "function") {
+        var self = this;
+        createConnectionExternally(this.options.prebindURL, function (data) {
+            self.attach(data);
+        }, function (error) {
+            //connect
+            self.connect(this.connectParams.jid, this.connectParams.password);
+        });
+    } else {
+        //connect
+        this.connect(this.connectParams.jid, this.connectParams.password);
+    }
+
+}
+
+/**
+ * Initializes the list of feature advertised through the disco-info mechanism
+ */
+XMPP.prototype.initFeaturesList = function () {
+    var disco = this.connection.disco;
+    if (disco) {
+        // http://xmpp.org/extensions/xep-0167.html#support
+        // http://xmpp.org/extensions/xep-0176.html#support
+        disco.addFeature('urn:xmpp:jingle:1');
+        disco.addFeature('urn:xmpp:jingle:apps:rtp:1');
+        disco.addFeature('urn:xmpp:jingle:transports:ice-udp:1');
+        disco.addFeature('urn:xmpp:jingle:apps:dtls:0');
+        disco.addFeature('urn:xmpp:jingle:transports:dtls-sctp:1');
+        disco.addFeature('urn:xmpp:jingle:apps:rtp:audio');
+        disco.addFeature('urn:xmpp:jingle:apps:rtp:video');
+
+        if (RTCBrowserType.isChrome() || RTCBrowserType.isOpera()
+            || RTCBrowserType.isTemasysPluginUsed()) {
+            disco.addFeature('urn:ietf:rfc:4588');
+        }
+
+        // this is dealt with by SDP O/A so we don't need to announce this
+        //disco.addFeature('urn:xmpp:jingle:apps:rtp:rtcp-fb:0'); // XEP-0293
+        //disco.addFeature('urn:xmpp:jingle:apps:rtp:rtp-hdrext:0'); // XEP-0294
+
+        disco.addFeature('urn:ietf:rfc:5761'); // rtcp-mux
+        disco.addFeature('urn:ietf:rfc:5888'); // a=group, e.g. bundle
+
+        //disco.addFeature('urn:ietf:rfc:5576'); // a=ssrc
+
+        // Enable Lipsync ?
+        if (this.options.enableLipSync && RTCBrowserType.isChrome()) {
+            logger.info("Lip-sync enabled !");
+            this.connection.disco.addFeature('http://jitsi.org/meet/lipsync');
+        }
+    }
+};
 
 XMPP.prototype.getConnection = function () { return this.connection; };
 
@@ -15238,12 +18992,18 @@ XMPP.prototype._connect = function (jid, password) {
 }
 
 XMPP.prototype.connect = function (jid, password) {
+    this.connectParams = {
+        jid: jid,
+        password: password
+    };
     if (!jid) {
         var configDomain
             = this.options.hosts.anonymousdomain || this.options.hosts.domain;
         // Force authenticated domain if room is appended with '?login=true'
+        // or if we're joining with the token
         if (this.options.hosts.anonymousdomain
-                && window.location.search.indexOf("login=true") !== -1) {
+                && (window.location.search.indexOf("login=true") !== -1
+                    || this.options.token)) {
             configDomain = this.options.hosts.domain;
         }
         jid = configDomain || window.location.hostname;
@@ -15265,6 +19025,9 @@ XMPP.prototype.createRoom = function (roomName, options, settings) {
 
         if (!authenticatedUser)
             tmpJid = tmpJid.substr(0, 8);
+        else
+            tmpJid += "-" + RandomUtil.randomHexString(6);
+
         roomjid += '/' + tmpJid;
     }
 
@@ -15388,68 +19151,7 @@ module.exports = XMPP;
 
 }).call(this,"/modules/xmpp/xmpp.js")
 
-},{"../../JitsiConnectionErrors":5,"../../JitsiConnectionEvents":6,"../../service/RTC/RTCEvents":130,"../../service/xmpp/XMPPEvents":136,"../RTC/RTC":17,"./strophe.emuc":41,"./strophe.jingle":42,"./strophe.logger":43,"./strophe.ping":44,"./strophe.rayo":45,"./strophe.util":46,"events":54,"jitsi-meet-logger":82,"pako":87}],48:[function(require,module,exports){
-module.exports = after
-
-function after(count, callback, err_cb) {
-    var bail = false
-    err_cb = err_cb || noop
-    proxy.count = count
-
-    return (count === 0) ? callback() : proxy
-
-    function proxy(err, result) {
-        if (proxy.count <= 0) {
-            throw new Error('after called too many times')
-        }
-        --proxy.count
-
-        // after first error, rest are passed to err_cb
-        if (err) {
-            bail = true
-            callback(err)
-            // future error callbacks will go to error handler
-            callback = err_cb
-        } else if (proxy.count === 0 && !bail) {
-            callback(null, result)
-        }
-    }
-}
-
-function noop() {}
-
-},{}],49:[function(require,module,exports){
-/**
- * An abstraction for slicing an arraybuffer even when
- * ArrayBuffer.prototype.slice is not supported
- *
- * @api public
- */
-
-module.exports = function(arraybuffer, start, end) {
-  var bytes = arraybuffer.byteLength;
-  start = start || 0;
-  end = end || bytes;
-
-  if (arraybuffer.slice) { return arraybuffer.slice(start, end); }
-
-  if (start < 0) { start += bytes; }
-  if (end < 0) { end += bytes; }
-  if (end > bytes) { end = bytes; }
-
-  if (start >= bytes || start >= end || bytes === 0) {
-    return new ArrayBuffer(0);
-  }
-
-  var abv = new Uint8Array(arraybuffer);
-  var result = new Uint8Array(end - start);
-  for (var i = start, ii = 0; i < end; i++, ii++) {
-    result[ii] = abv[i];
-  }
-  return result.buffer;
-};
-
-},{}],50:[function(require,module,exports){
+},{"../../JitsiConnectionErrors":6,"../../JitsiConnectionEvents":7,"../../service/RTC/RTCEvents":148,"../../service/xmpp/XMPPEvents":154,"../RTC/RTC":21,"../RTC/RTCBrowserType":22,"../util/RandomUtil":42,"./strophe.emuc":55,"./strophe.jingle":56,"./strophe.logger":57,"./strophe.ping":58,"./strophe.rayo":59,"./strophe.util":60,"events":63,"jitsi-meet-logger":68,"pako":70}],62:[function(require,module,exports){
 (function (process){
 /*!
  * async
@@ -16577,209 +20279,7 @@ module.exports = function(arraybuffer, start, end) {
 
 }).call(this,require('_process'))
 
-},{"_process":106}],51:[function(require,module,exports){
-
-/**
- * Expose `Backoff`.
- */
-
-module.exports = Backoff;
-
-/**
- * Initialize backoff timer with `opts`.
- *
- * - `min` initial timeout in milliseconds [100]
- * - `max` max timeout [10000]
- * - `jitter` [0]
- * - `factor` [2]
- *
- * @param {Object} opts
- * @api public
- */
-
-function Backoff(opts) {
-  opts = opts || {};
-  this.ms = opts.min || 100;
-  this.max = opts.max || 10000;
-  this.factor = opts.factor || 2;
-  this.jitter = opts.jitter > 0 && opts.jitter <= 1 ? opts.jitter : 0;
-  this.attempts = 0;
-}
-
-/**
- * Return the backoff duration.
- *
- * @return {Number}
- * @api public
- */
-
-Backoff.prototype.duration = function(){
-  var ms = this.ms * Math.pow(this.factor, this.attempts++);
-  if (this.jitter) {
-    var rand =  Math.random();
-    var deviation = Math.floor(rand * this.jitter * ms);
-    ms = (Math.floor(rand * 10) & 1) == 0  ? ms - deviation : ms + deviation;
-  }
-  return Math.min(ms, this.max) | 0;
-};
-
-/**
- * Reset the number of attempts.
- *
- * @api public
- */
-
-Backoff.prototype.reset = function(){
-  this.attempts = 0;
-};
-
-/**
- * Set the minimum duration
- *
- * @api public
- */
-
-Backoff.prototype.setMin = function(min){
-  this.ms = min;
-};
-
-/**
- * Set the maximum duration
- *
- * @api public
- */
-
-Backoff.prototype.setMax = function(max){
-  this.max = max;
-};
-
-/**
- * Set the jitter
- *
- * @api public
- */
-
-Backoff.prototype.setJitter = function(jitter){
-  this.jitter = jitter;
-};
-
-
-},{}],52:[function(require,module,exports){
-/*
- * base64-arraybuffer
- * https://github.com/niklasvh/base64-arraybuffer
- *
- * Copyright (c) 2012 Niklas von Hertzen
- * Licensed under the MIT license.
- */
-(function(chars){
-  "use strict";
-
-  exports.encode = function(arraybuffer) {
-    var bytes = new Uint8Array(arraybuffer),
-    i, len = bytes.length, base64 = "";
-
-    for (i = 0; i < len; i+=3) {
-      base64 += chars[bytes[i] >> 2];
-      base64 += chars[((bytes[i] & 3) << 4) | (bytes[i + 1] >> 4)];
-      base64 += chars[((bytes[i + 1] & 15) << 2) | (bytes[i + 2] >> 6)];
-      base64 += chars[bytes[i + 2] & 63];
-    }
-
-    if ((len % 3) === 2) {
-      base64 = base64.substring(0, base64.length - 1) + "=";
-    } else if (len % 3 === 1) {
-      base64 = base64.substring(0, base64.length - 2) + "==";
-    }
-
-    return base64;
-  };
-
-  exports.decode =  function(base64) {
-    var bufferLength = base64.length * 0.75,
-    len = base64.length, i, p = 0,
-    encoded1, encoded2, encoded3, encoded4;
-
-    if (base64[base64.length - 1] === "=") {
-      bufferLength--;
-      if (base64[base64.length - 2] === "=") {
-        bufferLength--;
-      }
-    }
-
-    var arraybuffer = new ArrayBuffer(bufferLength),
-    bytes = new Uint8Array(arraybuffer);
-
-    for (i = 0; i < len; i+=4) {
-      encoded1 = chars.indexOf(base64[i]);
-      encoded2 = chars.indexOf(base64[i+1]);
-      encoded3 = chars.indexOf(base64[i+2]);
-      encoded4 = chars.indexOf(base64[i+3]);
-
-      bytes[p++] = (encoded1 << 2) | (encoded2 >> 4);
-      bytes[p++] = ((encoded2 & 15) << 4) | (encoded3 >> 2);
-      bytes[p++] = ((encoded3 & 3) << 6) | (encoded4 & 63);
-    }
-
-    return arraybuffer;
-  };
-})("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/");
-
-},{}],53:[function(require,module,exports){
-(function (global){
-/**
- * Create a blob builder even when vendor prefixes exist
- */
-
-var BlobBuilder = global.BlobBuilder
-  || global.WebKitBlobBuilder
-  || global.MSBlobBuilder
-  || global.MozBlobBuilder;
-
-/**
- * Check if Blob constructor is supported
- */
-
-var blobSupported = (function() {
-  try {
-    var b = new Blob(['hi']);
-    return b.size == 2;
-  } catch(e) {
-    return false;
-  }
-})();
-
-/**
- * Check if BlobBuilder is supported
- */
-
-var blobBuilderSupported = BlobBuilder
-  && BlobBuilder.prototype.append
-  && BlobBuilder.prototype.getBlob;
-
-function BlobBuilderConstructor(ary, options) {
-  options = options || {};
-
-  var bb = new BlobBuilder();
-  for (var i = 0; i < ary.length; i++) {
-    bb.append(ary[i]);
-  }
-  return (options.type) ? bb.getBlob(options.type) : bb.getBlob();
-};
-
-module.exports = (function() {
-  if (blobSupported) {
-    return global.Blob;
-  } else if (blobBuilderSupported) {
-    return BlobBuilderConstructor;
-  } else {
-    return undefined;
-  }
-})();
-
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-
-},{}],54:[function(require,module,exports){
+},{"_process":64}],63:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -17082,3514 +20582,667 @@ function isUndefined(arg) {
   return arg === void 0;
 }
 
-},{}],55:[function(require,module,exports){
-/**
- * Slice reference.
- */
+},{}],64:[function(require,module,exports){
+// shim for using process in browser
+var process = module.exports = {};
 
-var slice = [].slice;
+// cached from whatever global is present so that test runners that stub it
+// don't break things.  But we need to wrap it in a try catch in case it is
+// wrapped in strict mode code which doesn't define any globals.  It's inside a
+// function because try/catches deoptimize in certain engines.
 
-/**
- * Bind `obj` to `fn`.
- *
- * @param {Object} obj
- * @param {Function|String} fn or string
- * @return {Function}
- * @api public
- */
+var cachedSetTimeout;
+var cachedClearTimeout;
 
-module.exports = function(obj, fn){
-  if ('string' == typeof fn) fn = obj[fn];
-  if ('function' != typeof fn) throw new Error('bind() requires a function');
-  var args = slice.call(arguments, 2);
-  return function(){
-    return fn.apply(obj, args.concat(slice.call(arguments)));
-  }
-};
-
-},{}],56:[function(require,module,exports){
-
-/**
- * Expose `Emitter`.
- */
-
-module.exports = Emitter;
-
-/**
- * Initialize a new `Emitter`.
- *
- * @api public
- */
-
-function Emitter(obj) {
-  if (obj) return mixin(obj);
-};
-
-/**
- * Mixin the emitter properties.
- *
- * @param {Object} obj
- * @return {Object}
- * @api private
- */
-
-function mixin(obj) {
-  for (var key in Emitter.prototype) {
-    obj[key] = Emitter.prototype[key];
-  }
-  return obj;
+function defaultSetTimout() {
+    throw new Error('setTimeout has not been defined');
 }
-
-/**
- * Listen on the given `event` with `fn`.
- *
- * @param {String} event
- * @param {Function} fn
- * @return {Emitter}
- * @api public
- */
-
-Emitter.prototype.on =
-Emitter.prototype.addEventListener = function(event, fn){
-  this._callbacks = this._callbacks || {};
-  (this._callbacks[event] = this._callbacks[event] || [])
-    .push(fn);
-  return this;
-};
-
-/**
- * Adds an `event` listener that will be invoked a single
- * time then automatically removed.
- *
- * @param {String} event
- * @param {Function} fn
- * @return {Emitter}
- * @api public
- */
-
-Emitter.prototype.once = function(event, fn){
-  var self = this;
-  this._callbacks = this._callbacks || {};
-
-  function on() {
-    self.off(event, on);
-    fn.apply(this, arguments);
-  }
-
-  on.fn = fn;
-  this.on(event, on);
-  return this;
-};
-
-/**
- * Remove the given callback for `event` or all
- * registered callbacks.
- *
- * @param {String} event
- * @param {Function} fn
- * @return {Emitter}
- * @api public
- */
-
-Emitter.prototype.off =
-Emitter.prototype.removeListener =
-Emitter.prototype.removeAllListeners =
-Emitter.prototype.removeEventListener = function(event, fn){
-  this._callbacks = this._callbacks || {};
-
-  // all
-  if (0 == arguments.length) {
-    this._callbacks = {};
-    return this;
-  }
-
-  // specific event
-  var callbacks = this._callbacks[event];
-  if (!callbacks) return this;
-
-  // remove all handlers
-  if (1 == arguments.length) {
-    delete this._callbacks[event];
-    return this;
-  }
-
-  // remove specific handler
-  var cb;
-  for (var i = 0; i < callbacks.length; i++) {
-    cb = callbacks[i];
-    if (cb === fn || cb.fn === fn) {
-      callbacks.splice(i, 1);
-      break;
-    }
-  }
-  return this;
-};
-
-/**
- * Emit `event` with the given args.
- *
- * @param {String} event
- * @param {Mixed} ...
- * @return {Emitter}
- */
-
-Emitter.prototype.emit = function(event){
-  this._callbacks = this._callbacks || {};
-  var args = [].slice.call(arguments, 1)
-    , callbacks = this._callbacks[event];
-
-  if (callbacks) {
-    callbacks = callbacks.slice(0);
-    for (var i = 0, len = callbacks.length; i < len; ++i) {
-      callbacks[i].apply(this, args);
-    }
-  }
-
-  return this;
-};
-
-/**
- * Return array of callbacks for `event`.
- *
- * @param {String} event
- * @return {Array}
- * @api public
- */
-
-Emitter.prototype.listeners = function(event){
-  this._callbacks = this._callbacks || {};
-  return this._callbacks[event] || [];
-};
-
-/**
- * Check if this emitter has `event` handlers.
- *
- * @param {String} event
- * @return {Boolean}
- * @api public
- */
-
-Emitter.prototype.hasListeners = function(event){
-  return !! this.listeners(event).length;
-};
-
-},{}],57:[function(require,module,exports){
-
-module.exports = function(a, b){
-  var fn = function(){};
-  fn.prototype = b.prototype;
-  a.prototype = new fn;
-  a.prototype.constructor = a;
-};
-},{}],58:[function(require,module,exports){
-
-/**
- * Expose `debug()` as the module.
- */
-
-module.exports = debug;
-
-/**
- * Create a debugger with the given `name`.
- *
- * @param {String} name
- * @return {Type}
- * @api public
- */
-
-function debug(name) {
-  if (!debug.enabled(name)) return function(){};
-
-  return function(fmt){
-    fmt = coerce(fmt);
-
-    var curr = new Date;
-    var ms = curr - (debug[name] || curr);
-    debug[name] = curr;
-
-    fmt = name
-      + ' '
-      + fmt
-      + ' +' + debug.humanize(ms);
-
-    // This hackery is required for IE8
-    // where `console.log` doesn't have 'apply'
-    window.console
-      && console.log
-      && Function.prototype.apply.call(console.log, console, arguments);
-  }
+function defaultClearTimeout () {
+    throw new Error('clearTimeout has not been defined');
 }
-
-/**
- * The currently active debug mode names.
- */
-
-debug.names = [];
-debug.skips = [];
-
-/**
- * Enables a debug mode by name. This can include modes
- * separated by a colon and wildcards.
- *
- * @param {String} name
- * @api public
- */
-
-debug.enable = function(name) {
-  try {
-    localStorage.debug = name;
-  } catch(e){}
-
-  var split = (name || '').split(/[\s,]+/)
-    , len = split.length;
-
-  for (var i = 0; i < len; i++) {
-    name = split[i].replace('*', '.*?');
-    if (name[0] === '-') {
-      debug.skips.push(new RegExp('^' + name.substr(1) + '$'));
-    }
-    else {
-      debug.names.push(new RegExp('^' + name + '$'));
-    }
-  }
-};
-
-/**
- * Disable debug output.
- *
- * @api public
- */
-
-debug.disable = function(){
-  debug.enable('');
-};
-
-/**
- * Humanize the given `ms`.
- *
- * @param {Number} m
- * @return {String}
- * @api private
- */
-
-debug.humanize = function(ms) {
-  var sec = 1000
-    , min = 60 * 1000
-    , hour = 60 * min;
-
-  if (ms >= hour) return (ms / hour).toFixed(1) + 'h';
-  if (ms >= min) return (ms / min).toFixed(1) + 'm';
-  if (ms >= sec) return (ms / sec | 0) + 's';
-  return ms + 'ms';
-};
-
-/**
- * Returns true if the given mode name is enabled, false otherwise.
- *
- * @param {String} name
- * @return {Boolean}
- * @api public
- */
-
-debug.enabled = function(name) {
-  for (var i = 0, len = debug.skips.length; i < len; i++) {
-    if (debug.skips[i].test(name)) {
-      return false;
-    }
-  }
-  for (var i = 0, len = debug.names.length; i < len; i++) {
-    if (debug.names[i].test(name)) {
-      return true;
-    }
-  }
-  return false;
-};
-
-/**
- * Coerce `val`.
- */
-
-function coerce(val) {
-  if (val instanceof Error) return val.stack || val.message;
-  return val;
-}
-
-// persist
-
-try {
-  if (window.localStorage) debug.enable(localStorage.debug);
-} catch(e){}
-
-},{}],59:[function(require,module,exports){
-
-module.exports =  require('./lib/');
-
-},{"./lib/":60}],60:[function(require,module,exports){
-
-module.exports = require('./socket');
-
-/**
- * Exports parser
- *
- * @api public
- *
- */
-module.exports.parser = require('engine.io-parser');
-
-},{"./socket":61,"engine.io-parser":72}],61:[function(require,module,exports){
-(function (global){
-/**
- * Module dependencies.
- */
-
-var transports = require('./transports');
-var Emitter = require('component-emitter');
-var debug = require('debug')('engine.io-client:socket');
-var index = require('indexof');
-var parser = require('engine.io-parser');
-var parseuri = require('parseuri');
-var parsejson = require('parsejson');
-var parseqs = require('parseqs');
-
-/**
- * Module exports.
- */
-
-module.exports = Socket;
-
-/**
- * Noop function.
- *
- * @api private
- */
-
-function noop(){}
-
-/**
- * Socket constructor.
- *
- * @param {String|Object} uri or options
- * @param {Object} options
- * @api public
- */
-
-function Socket(uri, opts){
-  if (!(this instanceof Socket)) return new Socket(uri, opts);
-
-  opts = opts || {};
-
-  if (uri && 'object' == typeof uri) {
-    opts = uri;
-    uri = null;
-  }
-
-  if (uri) {
-    uri = parseuri(uri);
-    opts.host = uri.host;
-    opts.secure = uri.protocol == 'https' || uri.protocol == 'wss';
-    opts.port = uri.port;
-    if (uri.query) opts.query = uri.query;
-  }
-
-  this.secure = null != opts.secure ? opts.secure :
-    (global.location && 'https:' == location.protocol);
-
-  if (opts.host) {
-    var pieces = opts.host.split(':');
-    opts.hostname = pieces.shift();
-    if (pieces.length) {
-      opts.port = pieces.pop();
-    } else if (!opts.port) {
-      // if no port is specified manually, use the protocol default
-      opts.port = this.secure ? '443' : '80';
-    }
-  }
-
-  this.agent = opts.agent || false;
-  this.hostname = opts.hostname ||
-    (global.location ? location.hostname : 'localhost');
-  this.port = opts.port || (global.location && location.port ?
-       location.port :
-       (this.secure ? 443 : 80));
-  this.query = opts.query || {};
-  if ('string' == typeof this.query) this.query = parseqs.decode(this.query);
-  this.upgrade = false !== opts.upgrade;
-  this.path = (opts.path || '/engine.io').replace(/\/$/, '') + '/';
-  this.forceJSONP = !!opts.forceJSONP;
-  this.jsonp = false !== opts.jsonp;
-  this.forceBase64 = !!opts.forceBase64;
-  this.enablesXDR = !!opts.enablesXDR;
-  this.timestampParam = opts.timestampParam || 't';
-  this.timestampRequests = opts.timestampRequests;
-  this.transports = opts.transports || ['polling', 'websocket'];
-  this.readyState = '';
-  this.writeBuffer = [];
-  this.callbackBuffer = [];
-  this.policyPort = opts.policyPort || 843;
-  this.rememberUpgrade = opts.rememberUpgrade || false;
-  this.binaryType = null;
-  this.onlyBinaryUpgrades = opts.onlyBinaryUpgrades;
-
-  // SSL options for Node.js client
-  this.pfx = opts.pfx || null;
-  this.key = opts.key || null;
-  this.passphrase = opts.passphrase || null;
-  this.cert = opts.cert || null;
-  this.ca = opts.ca || null;
-  this.ciphers = opts.ciphers || null;
-  this.rejectUnauthorized = opts.rejectUnauthorized || null;
-
-  this.open();
-}
-
-Socket.priorWebsocketSuccess = false;
-
-/**
- * Mix in `Emitter`.
- */
-
-Emitter(Socket.prototype);
-
-/**
- * Protocol version.
- *
- * @api public
- */
-
-Socket.protocol = parser.protocol; // this is an int
-
-/**
- * Expose deps for legacy compatibility
- * and standalone browser access.
- */
-
-Socket.Socket = Socket;
-Socket.Transport = require('./transport');
-Socket.transports = require('./transports');
-Socket.parser = require('engine.io-parser');
-
-/**
- * Creates transport of the given type.
- *
- * @param {String} transport name
- * @return {Transport}
- * @api private
- */
-
-Socket.prototype.createTransport = function (name) {
-  debug('creating transport "%s"', name);
-  var query = clone(this.query);
-
-  // append engine.io protocol identifier
-  query.EIO = parser.protocol;
-
-  // transport name
-  query.transport = name;
-
-  // session id if we already have one
-  if (this.id) query.sid = this.id;
-
-  var transport = new transports[name]({
-    agent: this.agent,
-    hostname: this.hostname,
-    port: this.port,
-    secure: this.secure,
-    path: this.path,
-    query: query,
-    forceJSONP: this.forceJSONP,
-    jsonp: this.jsonp,
-    forceBase64: this.forceBase64,
-    enablesXDR: this.enablesXDR,
-    timestampRequests: this.timestampRequests,
-    timestampParam: this.timestampParam,
-    policyPort: this.policyPort,
-    socket: this,
-    pfx: this.pfx,
-    key: this.key,
-    passphrase: this.passphrase,
-    cert: this.cert,
-    ca: this.ca,
-    ciphers: this.ciphers,
-    rejectUnauthorized: this.rejectUnauthorized
-  });
-
-  return transport;
-};
-
-function clone (obj) {
-  var o = {};
-  for (var i in obj) {
-    if (obj.hasOwnProperty(i)) {
-      o[i] = obj[i];
-    }
-  }
-  return o;
-}
-
-/**
- * Initializes transport to use and starts probe.
- *
- * @api private
- */
-Socket.prototype.open = function () {
-  var transport;
-  if (this.rememberUpgrade && Socket.priorWebsocketSuccess && this.transports.indexOf('websocket') != -1) {
-    transport = 'websocket';
-  } else if (0 == this.transports.length) {
-    // Emit error on next tick so it can be listened to
-    var self = this;
-    setTimeout(function() {
-      self.emit('error', 'No transports available');
-    }, 0);
-    return;
-  } else {
-    transport = this.transports[0];
-  }
-  this.readyState = 'opening';
-
-  // Retry with the next transport if the transport is disabled (jsonp: false)
-  var transport;
-  try {
-    transport = this.createTransport(transport);
-  } catch (e) {
-    this.transports.shift();
-    this.open();
-    return;
-  }
-
-  transport.open();
-  this.setTransport(transport);
-};
-
-/**
- * Sets the current transport. Disables the existing one (if any).
- *
- * @api private
- */
-
-Socket.prototype.setTransport = function(transport){
-  debug('setting transport %s', transport.name);
-  var self = this;
-
-  if (this.transport) {
-    debug('clearing existing transport %s', this.transport.name);
-    this.transport.removeAllListeners();
-  }
-
-  // set up transport
-  this.transport = transport;
-
-  // set up transport listeners
-  transport
-  .on('drain', function(){
-    self.onDrain();
-  })
-  .on('packet', function(packet){
-    self.onPacket(packet);
-  })
-  .on('error', function(e){
-    self.onError(e);
-  })
-  .on('close', function(){
-    self.onClose('transport close');
-  });
-};
-
-/**
- * Probes a transport.
- *
- * @param {String} transport name
- * @api private
- */
-
-Socket.prototype.probe = function (name) {
-  debug('probing transport "%s"', name);
-  var transport = this.createTransport(name, { probe: 1 })
-    , failed = false
-    , self = this;
-
-  Socket.priorWebsocketSuccess = false;
-
-  function onTransportOpen(){
-    if (self.onlyBinaryUpgrades) {
-      var upgradeLosesBinary = !this.supportsBinary && self.transport.supportsBinary;
-      failed = failed || upgradeLosesBinary;
-    }
-    if (failed) return;
-
-    debug('probe transport "%s" opened', name);
-    transport.send([{ type: 'ping', data: 'probe' }]);
-    transport.once('packet', function (msg) {
-      if (failed) return;
-      if ('pong' == msg.type && 'probe' == msg.data) {
-        debug('probe transport "%s" pong', name);
-        self.upgrading = true;
-        self.emit('upgrading', transport);
-        if (!transport) return;
-        Socket.priorWebsocketSuccess = 'websocket' == transport.name;
-
-        debug('pausing current transport "%s"', self.transport.name);
-        self.transport.pause(function () {
-          if (failed) return;
-          if ('closed' == self.readyState) return;
-          debug('changing transport and sending upgrade packet');
-
-          cleanup();
-
-          self.setTransport(transport);
-          transport.send([{ type: 'upgrade' }]);
-          self.emit('upgrade', transport);
-          transport = null;
-          self.upgrading = false;
-          self.flush();
-        });
-      } else {
-        debug('probe transport "%s" failed', name);
-        var err = new Error('probe error');
-        err.transport = transport.name;
-        self.emit('upgradeError', err);
-      }
-    });
-  }
-
-  function freezeTransport() {
-    if (failed) return;
-
-    // Any callback called by transport should be ignored since now
-    failed = true;
-
-    cleanup();
-
-    transport.close();
-    transport = null;
-  }
-
-  //Handle any error that happens while probing
-  function onerror(err) {
-    var error = new Error('probe error: ' + err);
-    error.transport = transport.name;
-
-    freezeTransport();
-
-    debug('probe transport "%s" failed because of error: %s', name, err);
-
-    self.emit('upgradeError', error);
-  }
-
-  function onTransportClose(){
-    onerror("transport closed");
-  }
-
-  //When the socket is closed while we're probing
-  function onclose(){
-    onerror("socket closed");
-  }
-
-  //When the socket is upgraded while we're probing
-  function onupgrade(to){
-    if (transport && to.name != transport.name) {
-      debug('"%s" works - aborting "%s"', to.name, transport.name);
-      freezeTransport();
-    }
-  }
-
-  //Remove all listeners on the transport and on self
-  function cleanup(){
-    transport.removeListener('open', onTransportOpen);
-    transport.removeListener('error', onerror);
-    transport.removeListener('close', onTransportClose);
-    self.removeListener('close', onclose);
-    self.removeListener('upgrading', onupgrade);
-  }
-
-  transport.once('open', onTransportOpen);
-  transport.once('error', onerror);
-  transport.once('close', onTransportClose);
-
-  this.once('close', onclose);
-  this.once('upgrading', onupgrade);
-
-  transport.open();
-
-};
-
-/**
- * Called when connection is deemed open.
- *
- * @api public
- */
-
-Socket.prototype.onOpen = function () {
-  debug('socket open');
-  this.readyState = 'open';
-  Socket.priorWebsocketSuccess = 'websocket' == this.transport.name;
-  this.emit('open');
-  this.flush();
-
-  // we check for `readyState` in case an `open`
-  // listener already closed the socket
-  if ('open' == this.readyState && this.upgrade && this.transport.pause) {
-    debug('starting upgrade probes');
-    for (var i = 0, l = this.upgrades.length; i < l; i++) {
-      this.probe(this.upgrades[i]);
-    }
-  }
-};
-
-/**
- * Handles a packet.
- *
- * @api private
- */
-
-Socket.prototype.onPacket = function (packet) {
-  if ('opening' == this.readyState || 'open' == this.readyState) {
-    debug('socket receive: type "%s", data "%s"', packet.type, packet.data);
-
-    this.emit('packet', packet);
-
-    // Socket is live - any packet counts
-    this.emit('heartbeat');
-
-    switch (packet.type) {
-      case 'open':
-        this.onHandshake(parsejson(packet.data));
-        break;
-
-      case 'pong':
-        this.setPing();
-        break;
-
-      case 'error':
-        var err = new Error('server error');
-        err.code = packet.data;
-        this.emit('error', err);
-        break;
-
-      case 'message':
-        this.emit('data', packet.data);
-        this.emit('message', packet.data);
-        break;
-    }
-  } else {
-    debug('packet received with socket readyState "%s"', this.readyState);
-  }
-};
-
-/**
- * Called upon handshake completion.
- *
- * @param {Object} handshake obj
- * @api private
- */
-
-Socket.prototype.onHandshake = function (data) {
-  this.emit('handshake', data);
-  this.id = data.sid;
-  this.transport.query.sid = data.sid;
-  this.upgrades = this.filterUpgrades(data.upgrades);
-  this.pingInterval = data.pingInterval;
-  this.pingTimeout = data.pingTimeout;
-  this.onOpen();
-  // In case open handler closes socket
-  if  ('closed' == this.readyState) return;
-  this.setPing();
-
-  // Prolong liveness of socket on heartbeat
-  this.removeListener('heartbeat', this.onHeartbeat);
-  this.on('heartbeat', this.onHeartbeat);
-};
-
-/**
- * Resets ping timeout.
- *
- * @api private
- */
-
-Socket.prototype.onHeartbeat = function (timeout) {
-  clearTimeout(this.pingTimeoutTimer);
-  var self = this;
-  self.pingTimeoutTimer = setTimeout(function () {
-    if ('closed' == self.readyState) return;
-    self.onClose('ping timeout');
-  }, timeout || (self.pingInterval + self.pingTimeout));
-};
-
-/**
- * Pings server every `this.pingInterval` and expects response
- * within `this.pingTimeout` or closes connection.
- *
- * @api private
- */
-
-Socket.prototype.setPing = function () {
-  var self = this;
-  clearTimeout(self.pingIntervalTimer);
-  self.pingIntervalTimer = setTimeout(function () {
-    debug('writing ping packet - expecting pong within %sms', self.pingTimeout);
-    self.ping();
-    self.onHeartbeat(self.pingTimeout);
-  }, self.pingInterval);
-};
-
-/**
-* Sends a ping packet.
-*
-* @api public
-*/
-
-Socket.prototype.ping = function () {
-  this.sendPacket('ping');
-};
-
-/**
- * Called on `drain` event
- *
- * @api private
- */
-
-Socket.prototype.onDrain = function() {
-  for (var i = 0; i < this.prevBufferLen; i++) {
-    if (this.callbackBuffer[i]) {
-      this.callbackBuffer[i]();
-    }
-  }
-
-  this.writeBuffer.splice(0, this.prevBufferLen);
-  this.callbackBuffer.splice(0, this.prevBufferLen);
-
-  // setting prevBufferLen = 0 is very important
-  // for example, when upgrading, upgrade packet is sent over,
-  // and a nonzero prevBufferLen could cause problems on `drain`
-  this.prevBufferLen = 0;
-
-  if (this.writeBuffer.length == 0) {
-    this.emit('drain');
-  } else {
-    this.flush();
-  }
-};
-
-/**
- * Flush write buffers.
- *
- * @api private
- */
-
-Socket.prototype.flush = function () {
-  if ('closed' != this.readyState && this.transport.writable &&
-    !this.upgrading && this.writeBuffer.length) {
-    debug('flushing %d packets in socket', this.writeBuffer.length);
-    this.transport.send(this.writeBuffer);
-    // keep track of current length of writeBuffer
-    // splice writeBuffer and callbackBuffer on `drain`
-    this.prevBufferLen = this.writeBuffer.length;
-    this.emit('flush');
-  }
-};
-
-/**
- * Sends a message.
- *
- * @param {String} message.
- * @param {Function} callback function.
- * @return {Socket} for chaining.
- * @api public
- */
-
-Socket.prototype.write =
-Socket.prototype.send = function (msg, fn) {
-  this.sendPacket('message', msg, fn);
-  return this;
-};
-
-/**
- * Sends a packet.
- *
- * @param {String} packet type.
- * @param {String} data.
- * @param {Function} callback function.
- * @api private
- */
-
-Socket.prototype.sendPacket = function (type, data, fn) {
-  if ('closing' == this.readyState || 'closed' == this.readyState) {
-    return;
-  }
-
-  var packet = { type: type, data: data };
-  this.emit('packetCreate', packet);
-  this.writeBuffer.push(packet);
-  this.callbackBuffer.push(fn);
-  this.flush();
-};
-
-/**
- * Closes the connection.
- *
- * @api private
- */
-
-Socket.prototype.close = function () {
-  if ('opening' == this.readyState || 'open' == this.readyState) {
-    this.readyState = 'closing';
-
-    var self = this;
-
-    function close() {
-      self.onClose('forced close');
-      debug('socket closing - telling transport to close');
-      self.transport.close();
-    }
-
-    function cleanupAndClose() {
-      self.removeListener('upgrade', cleanupAndClose);
-      self.removeListener('upgradeError', cleanupAndClose);
-      close();
-    }
-
-    function waitForUpgrade() {
-      // wait for upgrade to finish since we can't send packets while pausing a transport
-      self.once('upgrade', cleanupAndClose);
-      self.once('upgradeError', cleanupAndClose);
-    }
-
-    if (this.writeBuffer.length) {
-      this.once('drain', function() {
-        if (this.upgrading) {
-          waitForUpgrade();
-        } else {
-          close();
-        }
-      });
-    } else if (this.upgrading) {
-      waitForUpgrade();
-    } else {
-      close();
-    }
-  }
-
-  return this;
-};
-
-/**
- * Called upon transport error
- *
- * @api private
- */
-
-Socket.prototype.onError = function (err) {
-  debug('socket error %j', err);
-  Socket.priorWebsocketSuccess = false;
-  this.emit('error', err);
-  this.onClose('transport error', err);
-};
-
-/**
- * Called upon transport close.
- *
- * @api private
- */
-
-Socket.prototype.onClose = function (reason, desc) {
-  if ('opening' == this.readyState || 'open' == this.readyState || 'closing' == this.readyState) {
-    debug('socket close with reason: "%s"', reason);
-    var self = this;
-
-    // clear timers
-    clearTimeout(this.pingIntervalTimer);
-    clearTimeout(this.pingTimeoutTimer);
-
-    // clean buffers in next tick, so developers can still
-    // grab the buffers on `close` event
-    setTimeout(function() {
-      self.writeBuffer = [];
-      self.callbackBuffer = [];
-      self.prevBufferLen = 0;
-    }, 0);
-
-    // stop event from firing again for transport
-    this.transport.removeAllListeners('close');
-
-    // ensure transport won't stay open
-    this.transport.close();
-
-    // ignore further transport communication
-    this.transport.removeAllListeners();
-
-    // set ready state
-    this.readyState = 'closed';
-
-    // clear session id
-    this.id = null;
-
-    // emit close event
-    this.emit('close', reason, desc);
-  }
-};
-
-/**
- * Filters upgrades, returning only those matching client transports.
- *
- * @param {Array} server upgrades
- * @api private
- *
- */
-
-Socket.prototype.filterUpgrades = function (upgrades) {
-  var filteredUpgrades = [];
-  for (var i = 0, j = upgrades.length; i<j; i++) {
-    if (~index(this.transports, upgrades[i])) filteredUpgrades.push(upgrades[i]);
-  }
-  return filteredUpgrades;
-};
-
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-
-},{"./transport":62,"./transports":63,"component-emitter":56,"debug":69,"engine.io-parser":72,"indexof":79,"parsejson":103,"parseqs":104,"parseuri":71}],62:[function(require,module,exports){
-/**
- * Module dependencies.
- */
-
-var parser = require('engine.io-parser');
-var Emitter = require('component-emitter');
-
-/**
- * Module exports.
- */
-
-module.exports = Transport;
-
-/**
- * Transport abstract constructor.
- *
- * @param {Object} options.
- * @api private
- */
-
-function Transport (opts) {
-  this.path = opts.path;
-  this.hostname = opts.hostname;
-  this.port = opts.port;
-  this.secure = opts.secure;
-  this.query = opts.query;
-  this.timestampParam = opts.timestampParam;
-  this.timestampRequests = opts.timestampRequests;
-  this.readyState = '';
-  this.agent = opts.agent || false;
-  this.socket = opts.socket;
-  this.enablesXDR = opts.enablesXDR;
-
-  // SSL options for Node.js client
-  this.pfx = opts.pfx;
-  this.key = opts.key;
-  this.passphrase = opts.passphrase;
-  this.cert = opts.cert;
-  this.ca = opts.ca;
-  this.ciphers = opts.ciphers;
-  this.rejectUnauthorized = opts.rejectUnauthorized;
-}
-
-/**
- * Mix in `Emitter`.
- */
-
-Emitter(Transport.prototype);
-
-/**
- * A counter used to prevent collisions in the timestamps used
- * for cache busting.
- */
-
-Transport.timestamps = 0;
-
-/**
- * Emits an error.
- *
- * @param {String} str
- * @return {Transport} for chaining
- * @api public
- */
-
-Transport.prototype.onError = function (msg, desc) {
-  var err = new Error(msg);
-  err.type = 'TransportError';
-  err.description = desc;
-  this.emit('error', err);
-  return this;
-};
-
-/**
- * Opens the transport.
- *
- * @api public
- */
-
-Transport.prototype.open = function () {
-  if ('closed' == this.readyState || '' == this.readyState) {
-    this.readyState = 'opening';
-    this.doOpen();
-  }
-
-  return this;
-};
-
-/**
- * Closes the transport.
- *
- * @api private
- */
-
-Transport.prototype.close = function () {
-  if ('opening' == this.readyState || 'open' == this.readyState) {
-    this.doClose();
-    this.onClose();
-  }
-
-  return this;
-};
-
-/**
- * Sends multiple packets.
- *
- * @param {Array} packets
- * @api private
- */
-
-Transport.prototype.send = function(packets){
-  if ('open' == this.readyState) {
-    this.write(packets);
-  } else {
-    throw new Error('Transport not open');
-  }
-};
-
-/**
- * Called upon open
- *
- * @api private
- */
-
-Transport.prototype.onOpen = function () {
-  this.readyState = 'open';
-  this.writable = true;
-  this.emit('open');
-};
-
-/**
- * Called with data.
- *
- * @param {String} data
- * @api private
- */
-
-Transport.prototype.onData = function(data){
-  var packet = parser.decodePacket(data, this.socket.binaryType);
-  this.onPacket(packet);
-};
-
-/**
- * Called with a decoded packet.
- */
-
-Transport.prototype.onPacket = function (packet) {
-  this.emit('packet', packet);
-};
-
-/**
- * Called upon close.
- *
- * @api private
- */
-
-Transport.prototype.onClose = function () {
-  this.readyState = 'closed';
-  this.emit('close');
-};
-
-},{"component-emitter":56,"engine.io-parser":72}],63:[function(require,module,exports){
-(function (global){
-/**
- * Module dependencies
- */
-
-var XMLHttpRequest = require('xmlhttprequest');
-var XHR = require('./polling-xhr');
-var JSONP = require('./polling-jsonp');
-var websocket = require('./websocket');
-
-/**
- * Export transports.
- */
-
-exports.polling = polling;
-exports.websocket = websocket;
-
-/**
- * Polling transport polymorphic constructor.
- * Decides on xhr vs jsonp based on feature detection.
- *
- * @api private
- */
-
-function polling(opts){
-  var xhr;
-  var xd = false;
-  var xs = false;
-  var jsonp = false !== opts.jsonp;
-
-  if (global.location) {
-    var isSSL = 'https:' == location.protocol;
-    var port = location.port;
-
-    // some user agents have empty `location.port`
-    if (!port) {
-      port = isSSL ? 443 : 80;
-    }
-
-    xd = opts.hostname != location.hostname || port != opts.port;
-    xs = opts.secure != isSSL;
-  }
-
-  opts.xdomain = xd;
-  opts.xscheme = xs;
-  xhr = new XMLHttpRequest(opts);
-
-  if ('open' in xhr && !opts.forceJSONP) {
-    return new XHR(opts);
-  } else {
-    if (!jsonp) throw new Error('JSONP disabled');
-    return new JSONP(opts);
-  }
-}
-
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-
-},{"./polling-jsonp":64,"./polling-xhr":65,"./websocket":67,"xmlhttprequest":68}],64:[function(require,module,exports){
-(function (global){
-
-/**
- * Module requirements.
- */
-
-var Polling = require('./polling');
-var inherit = require('component-inherit');
-
-/**
- * Module exports.
- */
-
-module.exports = JSONPPolling;
-
-/**
- * Cached regular expressions.
- */
-
-var rNewline = /\n/g;
-var rEscapedNewline = /\\n/g;
-
-/**
- * Global JSONP callbacks.
- */
-
-var callbacks;
-
-/**
- * Callbacks count.
- */
-
-var index = 0;
-
-/**
- * Noop.
- */
-
-function empty () { }
-
-/**
- * JSONP Polling constructor.
- *
- * @param {Object} opts.
- * @api public
- */
-
-function JSONPPolling (opts) {
-  Polling.call(this, opts);
-
-  this.query = this.query || {};
-
-  // define global callbacks array if not present
-  // we do this here (lazily) to avoid unneeded global pollution
-  if (!callbacks) {
-    // we need to consider multiple engines in the same page
-    if (!global.___eio) global.___eio = [];
-    callbacks = global.___eio;
-  }
-
-  // callback identifier
-  this.index = callbacks.length;
-
-  // add callback to jsonp global
-  var self = this;
-  callbacks.push(function (msg) {
-    self.onData(msg);
-  });
-
-  // append to query string
-  this.query.j = this.index;
-
-  // prevent spurious errors from being emitted when the window is unloaded
-  if (global.document && global.addEventListener) {
-    global.addEventListener('beforeunload', function () {
-      if (self.script) self.script.onerror = empty;
-    }, false);
-  }
-}
-
-/**
- * Inherits from Polling.
- */
-
-inherit(JSONPPolling, Polling);
-
-/*
- * JSONP only supports binary as base64 encoded strings
- */
-
-JSONPPolling.prototype.supportsBinary = false;
-
-/**
- * Closes the socket.
- *
- * @api private
- */
-
-JSONPPolling.prototype.doClose = function () {
-  if (this.script) {
-    this.script.parentNode.removeChild(this.script);
-    this.script = null;
-  }
-
-  if (this.form) {
-    this.form.parentNode.removeChild(this.form);
-    this.form = null;
-    this.iframe = null;
-  }
-
-  Polling.prototype.doClose.call(this);
-};
-
-/**
- * Starts a poll cycle.
- *
- * @api private
- */
-
-JSONPPolling.prototype.doPoll = function () {
-  var self = this;
-  var script = document.createElement('script');
-
-  if (this.script) {
-    this.script.parentNode.removeChild(this.script);
-    this.script = null;
-  }
-
-  script.async = true;
-  script.src = this.uri();
-  script.onerror = function(e){
-    self.onError('jsonp poll error',e);
-  };
-
-  var insertAt = document.getElementsByTagName('script')[0];
-  insertAt.parentNode.insertBefore(script, insertAt);
-  this.script = script;
-
-  var isUAgecko = 'undefined' != typeof navigator && /gecko/i.test(navigator.userAgent);
-  
-  if (isUAgecko) {
-    setTimeout(function () {
-      var iframe = document.createElement('iframe');
-      document.body.appendChild(iframe);
-      document.body.removeChild(iframe);
-    }, 100);
-  }
-};
-
-/**
- * Writes with a hidden iframe.
- *
- * @param {String} data to send
- * @param {Function} called upon flush.
- * @api private
- */
-
-JSONPPolling.prototype.doWrite = function (data, fn) {
-  var self = this;
-
-  if (!this.form) {
-    var form = document.createElement('form');
-    var area = document.createElement('textarea');
-    var id = this.iframeId = 'eio_iframe_' + this.index;
-    var iframe;
-
-    form.className = 'socketio';
-    form.style.position = 'absolute';
-    form.style.top = '-1000px';
-    form.style.left = '-1000px';
-    form.target = id;
-    form.method = 'POST';
-    form.setAttribute('accept-charset', 'utf-8');
-    area.name = 'd';
-    form.appendChild(area);
-    document.body.appendChild(form);
-
-    this.form = form;
-    this.area = area;
-  }
-
-  this.form.action = this.uri();
-
-  function complete () {
-    initIframe();
-    fn();
-  }
-
-  function initIframe () {
-    if (self.iframe) {
-      try {
-        self.form.removeChild(self.iframe);
-      } catch (e) {
-        self.onError('jsonp polling iframe removal error', e);
-      }
-    }
-
+(function () {
     try {
-      // ie6 dynamic iframes with target="" support (thanks Chris Lambacher)
-      var html = '<iframe src="javascript:0" name="'+ self.iframeId +'">';
-      iframe = document.createElement(html);
+        if (typeof setTimeout === 'function') {
+            cachedSetTimeout = setTimeout;
+        } else {
+            cachedSetTimeout = defaultSetTimout;
+        }
     } catch (e) {
-      iframe = document.createElement('iframe');
-      iframe.name = self.iframeId;
-      iframe.src = 'javascript:0';
+        cachedSetTimeout = defaultSetTimout;
     }
-
-    iframe.id = self.iframeId;
-
-    self.form.appendChild(iframe);
-    self.iframe = iframe;
-  }
-
-  initIframe();
-
-  // escape \n to prevent it from being converted into \r\n by some UAs
-  // double escaping is required for escaped new lines because unescaping of new lines can be done safely on server-side
-  data = data.replace(rEscapedNewline, '\\\n');
-  this.area.value = data.replace(rNewline, '\\n');
-
-  try {
-    this.form.submit();
-  } catch(e) {}
-
-  if (this.iframe.attachEvent) {
-    this.iframe.onreadystatechange = function(){
-      if (self.iframe.readyState == 'complete') {
-        complete();
-      }
-    };
-  } else {
-    this.iframe.onload = complete;
-  }
-};
-
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-
-},{"./polling":66,"component-inherit":57}],65:[function(require,module,exports){
-(function (global){
-/**
- * Module requirements.
- */
-
-var XMLHttpRequest = require('xmlhttprequest');
-var Polling = require('./polling');
-var Emitter = require('component-emitter');
-var inherit = require('component-inherit');
-var debug = require('debug')('engine.io-client:polling-xhr');
-
-/**
- * Module exports.
- */
-
-module.exports = XHR;
-module.exports.Request = Request;
-
-/**
- * Empty function
- */
-
-function empty(){}
-
-/**
- * XHR Polling constructor.
- *
- * @param {Object} opts
- * @api public
- */
-
-function XHR(opts){
-  Polling.call(this, opts);
-
-  if (global.location) {
-    var isSSL = 'https:' == location.protocol;
-    var port = location.port;
-
-    // some user agents have empty `location.port`
-    if (!port) {
-      port = isSSL ? 443 : 80;
-    }
-
-    this.xd = opts.hostname != global.location.hostname ||
-      port != opts.port;
-    this.xs = opts.secure != isSSL;
-  }
-}
-
-/**
- * Inherits from Polling.
- */
-
-inherit(XHR, Polling);
-
-/**
- * XHR supports binary
- */
-
-XHR.prototype.supportsBinary = true;
-
-/**
- * Creates a request.
- *
- * @param {String} method
- * @api private
- */
-
-XHR.prototype.request = function(opts){
-  opts = opts || {};
-  opts.uri = this.uri();
-  opts.xd = this.xd;
-  opts.xs = this.xs;
-  opts.agent = this.agent || false;
-  opts.supportsBinary = this.supportsBinary;
-  opts.enablesXDR = this.enablesXDR;
-
-  // SSL options for Node.js client
-  opts.pfx = this.pfx;
-  opts.key = this.key;
-  opts.passphrase = this.passphrase;
-  opts.cert = this.cert;
-  opts.ca = this.ca;
-  opts.ciphers = this.ciphers;
-  opts.rejectUnauthorized = this.rejectUnauthorized;
-
-  return new Request(opts);
-};
-
-/**
- * Sends data.
- *
- * @param {String} data to send.
- * @param {Function} called upon flush.
- * @api private
- */
-
-XHR.prototype.doWrite = function(data, fn){
-  var isBinary = typeof data !== 'string' && data !== undefined;
-  var req = this.request({ method: 'POST', data: data, isBinary: isBinary });
-  var self = this;
-  req.on('success', fn);
-  req.on('error', function(err){
-    self.onError('xhr post error', err);
-  });
-  this.sendXhr = req;
-};
-
-/**
- * Starts a poll cycle.
- *
- * @api private
- */
-
-XHR.prototype.doPoll = function(){
-  debug('xhr poll');
-  var req = this.request();
-  var self = this;
-  req.on('data', function(data){
-    self.onData(data);
-  });
-  req.on('error', function(err){
-    self.onError('xhr poll error', err);
-  });
-  this.pollXhr = req;
-};
-
-/**
- * Request constructor
- *
- * @param {Object} options
- * @api public
- */
-
-function Request(opts){
-  this.method = opts.method || 'GET';
-  this.uri = opts.uri;
-  this.xd = !!opts.xd;
-  this.xs = !!opts.xs;
-  this.async = false !== opts.async;
-  this.data = undefined != opts.data ? opts.data : null;
-  this.agent = opts.agent;
-  this.isBinary = opts.isBinary;
-  this.supportsBinary = opts.supportsBinary;
-  this.enablesXDR = opts.enablesXDR;
-
-  // SSL options for Node.js client
-  this.pfx = opts.pfx;
-  this.key = opts.key;
-  this.passphrase = opts.passphrase;
-  this.cert = opts.cert;
-  this.ca = opts.ca;
-  this.ciphers = opts.ciphers;
-  this.rejectUnauthorized = opts.rejectUnauthorized;
-
-  this.create();
-}
-
-/**
- * Mix in `Emitter`.
- */
-
-Emitter(Request.prototype);
-
-/**
- * Creates the XHR object and sends the request.
- *
- * @api private
- */
-
-Request.prototype.create = function(){
-  var opts = { agent: this.agent, xdomain: this.xd, xscheme: this.xs, enablesXDR: this.enablesXDR };
-
-  // SSL options for Node.js client
-  opts.pfx = this.pfx;
-  opts.key = this.key;
-  opts.passphrase = this.passphrase;
-  opts.cert = this.cert;
-  opts.ca = this.ca;
-  opts.ciphers = this.ciphers;
-  opts.rejectUnauthorized = this.rejectUnauthorized;
-
-  var xhr = this.xhr = new XMLHttpRequest(opts);
-  var self = this;
-
-  try {
-    debug('xhr open %s: %s', this.method, this.uri);
-    xhr.open(this.method, this.uri, this.async);
-    if (this.supportsBinary) {
-      // This has to be done after open because Firefox is stupid
-      // http://stackoverflow.com/questions/13216903/get-binary-data-with-xmlhttprequest-in-a-firefox-extension
-      xhr.responseType = 'arraybuffer';
-    }
-
-    if ('POST' == this.method) {
-      try {
-        if (this.isBinary) {
-          xhr.setRequestHeader('Content-type', 'application/octet-stream');
-        } else {
-          xhr.setRequestHeader('Content-type', 'text/plain;charset=UTF-8');
-        }
-      } catch (e) {}
-    }
-
-    // ie6 check
-    if ('withCredentials' in xhr) {
-      xhr.withCredentials = true;
-    }
-
-    if (this.hasXDR()) {
-      xhr.onload = function(){
-        self.onLoad();
-      };
-      xhr.onerror = function(){
-        self.onError(xhr.responseText);
-      };
-    } else {
-      xhr.onreadystatechange = function(){
-        if (4 != xhr.readyState) return;
-        if (200 == xhr.status || 1223 == xhr.status) {
-          self.onLoad();
-        } else {
-          // make sure the `error` event handler that's user-set
-          // does not throw in the same tick and gets caught here
-          setTimeout(function(){
-            self.onError(xhr.status);
-          }, 0);
-        }
-      };
-    }
-
-    debug('xhr data %s', this.data);
-    xhr.send(this.data);
-  } catch (e) {
-    // Need to defer since .create() is called directly fhrom the constructor
-    // and thus the 'error' event can only be only bound *after* this exception
-    // occurs.  Therefore, also, we cannot throw here at all.
-    setTimeout(function() {
-      self.onError(e);
-    }, 0);
-    return;
-  }
-
-  if (global.document) {
-    this.index = Request.requestsCount++;
-    Request.requests[this.index] = this;
-  }
-};
-
-/**
- * Called upon successful response.
- *
- * @api private
- */
-
-Request.prototype.onSuccess = function(){
-  this.emit('success');
-  this.cleanup();
-};
-
-/**
- * Called if we have data.
- *
- * @api private
- */
-
-Request.prototype.onData = function(data){
-  this.emit('data', data);
-  this.onSuccess();
-};
-
-/**
- * Called upon error.
- *
- * @api private
- */
-
-Request.prototype.onError = function(err){
-  this.emit('error', err);
-  this.cleanup(true);
-};
-
-/**
- * Cleans up house.
- *
- * @api private
- */
-
-Request.prototype.cleanup = function(fromError){
-  if ('undefined' == typeof this.xhr || null === this.xhr) {
-    return;
-  }
-  // xmlhttprequest
-  if (this.hasXDR()) {
-    this.xhr.onload = this.xhr.onerror = empty;
-  } else {
-    this.xhr.onreadystatechange = empty;
-  }
-
-  if (fromError) {
     try {
-      this.xhr.abort();
-    } catch(e) {}
-  }
-
-  if (global.document) {
-    delete Request.requests[this.index];
-  }
-
-  this.xhr = null;
-};
-
-/**
- * Called upon load.
- *
- * @api private
- */
-
-Request.prototype.onLoad = function(){
-  var data;
-  try {
-    var contentType;
+        if (typeof clearTimeout === 'function') {
+            cachedClearTimeout = clearTimeout;
+        } else {
+            cachedClearTimeout = defaultClearTimeout;
+        }
+    } catch (e) {
+        cachedClearTimeout = defaultClearTimeout;
+    }
+} ())
+function runTimeout(fun) {
+    if (cachedSetTimeout === setTimeout) {
+        //normal enviroments in sane situations
+        return setTimeout(fun, 0);
+    }
+    // if setTimeout wasn't available but was latter defined
+    if ((cachedSetTimeout === defaultSetTimout || !cachedSetTimeout) && setTimeout) {
+        cachedSetTimeout = setTimeout;
+        return setTimeout(fun, 0);
+    }
     try {
-      contentType = this.xhr.getResponseHeader('Content-Type').split(';')[0];
-    } catch (e) {}
-    if (contentType === 'application/octet-stream') {
-      data = this.xhr.response;
+        // when when somebody has screwed with setTimeout but no I.E. maddness
+        return cachedSetTimeout(fun, 0);
+    } catch(e){
+        try {
+            // When we are in I.E. but the script has been evaled so I.E. doesn't trust the global object when called normally
+            return cachedSetTimeout.call(null, fun, 0);
+        } catch(e){
+            // same as above but when it's a version of I.E. that must have the global object for 'this', hopfully our context correct otherwise it will throw a global error
+            return cachedSetTimeout.call(this, fun, 0);
+        }
+    }
+
+
+}
+function runClearTimeout(marker) {
+    if (cachedClearTimeout === clearTimeout) {
+        //normal enviroments in sane situations
+        return clearTimeout(marker);
+    }
+    // if clearTimeout wasn't available but was latter defined
+    if ((cachedClearTimeout === defaultClearTimeout || !cachedClearTimeout) && clearTimeout) {
+        cachedClearTimeout = clearTimeout;
+        return clearTimeout(marker);
+    }
+    try {
+        // when when somebody has screwed with setTimeout but no I.E. maddness
+        return cachedClearTimeout(marker);
+    } catch (e){
+        try {
+            // When we are in I.E. but the script has been evaled so I.E. doesn't  trust the global object when called normally
+            return cachedClearTimeout.call(null, marker);
+        } catch (e){
+            // same as above but when it's a version of I.E. that must have the global object for 'this', hopfully our context correct otherwise it will throw a global error.
+            // Some versions of I.E. have different rules for clearTimeout vs setTimeout
+            return cachedClearTimeout.call(this, marker);
+        }
+    }
+
+
+
+}
+var queue = [];
+var draining = false;
+var currentQueue;
+var queueIndex = -1;
+
+function cleanUpNextTick() {
+    if (!draining || !currentQueue) {
+        return;
+    }
+    draining = false;
+    if (currentQueue.length) {
+        queue = currentQueue.concat(queue);
     } else {
-      if (!this.supportsBinary) {
-        data = this.xhr.responseText;
-      } else {
-        data = 'ok';
-      }
+        queueIndex = -1;
     }
-  } catch (e) {
-    this.onError(e);
-  }
-  if (null != data) {
-    this.onData(data);
-  }
-};
-
-/**
- * Check if it has XDomainRequest.
- *
- * @api private
- */
-
-Request.prototype.hasXDR = function(){
-  return 'undefined' !== typeof global.XDomainRequest && !this.xs && this.enablesXDR;
-};
-
-/**
- * Aborts the request.
- *
- * @api public
- */
-
-Request.prototype.abort = function(){
-  this.cleanup();
-};
-
-/**
- * Aborts pending requests when unloading the window. This is needed to prevent
- * memory leaks (e.g. when using IE) and to ensure that no spurious error is
- * emitted.
- */
-
-if (global.document) {
-  Request.requestsCount = 0;
-  Request.requests = {};
-  if (global.attachEvent) {
-    global.attachEvent('onunload', unloadHandler);
-  } else if (global.addEventListener) {
-    global.addEventListener('beforeunload', unloadHandler, false);
-  }
+    if (queue.length) {
+        drainQueue();
+    }
 }
 
-function unloadHandler() {
-  for (var i in Request.requests) {
-    if (Request.requests.hasOwnProperty(i)) {
-      Request.requests[i].abort();
+function drainQueue() {
+    if (draining) {
+        return;
     }
-  }
+    var timeout = runTimeout(cleanUpNextTick);
+    draining = true;
+
+    var len = queue.length;
+    while(len) {
+        currentQueue = queue;
+        queue = [];
+        while (++queueIndex < len) {
+            if (currentQueue) {
+                currentQueue[queueIndex].run();
+            }
+        }
+        queueIndex = -1;
+        len = queue.length;
+    }
+    currentQueue = null;
+    draining = false;
+    runClearTimeout(timeout);
 }
 
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+process.nextTick = function (fun) {
+    var args = new Array(arguments.length - 1);
+    if (arguments.length > 1) {
+        for (var i = 1; i < arguments.length; i++) {
+            args[i - 1] = arguments[i];
+        }
+    }
+    queue.push(new Item(fun, args));
+    if (queue.length === 1 && !draining) {
+        runTimeout(drainQueue);
+    }
+};
 
-},{"./polling":66,"component-emitter":56,"component-inherit":57,"debug":69,"xmlhttprequest":68}],66:[function(require,module,exports){
-/**
- * Module dependencies.
+// v8 likes predictible objects
+function Item(fun, array) {
+    this.fun = fun;
+    this.array = array;
+}
+Item.prototype.run = function () {
+    this.fun.apply(null, this.array);
+};
+process.title = 'browser';
+process.browser = true;
+process.env = {};
+process.argv = [];
+process.version = ''; // empty string to avoid regexp issues
+process.versions = {};
+
+function noop() {}
+
+process.on = noop;
+process.addListener = noop;
+process.once = noop;
+process.off = noop;
+process.removeListener = noop;
+process.removeAllListeners = noop;
+process.emit = noop;
+
+process.binding = function (name) {
+    throw new Error('process.binding is not supported');
+};
+
+process.cwd = function () { return '/' };
+process.chdir = function (dir) {
+    throw new Error('process.chdir is not supported');
+};
+process.umask = function() { return 0; };
+
+},{}],65:[function(require,module,exports){
+/*!
+ * currentExecutingScript
+ * Get the currently executing script, regardless of its source/trigger/synchronicity. Similar to HTML5's `document.currentScript` but arguably much more useful!
+ * Copyright (c) 2015 James M. Greene
+ * Licensed MIT
+ * https://github.com/JamesMGreene/currentExecutingScript
+ * v0.1.3
  */
+(function(root, factory) {
+  if (typeof define === "function" && define.amd) {
+    // AMD. Register as an anonymous module.
+    define([], factory);
+  } else if (typeof exports === "object") {
+    // CommonJS-like environments that support `module.exports`,
+    // like Node.js. Does not work with strict CommonJS!
+    module.exports = factory();
+  } else {
+    // Browser globals (`root` is `window`)
+    root.currentExecutingScript = factory();
+  }
+}(
+  // Current context/scope
+  this || window,
 
-var Transport = require('../transport');
-var parseqs = require('parseqs');
-var parser = require('engine.io-parser');
-var inherit = require('component-inherit');
-var debug = require('debug')('engine.io-client:polling');
+  // Factory function to return the export
+  function() {
 
-/**
- * Module exports.
- */
+var scriptReadyRegex = /^(interactive|loaded|complete)$/;
 
-module.exports = Polling;
+// This page's URL (minus query string and fragment identifer hash, if any)
+var fullPageUrl = !!window.location ? window.location.href : null;
+var pageUrl = fullPageUrl ? fullPageUrl.replace(/#.*$/, "").replace(/\?.*$/, "") || null : null;
 
-/**
- * Is XHR2 supported?
- */
+// Live NodeList collection
+var scripts = document.getElementsByTagName("script");
 
-var hasXHR2 = (function() {
-  var XMLHttpRequest = require('xmlhttprequest');
-  var xhr = new XMLHttpRequest({ xdomain: false });
-  return null != xhr.responseType;
+// Check if the browser supports the `readyState` property on `script` elements
+var supportsScriptReadyState = "readyState" in (scripts[0] || document.createElement("script"));
+
+// Lousy browser detection for [not] Opera
+var isNotOpera = !window.opera || window.opera.toString() !== "[object Opera]";
+
+// Detect if `document.currentScript` is supported
+var hasNativeCurrentScriptAccessor = "currentScript" in document;
+
+var originalStackDepthConfig;
+// Detect if the V8 Error Stack Trace API is supported
+if ("stackTraceLimit" in Error && Error.stackTraceLimit !== Infinity) {
+  originalStackDepthConfig = Error.stackTraceLimit;
+  Error.stackTraceLimit = Infinity;
+}
+
+
+// In some browsers (e.g. Chrome), you can get the current stack from an Error
+// object instance without needing to throw it. Avoiding an unnecessary
+// use of `throw` saves time and performance.
+var hasStackBeforeThrowing = false,
+    hasStackAfterThrowing = false;
+(function() {
+  try {
+    var err = new Error();
+    hasStackBeforeThrowing = typeof err.stack === "string" && !!err.stack;
+    throw err;
+  }
+  catch (thrownErr) {
+    hasStackAfterThrowing = typeof thrownErr.stack === "string" && !!thrownErr.stack;
+  }
 })();
 
-/**
- * Polling interface.
- *
- * @param {Object} opts
- * @api private
- */
 
-function Polling(opts){
-  var forceBase64 = (opts && opts.forceBase64);
-  if (!hasXHR2 || forceBase64) {
-    this.supportsBinary = false;
-  }
-  Transport.call(this, opts);
+// Normalize whitespace within a string
+function normalizeWhitespace(str) {
+  return str ? str.replace(/^\s+$|\s+$/g, "").replace(/\s\s+/g, " ") : "";
 }
 
-/**
- * Inherits from Transport.
- */
-
-inherit(Polling, Transport);
-
-/**
- * Transport name.
- */
-
-Polling.prototype.name = 'polling';
-
-/**
- * Opens the socket (triggers polling). We write a PING message to determine
- * when the transport is open.
- *
- * @api private
- */
-
-Polling.prototype.doOpen = function(){
-  this.poll();
-};
-
-/**
- * Pauses polling.
- *
- * @param {Function} callback upon buffers are flushed and transport is paused
- * @api private
- */
-
-Polling.prototype.pause = function(onPause){
-  var pending = 0;
-  var self = this;
-
-  this.readyState = 'pausing';
-
-  function pause(){
-    debug('paused');
-    self.readyState = 'paused';
-    onPause();
-  }
-
-  if (this.polling || !this.writable) {
-    var total = 0;
-
-    if (this.polling) {
-      debug('we are currently polling - waiting to pause');
-      total++;
-      this.once('pollComplete', function(){
-        debug('pre-pause polling complete');
-        --total || pause();
-      });
-    }
-
-    if (!this.writable) {
-      debug('we are currently writing - waiting to pause');
-      total++;
-      this.once('drain', function(){
-        debug('pre-pause writing complete');
-        --total || pause();
-      });
-    }
-  } else {
-    pause();
-  }
-};
-
-/**
- * Starts polling cycle.
- *
- * @api public
- */
-
-Polling.prototype.poll = function(){
-  debug('polling');
-  this.polling = true;
-  this.doPoll();
-  this.emit('poll');
-};
-
-/**
- * Overloads onData to detect payloads.
- *
- * @api private
- */
-
-Polling.prototype.onData = function(data){
-  var self = this;
-  debug('polling got data %s', data);
-  var callback = function(packet, index, total) {
-    // if its the first message we consider the transport open
-    if ('opening' == self.readyState) {
-      self.onOpen();
-    }
-
-    // if its a close packet, we close the ongoing requests
-    if ('close' == packet.type) {
-      self.onClose();
-      return false;
-    }
-
-    // otherwise bypass onData and handle the message
-    self.onPacket(packet);
-  };
-
-  // decode payload
-  parser.decodePayload(data, this.socket.binaryType, callback);
-
-  // if an event did not trigger closing
-  if ('closed' != this.readyState) {
-    // if we got data we're not polling
-    this.polling = false;
-    this.emit('pollComplete');
-
-    if ('open' == this.readyState) {
-      this.poll();
-    } else {
-      debug('ignoring poll - transport state "%s"', this.readyState);
-    }
-  }
-};
-
-/**
- * For polling, send a close packet.
- *
- * @api private
- */
-
-Polling.prototype.doClose = function(){
-  var self = this;
-
-  function close(){
-    debug('writing close packet');
-    self.write([{ type: 'close' }]);
-  }
-
-  if ('open' == this.readyState) {
-    debug('transport open - closing');
-    close();
-  } else {
-    // in case we're trying to close while
-    // handshaking is in progress (GH-164)
-    debug('transport not open - deferring close');
-    this.once('open', close);
-  }
-};
-
-/**
- * Writes a packets payload.
- *
- * @param {Array} data packets
- * @param {Function} drain callback
- * @api private
- */
-
-Polling.prototype.write = function(packets){
-  var self = this;
-  this.writable = false;
-  var callbackfn = function() {
-    self.writable = true;
-    self.emit('drain');
-  };
-
-  var self = this;
-  parser.encodePayload(packets, this.supportsBinary, function(data) {
-    self.doWrite(data, callbackfn);
-  });
-};
-
-/**
- * Generates uri for connection.
- *
- * @api private
- */
-
-Polling.prototype.uri = function(){
-  var query = this.query || {};
-  var schema = this.secure ? 'https' : 'http';
-  var port = '';
-
-  // cache busting is forced
-  if (false !== this.timestampRequests) {
-    query[this.timestampParam] = +new Date + '-' + Transport.timestamps++;
-  }
-
-  if (!this.supportsBinary && !query.sid) {
-    query.b64 = 1;
-  }
-
-  query = parseqs.encode(query);
-
-  // avoid port if default for schema
-  if (this.port && (('https' == schema && this.port != 443) ||
-     ('http' == schema && this.port != 80))) {
-    port = ':' + this.port;
-  }
-
-  // prepend ? to query
-  if (query.length) {
-    query = '?' + query;
-  }
-
-  return schema + '://' + this.hostname + port + this.path + query;
-};
-
-},{"../transport":62,"component-inherit":57,"debug":69,"engine.io-parser":72,"parseqs":104,"xmlhttprequest":68}],67:[function(require,module,exports){
-/**
- * Module dependencies.
- */
-
-var Transport = require('../transport');
-var parser = require('engine.io-parser');
-var parseqs = require('parseqs');
-var inherit = require('component-inherit');
-var debug = require('debug')('engine.io-client:websocket');
-
-/**
- * `ws` exposes a WebSocket-compatible interface in
- * Node, or the `WebSocket` or `MozWebSocket` globals
- * in the browser.
- */
-
-var WebSocket = require('ws');
-
-/**
- * Module exports.
- */
-
-module.exports = WS;
-
-/**
- * WebSocket transport constructor.
- *
- * @api {Object} connection options
- * @api public
- */
-
-function WS(opts){
-  var forceBase64 = (opts && opts.forceBase64);
-  if (forceBase64) {
-    this.supportsBinary = false;
-  }
-  Transport.call(this, opts);
-}
-
-/**
- * Inherits from Transport.
- */
-
-inherit(WS, Transport);
-
-/**
- * Transport name.
- *
- * @api public
- */
-
-WS.prototype.name = 'websocket';
-
-/*
- * WebSockets support binary
- */
-
-WS.prototype.supportsBinary = true;
-
-/**
- * Opens socket.
- *
- * @api private
- */
-
-WS.prototype.doOpen = function(){
-  if (!this.check()) {
-    // let probe timeout
-    return;
-  }
-
-  var self = this;
-  var uri = this.uri();
-  var protocols = void(0);
-  var opts = { agent: this.agent };
-
-  // SSL options for Node.js client
-  opts.pfx = this.pfx;
-  opts.key = this.key;
-  opts.passphrase = this.passphrase;
-  opts.cert = this.cert;
-  opts.ca = this.ca;
-  opts.ciphers = this.ciphers;
-  opts.rejectUnauthorized = this.rejectUnauthorized;
-
-  this.ws = new WebSocket(uri, protocols, opts);
-
-  if (this.ws.binaryType === undefined) {
-    this.supportsBinary = false;
-  }
-
-  this.ws.binaryType = 'arraybuffer';
-  this.addEventListeners();
-};
-
-/**
- * Adds event listeners to the socket
- *
- * @api private
- */
-
-WS.prototype.addEventListeners = function(){
-  var self = this;
-
-  this.ws.onopen = function(){
-    self.onOpen();
-  };
-  this.ws.onclose = function(){
-    self.onClose();
-  };
-  this.ws.onmessage = function(ev){
-    self.onData(ev.data);
-  };
-  this.ws.onerror = function(e){
-    self.onError('websocket error', e);
-  };
-};
-
-/**
- * Override `onData` to use a timer on iOS.
- * See: https://gist.github.com/mloughran/2052006
- *
- * @api private
- */
-
-if ('undefined' != typeof navigator
-  && /iPad|iPhone|iPod/i.test(navigator.userAgent)) {
-  WS.prototype.onData = function(data){
-    var self = this;
-    setTimeout(function(){
-      Transport.prototype.onData.call(self, data);
-    }, 0);
-  };
-}
-
-/**
- * Writes data to socket.
- *
- * @param {Array} array of packets.
- * @api private
- */
-
-WS.prototype.write = function(packets){
-  var self = this;
-  this.writable = false;
-  // encodePacket efficient as it uses WS framing
-  // no need for encodePayload
-  for (var i = 0, l = packets.length; i < l; i++) {
-    parser.encodePacket(packets[i], this.supportsBinary, function(data) {
-      //Sometimes the websocket has already been closed but the browser didn't
-      //have a chance of informing us about it yet, in that case send will
-      //throw an error
-      try {
-        self.ws.send(data);
-      } catch (e){
-        debug('websocket closed before onclose event');
-      }
-    });
-  }
-
-  function ondrain() {
-    self.writable = true;
-    self.emit('drain');
-  }
-  // fake drain
-  // defer to next tick to allow Socket to clear writeBuffer
-  setTimeout(ondrain, 0);
-};
-
-/**
- * Called upon close
- *
- * @api private
- */
-
-WS.prototype.onClose = function(){
-  Transport.prototype.onClose.call(this);
-};
-
-/**
- * Closes socket.
- *
- * @api private
- */
-
-WS.prototype.doClose = function(){
-  if (typeof this.ws !== 'undefined') {
-    this.ws.close();
-  }
-};
-
-/**
- * Generates uri for connection.
- *
- * @api private
- */
-
-WS.prototype.uri = function(){
-  var query = this.query || {};
-  var schema = this.secure ? 'wss' : 'ws';
-  var port = '';
-
-  // avoid port if default for schema
-  if (this.port && (('wss' == schema && this.port != 443)
-    || ('ws' == schema && this.port != 80))) {
-    port = ':' + this.port;
-  }
-
-  // append timestamp to URI
-  if (this.timestampRequests) {
-    query[this.timestampParam] = +new Date;
-  }
-
-  // communicate binary support capabilities
-  if (!this.supportsBinary) {
-    query.b64 = 1;
-  }
-
-  query = parseqs.encode(query);
-
-  // prepend ? to query
-  if (query.length) {
-    query = '?' + query;
-  }
-
-  return schema + '://' + this.hostname + port + this.path + query;
-};
-
-/**
- * Feature detection for WebSocket.
- *
- * @return {Boolean} whether this transport is available.
- * @api public
- */
-
-WS.prototype.check = function(){
-  return !!WebSocket && !('__initialize' in WebSocket && this.name === WS.prototype.name);
-};
-
-},{"../transport":62,"component-inherit":57,"debug":69,"engine.io-parser":72,"parseqs":104,"ws":128}],68:[function(require,module,exports){
-// browser shim for xmlhttprequest module
-var hasCORS = require('has-cors');
-
-module.exports = function(opts) {
-  var xdomain = opts.xdomain;
-
-  // scheme must be same when usign XDomainRequest
-  // http://blogs.msdn.com/b/ieinternals/archive/2010/05/13/xdomainrequest-restrictions-limitations-and-workarounds.aspx
-  var xscheme = opts.xscheme;
-
-  // XDomainRequest has a flow of not sending cookie, therefore it should be disabled as a default.
-  // https://github.com/Automattic/engine.io-client/pull/217
-  var enablesXDR = opts.enablesXDR;
-
-  // XMLHttpRequest can be disabled on IE
-  try {
-    if ('undefined' != typeof XMLHttpRequest && (!xdomain || hasCORS)) {
-      return new XMLHttpRequest();
-    }
-  } catch (e) { }
-
-  // Use XDomainRequest for IE8 if enablesXDR is true
-  // because loading bar keeps flashing when using jsonp-polling
-  // https://github.com/yujiosaka/socke.io-ie8-loading-example
-  try {
-    if ('undefined' != typeof XDomainRequest && !xscheme && enablesXDR) {
-      return new XDomainRequest();
-    }
-  } catch (e) { }
-
-  if (!xdomain) {
-    try {
-      return new ActiveXObject('Microsoft.XMLHTTP');
-    } catch(e) { }
-  }
-}
-
-},{"has-cors":78}],69:[function(require,module,exports){
-
-/**
- * This is the web browser implementation of `debug()`.
- *
- * Expose `debug()` as the module.
- */
-
-exports = module.exports = require('./debug');
-exports.log = log;
-exports.formatArgs = formatArgs;
-exports.save = save;
-exports.load = load;
-exports.useColors = useColors;
-
-/**
- * Colors.
- */
-
-exports.colors = [
-  'lightseagreen',
-  'forestgreen',
-  'goldenrod',
-  'dodgerblue',
-  'darkorchid',
-  'crimson'
-];
-
-/**
- * Currently only WebKit-based Web Inspectors, Firefox >= v31,
- * and the Firebug extension (any Firefox version) are known
- * to support "%c" CSS customizations.
- *
- * TODO: add a `localStorage` variable to explicitly enable/disable colors
- */
-
-function useColors() {
-  // is webkit? http://stackoverflow.com/a/16459606/376773
-  return ('WebkitAppearance' in document.documentElement.style) ||
-    // is firebug? http://stackoverflow.com/a/398120/376773
-    (window.console && (console.firebug || (console.exception && console.table))) ||
-    // is firefox >= v31?
-    // https://developer.mozilla.org/en-US/docs/Tools/Web_Console#Styling_messages
-    (navigator.userAgent.toLowerCase().match(/firefox\/(\d+)/) && parseInt(RegExp.$1, 10) >= 31);
-}
-
-/**
- * Map %j to `JSON.stringify()`, since no Web Inspectors do that by default.
- */
-
-exports.formatters.j = function(v) {
-  return JSON.stringify(v);
-};
-
-
-/**
- * Colorize log arguments if enabled.
- *
- * @api public
- */
-
-function formatArgs() {
-  var args = arguments;
-  var useColors = this.useColors;
-
-  args[0] = (useColors ? '%c' : '')
-    + this.namespace
-    + (useColors ? ' %c' : ' ')
-    + args[0]
-    + (useColors ? '%c ' : ' ')
-    + '+' + exports.humanize(this.diff);
-
-  if (!useColors) return args;
-
-  var c = 'color: ' + this.color;
-  args = [args[0], c, 'color: inherit'].concat(Array.prototype.slice.call(args, 1));
-
-  // the final "%c" is somewhat tricky, because there could be other
-  // arguments passed either before or after the %c, so we need to
-  // figure out the correct index to insert the CSS into
-  var index = 0;
-  var lastC = 0;
-  args[0].replace(/%[a-z%]/g, function(match) {
-    if ('%%' === match) return;
-    index++;
-    if ('%c' === match) {
-      // we only are interested in the *last* %c
-      // (the user may have provided their own)
-      lastC = index;
-    }
-  });
-
-  args.splice(lastC, 0, c);
-  return args;
-}
-
-/**
- * Invokes `console.log()` when available.
- * No-op when `console.log` is not a "function".
- *
- * @api public
- */
-
-function log() {
-  // This hackery is required for IE8,
-  // where the `console.log` function doesn't have 'apply'
-  return 'object' == typeof console
-    && 'function' == typeof console.log
-    && Function.prototype.apply.call(console.log, console, arguments);
-}
-
-/**
- * Save `namespaces`.
- *
- * @param {String} namespaces
- * @api private
- */
-
-function save(namespaces) {
-  try {
-    if (null == namespaces) {
-      localStorage.removeItem('debug');
-    } else {
-      localStorage.debug = namespaces;
-    }
-  } catch(e) {}
-}
-
-/**
- * Load `namespaces`.
- *
- * @return {String} returns the previously persisted debug modes
- * @api private
- */
-
-function load() {
-  var r;
-  try {
-    r = localStorage.debug;
-  } catch(e) {}
-  return r;
-}
-
-/**
- * Enable namespaces listed in `localStorage.debug` initially.
- */
-
-exports.enable(load());
-
-},{"./debug":70}],70:[function(require,module,exports){
-
-/**
- * This is the common logic for both the Node.js and web browser
- * implementations of `debug()`.
- *
- * Expose `debug()` as the module.
- */
-
-exports = module.exports = debug;
-exports.coerce = coerce;
-exports.disable = disable;
-exports.enable = enable;
-exports.enabled = enabled;
-exports.humanize = require('ms');
-
-/**
- * The currently active debug mode names, and names to skip.
- */
-
-exports.names = [];
-exports.skips = [];
-
-/**
- * Map of special "%n" handling functions, for the debug "format" argument.
- *
- * Valid key names are a single, lowercased letter, i.e. "n".
- */
-
-exports.formatters = {};
-
-/**
- * Previously assigned color.
- */
-
-var prevColor = 0;
-
-/**
- * Previous log timestamp.
- */
-
-var prevTime;
-
-/**
- * Select a color.
- *
- * @return {Number}
- * @api private
- */
-
-function selectColor() {
-  return exports.colors[prevColor++ % exports.colors.length];
-}
-
-/**
- * Create a debugger with the given `namespace`.
- *
- * @param {String} namespace
- * @return {Function}
- * @api public
- */
-
-function debug(namespace) {
-
-  // define the `disabled` version
-  function disabled() {
-  }
-  disabled.enabled = false;
-
-  // define the `enabled` version
-  function enabled() {
-
-    var self = enabled;
-
-    // set `diff` timestamp
-    var curr = +new Date();
-    var ms = curr - (prevTime || curr);
-    self.diff = ms;
-    self.prev = prevTime;
-    self.curr = curr;
-    prevTime = curr;
-
-    // add the `color` if not set
-    if (null == self.useColors) self.useColors = exports.useColors();
-    if (null == self.color && self.useColors) self.color = selectColor();
-
-    var args = Array.prototype.slice.call(arguments);
-
-    args[0] = exports.coerce(args[0]);
-
-    if ('string' !== typeof args[0]) {
-      // anything else let's inspect with %o
-      args = ['%o'].concat(args);
-    }
-
-    // apply any `formatters` transformations
-    var index = 0;
-    args[0] = args[0].replace(/%([a-z%])/g, function(match, format) {
-      // if we encounter an escaped % then don't increase the array index
-      if (match === '%%') return match;
-      index++;
-      var formatter = exports.formatters[format];
-      if ('function' === typeof formatter) {
-        var val = args[index];
-        match = formatter.call(self, val);
-
-        // now we need to remove `args[index]` since it's inlined in the `format`
-        args.splice(index, 1);
-        index--;
-      }
-      return match;
-    });
-
-    if ('function' === typeof exports.formatArgs) {
-      args = exports.formatArgs.apply(self, args);
-    }
-    var logFn = enabled.log || exports.log || console.log.bind(console);
-    logFn.apply(self, args);
-  }
-  enabled.enabled = true;
-
-  var fn = exports.enabled(namespace) ? enabled : disabled;
-
-  fn.namespace = namespace;
-
-  return fn;
-}
-
-/**
- * Enables a debug mode by namespaces. This can include modes
- * separated by a colon and wildcards.
- *
- * @param {String} namespaces
- * @api public
- */
-
-function enable(namespaces) {
-  exports.save(namespaces);
-
-  var split = (namespaces || '').split(/[\s,]+/);
-  var len = split.length;
-
-  for (var i = 0; i < len; i++) {
-    if (!split[i]) continue; // ignore empty strings
-    namespaces = split[i].replace(/\*/g, '.*?');
-    if (namespaces[0] === '-') {
-      exports.skips.push(new RegExp('^' + namespaces.substr(1) + '$'));
-    } else {
-      exports.names.push(new RegExp('^' + namespaces + '$'));
-    }
-  }
-}
-
-/**
- * Disable debug output.
- *
- * @api public
- */
-
-function disable() {
-  exports.enable('');
-}
-
-/**
- * Returns true if the given mode name is enabled, false otherwise.
- *
- * @param {String} name
- * @return {Boolean}
- * @api public
- */
-
-function enabled(name) {
-  var i, len;
-  for (i = 0, len = exports.skips.length; i < len; i++) {
-    if (exports.skips[i].test(name)) {
-      return false;
-    }
-  }
-  for (i = 0, len = exports.names.length; i < len; i++) {
-    if (exports.names[i].test(name)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Coerce `val`.
- *
- * @param {Mixed} val
- * @return {Mixed}
- * @api private
- */
-
-function coerce(val) {
-  if (val instanceof Error) return val.stack || val.message;
-  return val;
-}
-
-},{"ms":85}],71:[function(require,module,exports){
-/**
- * Parses an URI
- *
- * @author Steven Levithan <stevenlevithan.com> (MIT license)
- * @api private
- */
-
-var re = /^(?:(?![^:@]+:[^:@\/]*@)(http|https|ws|wss):\/\/)?((?:(([^:@]*)(?::([^:@]*))?)?@)?((?:[a-f0-9]{0,4}:){2,7}[a-f0-9]{0,4}|[^:\/?#]*)(?::(\d*))?)(((\/(?:[^?#](?![^?#\/]*\.[^?#\/.]+(?:[?#]|$)))*\/?)?([^?#\/]*))(?:\?([^#]*))?(?:#(.*))?)/;
-
-var parts = [
-    'source', 'protocol', 'authority', 'userInfo', 'user', 'password', 'host', 'port', 'relative', 'path', 'directory', 'file', 'query', 'anchor'
-];
-
-module.exports = function parseuri(str) {
-    var src = str,
-        b = str.indexOf('['),
-        e = str.indexOf(']');
-
-    if (b != -1 && e != -1) {
-        str = str.substring(0, b) + str.substring(b, e).replace(/:/g, ';') + str.substring(e, str.length);
-    }
-
-    var m = re.exec(str || ''),
-        uri = {},
-        i = 14;
-
-    while (i--) {
-        uri[parts[i]] = m[i] || '';
-    }
-
-    if (b != -1 && e != -1) {
-        uri.source = src;
-        uri.host = uri.host.substring(1, uri.host.length - 1).replace(/;/g, ':');
-        uri.authority = uri.authority.replace('[', '').replace(']', '').replace(/;/g, ':');
-        uri.ipv6uri = true;
-    }
-
-    return uri;
-};
-
-},{}],72:[function(require,module,exports){
-(function (global){
-/**
- * Module dependencies.
- */
-
-var keys = require('./keys');
-var hasBinary = require('has-binary');
-var sliceBuffer = require('arraybuffer.slice');
-var base64encoder = require('base64-arraybuffer');
-var after = require('after');
-var utf8 = require('utf8');
-
-/**
- * Check if we are running an android browser. That requires us to use
- * ArrayBuffer with polling transports...
- *
- * http://ghinda.net/jpeg-blob-ajax-android/
- */
-
-var isAndroid = navigator.userAgent.match(/Android/i);
-
-/**
- * Check if we are running in PhantomJS.
- * Uploading a Blob with PhantomJS does not work correctly, as reported here:
- * https://github.com/ariya/phantomjs/issues/11395
- * @type boolean
- */
-var isPhantomJS = /PhantomJS/i.test(navigator.userAgent);
-
-/**
- * When true, avoids using Blobs to encode payloads.
- * @type boolean
- */
-var dontSendBlobs = isAndroid || isPhantomJS;
-
-/**
- * Current protocol version.
- */
-
-exports.protocol = 3;
-
-/**
- * Packet types.
- */
-
-var packets = exports.packets = {
-    open:     0    // non-ws
-  , close:    1    // non-ws
-  , ping:     2
-  , pong:     3
-  , message:  4
-  , upgrade:  5
-  , noop:     6
-};
-
-var packetslist = keys(packets);
-
-/**
- * Premade error packet.
- */
-
-var err = { type: 'error', data: 'parser error' };
-
-/**
- * Create a blob api even for blob builder when vendor prefixes exist
- */
-
-var Blob = require('blob');
-
-/**
- * Encodes a packet.
- *
- *     <packet type id> [ <data> ]
- *
- * Example:
- *
- *     5hello world
- *     3
- *     4
- *
- * Binary is encoded in an identical principle
- *
- * @api private
- */
-
-exports.encodePacket = function (packet, supportsBinary, utf8encode, callback) {
-  if ('function' == typeof supportsBinary) {
-    callback = supportsBinary;
-    supportsBinary = false;
-  }
-
-  if ('function' == typeof utf8encode) {
-    callback = utf8encode;
-    utf8encode = null;
-  }
-
-  var data = (packet.data === undefined)
-    ? undefined
-    : packet.data.buffer || packet.data;
-
-  if (global.ArrayBuffer && data instanceof ArrayBuffer) {
-    return encodeArrayBuffer(packet, supportsBinary, callback);
-  } else if (Blob && data instanceof global.Blob) {
-    return encodeBlob(packet, supportsBinary, callback);
-  }
-
-  // might be an object with { base64: true, data: dataAsBase64String }
-  if (data && data.base64) {
-    return encodeBase64Object(packet, callback);
-  }
-
-  // Sending data as a utf-8 string
-  var encoded = packets[packet.type];
-
-  // data fragment is optional
-  if (undefined !== packet.data) {
-    encoded += utf8encode ? utf8.encode(String(packet.data)) : String(packet.data);
-  }
-
-  return callback('' + encoded);
-
-};
-
-function encodeBase64Object(packet, callback) {
-  // packet data is an object { base64: true, data: dataAsBase64String }
-  var message = 'b' + exports.packets[packet.type] + packet.data.data;
-  return callback(message);
-}
-
-/**
- * Encode packet helpers for binary types
- */
-
-function encodeArrayBuffer(packet, supportsBinary, callback) {
-  if (!supportsBinary) {
-    return exports.encodeBase64Packet(packet, callback);
-  }
-
-  var data = packet.data;
-  var contentArray = new Uint8Array(data);
-  var resultBuffer = new Uint8Array(1 + data.byteLength);
-
-  resultBuffer[0] = packets[packet.type];
-  for (var i = 0; i < contentArray.length; i++) {
-    resultBuffer[i+1] = contentArray[i];
-  }
-
-  return callback(resultBuffer.buffer);
-}
-
-function encodeBlobAsArrayBuffer(packet, supportsBinary, callback) {
-  if (!supportsBinary) {
-    return exports.encodeBase64Packet(packet, callback);
-  }
-
-  var fr = new FileReader();
-  fr.onload = function() {
-    packet.data = fr.result;
-    exports.encodePacket(packet, supportsBinary, true, callback);
-  };
-  return fr.readAsArrayBuffer(packet.data);
-}
-
-function encodeBlob(packet, supportsBinary, callback) {
-  if (!supportsBinary) {
-    return exports.encodeBase64Packet(packet, callback);
-  }
-
-  if (dontSendBlobs) {
-    return encodeBlobAsArrayBuffer(packet, supportsBinary, callback);
-  }
-
-  var length = new Uint8Array(1);
-  length[0] = packets[packet.type];
-  var blob = new Blob([length.buffer, packet.data]);
-
-  return callback(blob);
-}
-
-/**
- * Encodes a packet with binary data in a base64 string
- *
- * @param {Object} packet, has `type` and `data`
- * @return {String} base64 encoded message
- */
-
-exports.encodeBase64Packet = function(packet, callback) {
-  var message = 'b' + exports.packets[packet.type];
-  if (Blob && packet.data instanceof Blob) {
-    var fr = new FileReader();
-    fr.onload = function() {
-      var b64 = fr.result.split(',')[1];
-      callback(message + b64);
-    };
-    return fr.readAsDataURL(packet.data);
-  }
-
-  var b64data;
-  try {
-    b64data = String.fromCharCode.apply(null, new Uint8Array(packet.data));
-  } catch (e) {
-    // iPhone Safari doesn't let you apply with typed arrays
-    var typed = new Uint8Array(packet.data);
-    var basic = new Array(typed.length);
-    for (var i = 0; i < typed.length; i++) {
-      basic[i] = typed[i];
-    }
-    b64data = String.fromCharCode.apply(null, basic);
-  }
-  message += global.btoa(b64data);
-  return callback(message);
-};
-
-/**
- * Decodes a packet. Changes format to Blob if requested.
- *
- * @return {Object} with `type` and `data` (if any)
- * @api private
- */
-
-exports.decodePacket = function (data, binaryType, utf8decode) {
-  // String data
-  if (typeof data == 'string' || data === undefined) {
-    if (data.charAt(0) == 'b') {
-      return exports.decodeBase64Packet(data.substr(1), binaryType);
-    }
-
-    if (utf8decode) {
-      try {
-        data = utf8.decode(data);
-      } catch (e) {
-        return err;
-      }
-    }
-    var type = data.charAt(0);
-
-    if (Number(type) != type || !packetslist[type]) {
-      return err;
-    }
-
-    if (data.length > 1) {
-      return { type: packetslist[type], data: data.substring(1) };
-    } else {
-      return { type: packetslist[type] };
-    }
-  }
-
-  var asArray = new Uint8Array(data);
-  var type = asArray[0];
-  var rest = sliceBuffer(data, 1);
-  if (Blob && binaryType === 'blob') {
-    rest = new Blob([rest]);
-  }
-  return { type: packetslist[type], data: rest };
-};
-
-/**
- * Decodes a packet encoded in a base64 string
- *
- * @param {String} base64 encoded message
- * @return {Object} with `type` and `data` (if any)
- */
-
-exports.decodeBase64Packet = function(msg, binaryType) {
-  var type = packetslist[msg.charAt(0)];
-  if (!global.ArrayBuffer) {
-    return { type: type, data: { base64: true, data: msg.substr(1) } };
-  }
-
-  var data = base64encoder.decode(msg.substr(1));
-
-  if (binaryType === 'blob' && Blob) {
-    data = new Blob([data]);
-  }
-
-  return { type: type, data: data };
-};
-
-/**
- * Encodes multiple messages (payload).
- *
- *     <length>:data
- *
- * Example:
- *
- *     11:hello world2:hi
- *
- * If any contents are binary, they will be encoded as base64 strings. Base64
- * encoded strings are marked with a b before the length specifier
- *
- * @param {Array} packets
- * @api private
- */
-
-exports.encodePayload = function (packets, supportsBinary, callback) {
-  if (typeof supportsBinary == 'function') {
-    callback = supportsBinary;
-    supportsBinary = null;
-  }
-
-  var isBinary = hasBinary(packets);
-
-  if (supportsBinary && isBinary) {
-    if (Blob && !dontSendBlobs) {
-      return exports.encodePayloadAsBlob(packets, callback);
-    }
-
-    return exports.encodePayloadAsArrayBuffer(packets, callback);
-  }
-
-  if (!packets.length) {
-    return callback('0:');
-  }
-
-  function setLengthHeader(message) {
-    return message.length + ':' + message;
-  }
-
-  function encodeOne(packet, doneCallback) {
-    exports.encodePacket(packet, !isBinary ? false : supportsBinary, true, function(message) {
-      doneCallback(null, setLengthHeader(message));
-    });
-  }
-
-  map(packets, encodeOne, function(err, results) {
-    return callback(results.join(''));
-  });
-};
-
-/**
- * Async array map using after
- */
-
-function map(ary, each, done) {
-  var result = new Array(ary.length);
-  var next = after(ary.length, done);
-
-  var eachWithIndex = function(i, el, cb) {
-    each(el, function(error, msg) {
-      result[i] = msg;
-      cb(error, result);
-    });
-  };
-
-  for (var i = 0; i < ary.length; i++) {
-    eachWithIndex(i, ary[i], next);
-  }
-}
-
-/*
- * Decodes data when a payload is maybe expected. Possible binary contents are
- * decoded from their base64 representation
- *
- * @param {String} data, callback method
- * @api public
- */
-
-exports.decodePayload = function (data, binaryType, callback) {
-  if (typeof data != 'string') {
-    return exports.decodePayloadAsBinary(data, binaryType, callback);
-  }
-
-  if (typeof binaryType === 'function') {
-    callback = binaryType;
-    binaryType = null;
-  }
-
-  var packet;
-  if (data == '') {
-    // parser error - ignoring payload
-    return callback(err, 0, 1);
-  }
-
-  var length = ''
-    , n, msg;
-
-  for (var i = 0, l = data.length; i < l; i++) {
-    var chr = data.charAt(i);
-
-    if (':' != chr) {
-      length += chr;
-    } else {
-      if ('' == length || (length != (n = Number(length)))) {
-        // parser error - ignoring payload
-        return callback(err, 0, 1);
-      }
-
-      msg = data.substr(i + 1, n);
-
-      if (length != msg.length) {
-        // parser error - ignoring payload
-        return callback(err, 0, 1);
-      }
-
-      if (msg.length) {
-        packet = exports.decodePacket(msg, binaryType, true);
-
-        if (err.type == packet.type && err.data == packet.data) {
-          // parser error in individual packet - ignoring payload
-          return callback(err, 0, 1);
-        }
-
-        var ret = callback(packet, i + n, l);
-        if (false === ret) return;
-      }
-
-      // advance cursor
-      i += n;
-      length = '';
-    }
-  }
-
-  if (length != '') {
-    // parser error - ignoring payload
-    return callback(err, 0, 1);
-  }
-
-};
-
-/**
- * Encodes multiple messages (payload) as binary.
- *
- * <1 = binary, 0 = string><number from 0-9><number from 0-9>[...]<number
- * 255><data>
- *
- * Example:
- * 1 3 255 1 2 3, if the binary contents are interpreted as 8 bit integers
- *
- * @param {Array} packets
- * @return {ArrayBuffer} encoded payload
- * @api private
- */
-
-exports.encodePayloadAsArrayBuffer = function(packets, callback) {
-  if (!packets.length) {
-    return callback(new ArrayBuffer(0));
-  }
-
-  function encodeOne(packet, doneCallback) {
-    exports.encodePacket(packet, true, true, function(data) {
-      return doneCallback(null, data);
-    });
-  }
-
-  map(packets, encodeOne, function(err, encodedPackets) {
-    var totalLength = encodedPackets.reduce(function(acc, p) {
-      var len;
-      if (typeof p === 'string'){
-        len = p.length;
-      } else {
-        len = p.byteLength;
-      }
-      return acc + len.toString().length + len + 2; // string/binary identifier + separator = 2
-    }, 0);
-
-    var resultArray = new Uint8Array(totalLength);
-
-    var bufferIndex = 0;
-    encodedPackets.forEach(function(p) {
-      var isString = typeof p === 'string';
-      var ab = p;
-      if (isString) {
-        var view = new Uint8Array(p.length);
-        for (var i = 0; i < p.length; i++) {
-          view[i] = p.charCodeAt(i);
-        }
-        ab = view.buffer;
-      }
-
-      if (isString) { // not true binary
-        resultArray[bufferIndex++] = 0;
-      } else { // true binary
-        resultArray[bufferIndex++] = 1;
-      }
-
-      var lenStr = ab.byteLength.toString();
-      for (var i = 0; i < lenStr.length; i++) {
-        resultArray[bufferIndex++] = parseInt(lenStr[i]);
-      }
-      resultArray[bufferIndex++] = 255;
-
-      var view = new Uint8Array(ab);
-      for (var i = 0; i < view.length; i++) {
-        resultArray[bufferIndex++] = view[i];
-      }
-    });
-
-    return callback(resultArray.buffer);
-  });
-};
-
-/**
- * Encode as Blob
- */
-
-exports.encodePayloadAsBlob = function(packets, callback) {
-  function encodeOne(packet, doneCallback) {
-    exports.encodePacket(packet, true, true, function(encoded) {
-      var binaryIdentifier = new Uint8Array(1);
-      binaryIdentifier[0] = 1;
-      if (typeof encoded === 'string') {
-        var view = new Uint8Array(encoded.length);
-        for (var i = 0; i < encoded.length; i++) {
-          view[i] = encoded.charCodeAt(i);
-        }
-        encoded = view.buffer;
-        binaryIdentifier[0] = 0;
-      }
-
-      var len = (encoded instanceof ArrayBuffer)
-        ? encoded.byteLength
-        : encoded.size;
-
-      var lenStr = len.toString();
-      var lengthAry = new Uint8Array(lenStr.length + 1);
-      for (var i = 0; i < lenStr.length; i++) {
-        lengthAry[i] = parseInt(lenStr[i]);
-      }
-      lengthAry[lenStr.length] = 255;
-
-      if (Blob) {
-        var blob = new Blob([binaryIdentifier.buffer, lengthAry.buffer, encoded]);
-        doneCallback(null, blob);
-      }
-    });
-  }
-
-  map(packets, encodeOne, function(err, results) {
-    return callback(new Blob(results));
-  });
-};
-
-/*
- * Decodes data when a payload is maybe expected. Strings are decoded by
- * interpreting each byte as a key code for entries marked to start with 0. See
- * description of encodePayloadAsBinary
- *
- * @param {ArrayBuffer} data, callback method
- * @api public
- */
-
-exports.decodePayloadAsBinary = function (data, binaryType, callback) {
-  if (typeof binaryType === 'function') {
-    callback = binaryType;
-    binaryType = null;
-  }
-
-  var bufferTail = data;
-  var buffers = [];
-
-  var numberTooLong = false;
-  while (bufferTail.byteLength > 0) {
-    var tailArray = new Uint8Array(bufferTail);
-    var isString = tailArray[0] === 0;
-    var msgLength = '';
-
-    for (var i = 1; ; i++) {
-      if (tailArray[i] == 255) break;
-
-      if (msgLength.length > 310) {
-        numberTooLong = true;
+// Get script object based on the `src` URL
+function getScriptFromUrl(url, eligibleScripts) {
+  var i,
+      script = null;
+
+  eligibleScripts = eligibleScripts || scripts;
+
+  if (typeof url === "string" && url) {
+    for (i = eligibleScripts.length; i--; ) {
+      if (eligibleScripts[i].src === url) {
+        // NOTE: Could check if the same script URL is used by more than one `script` element
+        // here... but let's not. That would yield less useful results in "loose" detection. ;)
+        script = eligibleScripts[i];
         break;
       }
-
-      msgLength += tailArray[i];
-    }
-
-    if(numberTooLong) return callback(err, 0, 1);
-
-    bufferTail = sliceBuffer(bufferTail, 2 + msgLength.length);
-    msgLength = parseInt(msgLength);
-
-    var msg = sliceBuffer(bufferTail, 0, msgLength);
-    if (isString) {
-      try {
-        msg = String.fromCharCode.apply(null, new Uint8Array(msg));
-      } catch (e) {
-        // iPhone Safari doesn't let you apply to typed arrays
-        var typed = new Uint8Array(msg);
-        msg = '';
-        for (var i = 0; i < typed.length; i++) {
-          msg += String.fromCharCode(typed[i]);
-        }
-      }
-    }
-
-    buffers.push(msg);
-    bufferTail = sliceBuffer(bufferTail, msgLength);
-  }
-
-  var total = buffers.length;
-  buffers.forEach(function(buffer, i) {
-    callback(exports.decodePacket(buffer, binaryType, true), i, total);
-  });
-};
-
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-
-},{"./keys":73,"after":48,"arraybuffer.slice":49,"base64-arraybuffer":52,"blob":53,"has-binary":74,"utf8":127}],73:[function(require,module,exports){
-
-/**
- * Gets the keys for an object.
- *
- * @return {Array} keys
- * @api private
- */
-
-module.exports = Object.keys || function keys (obj){
-  var arr = [];
-  var has = Object.prototype.hasOwnProperty;
-
-  for (var i in obj) {
-    if (has.call(obj, i)) {
-      arr.push(i);
     }
   }
-  return arr;
-};
-
-},{}],74:[function(require,module,exports){
-(function (global){
-
-/*
- * Module requirements.
- */
-
-var isArray = require('isarray');
-
-/**
- * Module exports.
- */
-
-module.exports = hasBinary;
-
-/**
- * Checks for binary data.
- *
- * Right now only Buffer and ArrayBuffer are supported..
- *
- * @param {Object} anything
- * @api public
- */
-
-function hasBinary(data) {
-
-  function _hasBinary(obj) {
-    if (!obj) return false;
-
-    if ( (global.Buffer && global.Buffer.isBuffer(obj)) ||
-         (global.ArrayBuffer && obj instanceof ArrayBuffer) ||
-         (global.Blob && obj instanceof Blob) ||
-         (global.File && obj instanceof File)
-        ) {
-      return true;
-    }
-
-    if (isArray(obj)) {
-      for (var i = 0; i < obj.length; i++) {
-          if (_hasBinary(obj[i])) {
-              return true;
-          }
-      }
-    } else if (obj && 'object' == typeof obj) {
-      if (obj.toJSON) {
-        obj = obj.toJSON();
-      }
-
-      for (var key in obj) {
-        if (obj.hasOwnProperty(key) && _hasBinary(obj[key])) {
-          return true;
-        }
-      }
-    }
-
-    return false;
-  }
-
-  return _hasBinary(data);
+  return script;
 }
 
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+// Get script object based on the caller function's source code body (text)
+function getInlineScriptFromCallerSource(callerFnSource, eligibleScripts) {
+  var i, inlineScriptText,
+      script = null,
+      callerSourceText = normalizeWhitespace(callerFnSource);
 
-},{"isarray":80}],75:[function(require,module,exports){
+  eligibleScripts = eligibleScripts || scripts;
+
+  if (callerFnSource && callerSourceText) {
+    for (i = eligibleScripts.length; i--; ) {
+      // Only look at inline scripts
+      if (!eligibleScripts[i].hasAttribute("src")) {
+        inlineScriptText = normalizeWhitespace(eligibleScripts[i].text);
+        if (inlineScriptText.indexOf(callerSourceText) !== -1) {
+          // If more than one match is found, don't return any
+          if (script) {
+            script = null;
+            break;
+          }
+          script = eligibleScripts[i];
+        }
+      }
+    }
+  }
+
+  return script;
+}
+
+// If there is only a single inline script on the page, return it; otherwise `null`
+function getSoleInlineScript(eligibleScripts) {
+  var i, len,
+      script = null;
+  eligibleScripts = eligibleScripts || scripts;
+  for (i = 0, len = eligibleScripts.length; i < len; i++) {
+    if (!eligibleScripts[i].hasAttribute("src")) {
+      if (script) {
+        script = null;
+        break;
+      }
+      script = eligibleScripts[i];
+    }
+  }
+  return script;
+}
+
+// Get the currently executing script URL from an Error stack trace
+function getScriptUrlFromStack(stack, skipStackDepth) {
+  var matches, remainingStack,
+      url = null,
+      ignoreMessage = typeof skipStackDepth === "number";
+  skipStackDepth = ignoreMessage ? Math.round(skipStackDepth) : 0;
+  if (typeof stack === "string" && stack) {
+    if (ignoreMessage) {
+      matches = stack.match(/(data:text\/javascript(?:;[^,]+)?,.+?|(?:|blob:)(?:http[s]?|file):\/\/[\/]?.+?\/[^:\)]*?)(?::\d+)(?::\d+)?/);
+    }
+    else {
+      matches = stack.match(/^(?:|[^:@]*@|.+\)@(?=data:text\/javascript|blob|http[s]?|file)|.+?\s+(?: at |@)(?:[^:\(]+ )*[\(]?)(data:text\/javascript(?:;[^,]+)?,.+?|(?:|blob:)(?:http[s]?|file):\/\/[\/]?.+?\/[^:\)]*?)(?::\d+)(?::\d+)?/);
+
+      if (!(matches && matches[1])) {
+        matches = stack.match(/\)@(data:text\/javascript(?:;[^,]+)?,.+?|(?:|blob:)(?:http[s]?|file):\/\/[\/]?.+?\/[^:\)]*?)(?::\d+)(?::\d+)?/);
+      }
+    }
+
+    if (matches && matches[1]) {
+      if (skipStackDepth > 0) {
+        remainingStack = stack.slice(stack.indexOf(matches[0]) + matches[0].length);
+        url = getScriptUrlFromStack(remainingStack, (skipStackDepth - 1));
+      }
+      else {
+        url = matches[1];
+      }
+    }
+
+    // TODO: Handle more edge cases!
+    // Fixes #1
+    // See https://github.com/JamesMGreene/currentExecutingScript/issues/1
+
+    // ???
+
+  }
+  return url;
+}
+
+
+// Get the farthest currently executing (i.e. yes, EXECUTING) `script` DOM
+// element for the caller function, regardless of whether it is that `script`
+// DOM element is currently being evaluated for the first time. The farthest
+// currently executing `script` DOM element would typically be considered the
+// originator of the current execution stack.
+function _farthestExecutingScript() {
+  /*jshint noarg:false */
+
+  // TODO: Implement!
+  // Fixes #3
+  // See https://github.com/JamesMGreene/currentExecutingScript/issues/3
+  return null;
+
+/*
+  // Yes, this IS possible, i.e. if a script removes other scripts (or itself)
+  if (scripts.length === 0) {
+    return null;
+  }
+
+  // Guaranteed accurate in IE 6-10.
+  // Not accurate/supported in any other browsers.
+  if (isNotOpera && supportsScriptReadyState) {
+    for (var i = scripts.length; i--; ) {
+      if (scripts[i].readyState === "interactive") {
+        return scripts[i];
+      }
+    }
+  }
+
+  var stack,
+      e = new Error();
+  if (hasStackBeforeThrowing) {
+    stack = e.stack;
+  }
+  if (!stack && hasStackAfterThrowing) {
+    try {
+      throw e;
+    }
+    catch (err) {
+      // NOTE: Cannot use `err.sourceURL` or `err.fileName` as they will always be THIS script
+      stack = err.stack;
+    }
+  }
+  if (stack) {
+    var url = getScriptUrlFromStack(stack, skipStackDepth);
+    var script = getScriptFromUrl(url, scripts );
+    if (!script && pageUrl && url === pageUrl) {
+      // Try to find the correct inline script by searching through
+      // inline scripts' text content for the caller function's source
+      // code to be present. If the caller function's source code is
+      // not available, see if there is only one inline script element
+      // in the DOM and return that (even though it may be wrong)
+
+      // TODO: Implement!
+      // Fixes #4 in part
+      // See https://github.com/JamesMGreene/currentExecutingScript/issues/4
+
+      var callerFn = _farthestExecutingScript.caller || null,
+          callerFnStack = [],
+          callerFnSource = null;
+
+      while (callerFn) {
+        callerFnStack.push(callerFn);
+        callerFn = callerFn.caller || null;
+      }
+      callerFn = callerFnStack.slice(-1)[0];
+      callerFnSource = callerFn ? ("" + callerFn) : null;
+
+
+      if (callerFnSource) {
+        script = getInlineScriptFromCallerSource(callerFnSource);
+      }
+      else {
+        // NOTE: This is a loose assumption that could be inaccurate!
+        //
+        // Inaccuracies:
+        //  - If the inline script that initiated the call was also removed from the DOM.
+        //  - If the call was initiated by an element's inline event handler,
+        //    e.g. `<a onclick="(function() { alert(currentExecutingScript()); }()">click</a>`
+        script = getSoleInlineScript();
+      }
+    }
+    return script;
+  }
+
+  // NOTE: This is a loose assumption that could be inaccurate!
+  //
+  // Inaccuracies:
+  //  - If a script is created dynamically and appended to some position
+  //    other than the very end of the document.
+  //  - If multiple scripts are created dynamically and all appended to the
+  //    same position within the document (and do not have their `async` attributes
+  //    set to `false`, at least in browsers that support async script evaluation.
+  //    other than the very end of the document.
+  //  - If any scripts are added with the `async` attribute set to `true` in a browser
+  //    that supports it.
+  //  - May get confused by `script` elements within `svg` elements
+  return scripts[scripts.length - 1] || null;
+*/
+}
+
+
+// Get the originating currently executing (i.e. yes, EXECUTING) `script` DOM
+// element or attribute node (e.g. `onclick`) for the caller function,
+// regardless of whether it is that `script` DOM element is currently being
+// evaluated for the first time. The originating currently executing `script`
+// DOM element [or attribute node] is the originator of the current execution stack.
+function _originatingExecutingScript() {
+  // TODO: Implement!
+  // Fixes #2
+  // See https://github.com/JamesMGreene/currentExecutingScript/issues/2
+  return null;
+}
+
+// Get the nearest currently executing (i.e. yes, EXECUTING) `script` DOM
+// element for the caller function, regardless of whether it is that `script`
+// DOM element is currently being evaluated for the first time.
+function _nearestExecutingScript() {
+  /*jshint noarg:false */
+
+  // Yes, this IS possible, i.e. if a script removes other scripts (or itself)
+  if (scripts.length === 0) {
+    return null;
+  }
+
+  var i, e, stack, url, script,
+      eligibleScripts = [],
+      skipStackDepth = _nearestExecutingScript.skipStackDepth || 1,
+
+      // TODO: Implement!
+      // Fixes #4 in part
+      // See https://github.com/JamesMGreene/currentExecutingScript/issues/4
+      callerFnSource = null;  //("" + (_nearestExecutingScript.caller || "")) || null;
+
+  // This part will only help in IE 6-10.
+  for (i = 0; i < scripts.length; i++) {
+    if (isNotOpera && supportsScriptReadyState) {
+      if (scriptReadyRegex.test(scripts[i].readyState)) {
+        eligibleScripts.push(scripts[i]);
+      }
+    }
+    else {
+      eligibleScripts.push(scripts[i]);
+    }
+  }
+
+  e = new Error();
+  if (hasStackBeforeThrowing) {
+    stack = e.stack;
+  }
+  if (!stack && hasStackAfterThrowing) {
+    try {
+      throw e;
+    }
+    catch (err) {
+      // NOTE: Cannot use `err.sourceURL` or `err.fileName` as they will always be THIS script
+      stack = err.stack;
+    }
+  }
+
+  if (stack) {
+    url = getScriptUrlFromStack(stack, skipStackDepth);
+    script = getScriptFromUrl(url, eligibleScripts);
+
+    if (!script && pageUrl && url === pageUrl) {
+      // Try to find the correct inline script by searching through
+      // inline scripts' text content for the caller function's source
+      // code to be present.
+      if (callerFnSource) {
+        script = getInlineScriptFromCallerSource(callerFnSource, eligibleScripts);
+      }
+      // If the caller function's source code is not available, see if
+      // there is only one inline script element in the DOM and return
+      // that (even though it may be wrong)...
+      else {
+        // NOTE: This is a loose assumption that could be inaccurate!
+        //
+        // Inaccuracies:
+        //  - If the inline script that initiated the call was also removed from the DOM.
+        //  - If the call was initiated by an element's inline event handler,
+        //    e.g. `<a onclick="(function() { alert(currentExecutingScript()); }()">click</a>`
+        script = getSoleInlineScript(eligibleScripts);
+      }
+    }
+  }
+
+  //
+  // Welcome to the Island of Inaccurate Assumptions!
+  // NOTE: ALL of the following are loose assumptions that could be inaccurate!
+  //
+
+  if (!script) {
+    // Inaccuracies:
+    //  - If the inline script that initiated the call was also removed from the DOM.
+    //  - If the call was initiated by an element's inline event handler,
+    //    e.g. `<a onclick="(function() { alert(currentExecutingScript()); }()">click</a>`
+    if (eligibleScripts.length === 1) {
+      script = eligibleScripts[0];
+    }
+  }
+
+  if (!script) {
+    // Inaccuracies:
+    //  - If script currently being synchronously evaluated by the parser is the
+    //    originator of this call stack but NOT the source script of the caller/invocation
+    //    e.g.
+    //    ```html
+    //    <script id="a">
+    //    function getCurrentScriptCallerFn() {
+    //      return currentExecutingScript.near();
+    //    }
+    //    </script>
+    //    <script id="b">
+    //    // Should get `script[id="a"]` but will get `script[id="b"]` instead
+    //    getCurrentScriptCallerFn();
+    //    </script>
+    if (hasNativeCurrentScriptAccessor) {
+      script = document.currentScript;
+    }
+  }
+
+  if (!script) {
+    // Inaccuracies:
+    //  - If script currently being synchronously evaluated by the parser is the
+    //    originator of this call stack but NOT the source script of the caller/invocation
+    //    e.g.
+    //    ```html
+    //    <script id="a">
+    //    function getCurrentScriptCallerFn() {
+    //      return currentExecutingScript.near();
+    //    }
+    //    </script>
+    //    <script id="b">
+    //    // Should get `script[id="a"]` but will get `script[id="b"]` instead
+    //    getCurrentScriptCallerFn();
+    //    </script>
+    if (isNotOpera && supportsScriptReadyState) {
+      for (i = eligibleScripts.length; i--; ) {
+        if (eligibleScripts[i].readyState === "interactive") {
+          script = eligibleScripts[i];
+          break;
+        }
+      }
+    }
+  }
+
+  if (!script) {
+    // Inaccuracies:
+    //  - If a script is created dynamically and appended to some position
+    //    other than the very end of the document.
+    //  - If multiple scripts are created dynamically and all appended to the
+    //    same position within the document (and do not have their `async` attributes
+    //    set to `false`, at least in browsers that support async script evaluation.
+    //    other than the very end of the document.
+    //  - If any scripts are added with the `async` attribute set to `true` in a browser
+    //    that supports it.
+    //  - May get confused by `script` elements within `svg` elements
+    //  - If script currently being synchronously evaluated by the parser is the
+    //    originator of this call stack but NOT the source script of the caller/invocation
+    //    e.g.
+    //    ```html
+    //    <script id="a">
+    //    function getCurrentScriptCallerFn() {
+    //      return currentExecutingScript.near();
+    //    }
+    //    </script>
+    //    <script id="b">
+    //    // Should get `script[id="a"]` but will get `script[id="b"]` instead
+    //    getCurrentScriptCallerFn();
+    //    </script>
+    //    ```
+    script = eligibleScripts[eligibleScripts.length - 1] || null;
+  }
+
+  return script;
+}
+
+// Default stack depth to skip over when analyzing call stack frames
+_nearestExecutingScript.skipStackDepth = 1;
+
+
+
+    //
+    // Export the API
+    //
+    var currentExecutingScript    = _nearestExecutingScript;      // default
+    currentExecutingScript.near   = _nearestExecutingScript;
+    currentExecutingScript.far    = _farthestExecutingScript;
+    currentExecutingScript.origin = _originatingExecutingScript;
+
+
+    // Just return a value to define the module export.
+    // This example returns an object, but the module
+    // can return a function as the exported value.
+    return currentExecutingScript;
+  })
+);
+
+},{}],66:[function(require,module,exports){
 (function (process,global){
 /*!
  * @overview es6-promise - a tiny implementation of Promises/A+.
@@ -21553,121 +22206,7 @@ function hasBinary(data) {
 
 }).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{"_process":106}],76:[function(require,module,exports){
-
-/**
- * Returns `this`. Execute this without a "context" (i.e. without it being
- * attached to an object of the left-hand side), and `this` points to the
- * "global" scope of the current JS execution.
- */
-
-module.exports = (function () { return this; })();
-
-},{}],77:[function(require,module,exports){
-(function (global){
-
-/*
- * Module requirements.
- */
-
-var isArray = require('isarray');
-
-/**
- * Module exports.
- */
-
-module.exports = hasBinary;
-
-/**
- * Checks for binary data.
- *
- * Right now only Buffer and ArrayBuffer are supported..
- *
- * @param {Object} anything
- * @api public
- */
-
-function hasBinary(data) {
-
-  function _hasBinary(obj) {
-    if (!obj) return false;
-
-    if ( (global.Buffer && global.Buffer.isBuffer(obj)) ||
-         (global.ArrayBuffer && obj instanceof ArrayBuffer) ||
-         (global.Blob && obj instanceof Blob) ||
-         (global.File && obj instanceof File)
-        ) {
-      return true;
-    }
-
-    if (isArray(obj)) {
-      for (var i = 0; i < obj.length; i++) {
-          if (_hasBinary(obj[i])) {
-              return true;
-          }
-      }
-    } else if (obj && 'object' == typeof obj) {
-      if (obj.toJSON) {
-        obj = obj.toJSON();
-      }
-
-      for (var key in obj) {
-        if (Object.prototype.hasOwnProperty.call(obj, key) && _hasBinary(obj[key])) {
-          return true;
-        }
-      }
-    }
-
-    return false;
-  }
-
-  return _hasBinary(data);
-}
-
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-
-},{"isarray":80}],78:[function(require,module,exports){
-
-/**
- * Module dependencies.
- */
-
-var global = require('global');
-
-/**
- * Module exports.
- *
- * Logic borrowed from Modernizr:
- *
- *   - https://github.com/Modernizr/Modernizr/blob/master/feature-detects/cors.js
- */
-
-try {
-  module.exports = 'XMLHttpRequest' in global &&
-    'withCredentials' in new global.XMLHttpRequest();
-} catch (err) {
-  // if XMLHttp support is disabled in IE then it will throw
-  // when trying to create
-  module.exports = false;
-}
-
-},{"global":76}],79:[function(require,module,exports){
-
-var indexOf = [].indexOf;
-
-module.exports = function(arr, obj){
-  if (indexOf) return arr.indexOf(obj);
-  for (var i = 0; i < arr.length; ++i) {
-    if (arr[i] === obj) return i;
-  }
-  return -1;
-};
-},{}],80:[function(require,module,exports){
-module.exports = Array.isArray || function (arr) {
-  return Object.prototype.toString.call(arr) == '[object Array]';
-};
-
-},{}],81:[function(require,module,exports){
+},{"_process":64}],67:[function(require,module,exports){
 /* Copyright @ 2015 Atlassian Pty Ltd
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21811,7 +22350,7 @@ Logger.levels = {
     ERROR: "error"
 };
 
-},{}],82:[function(require,module,exports){
+},{}],68:[function(require,module,exports){
 /* Copyright @ 2015 Atlassian Pty Ltd
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21896,870 +22435,7 @@ module.exports = {
     levels: Logger.levels
 };
 
-},{"./Logger":81}],83:[function(require,module,exports){
-/*! JSON v3.2.6 | http://bestiejs.github.io/json3 | Copyright 2012-2013, Kit Cambridge | http://kit.mit-license.org */
-;(function (window) {
-  // Convenience aliases.
-  var getClass = {}.toString, isProperty, forEach, undef;
-
-  // Detect the `define` function exposed by asynchronous module loaders. The
-  // strict `define` check is necessary for compatibility with `r.js`.
-  var isLoader = typeof define === "function" && define.amd;
-
-  // Detect native implementations.
-  var nativeJSON = typeof JSON == "object" && JSON;
-
-  // Set up the JSON 3 namespace, preferring the CommonJS `exports` object if
-  // available.
-  var JSON3 = typeof exports == "object" && exports && !exports.nodeType && exports;
-
-  if (JSON3 && nativeJSON) {
-    // Explicitly delegate to the native `stringify` and `parse`
-    // implementations in CommonJS environments.
-    JSON3.stringify = nativeJSON.stringify;
-    JSON3.parse = nativeJSON.parse;
-  } else {
-    // Export for web browsers, JavaScript engines, and asynchronous module
-    // loaders, using the global `JSON` object if available.
-    JSON3 = window.JSON = nativeJSON || {};
-  }
-
-  // Test the `Date#getUTC*` methods. Based on work by @Yaffle.
-  var isExtended = new Date(-3509827334573292);
-  try {
-    // The `getUTCFullYear`, `Month`, and `Date` methods return nonsensical
-    // results for certain dates in Opera >= 10.53.
-    isExtended = isExtended.getUTCFullYear() == -109252 && isExtended.getUTCMonth() === 0 && isExtended.getUTCDate() === 1 &&
-      // Safari < 2.0.2 stores the internal millisecond time value correctly,
-      // but clips the values returned by the date methods to the range of
-      // signed 32-bit integers ([-2 ** 31, 2 ** 31 - 1]).
-      isExtended.getUTCHours() == 10 && isExtended.getUTCMinutes() == 37 && isExtended.getUTCSeconds() == 6 && isExtended.getUTCMilliseconds() == 708;
-  } catch (exception) {}
-
-  // Internal: Determines whether the native `JSON.stringify` and `parse`
-  // implementations are spec-compliant. Based on work by Ken Snyder.
-  function has(name) {
-    if (has[name] !== undef) {
-      // Return cached feature test result.
-      return has[name];
-    }
-
-    var isSupported;
-    if (name == "bug-string-char-index") {
-      // IE <= 7 doesn't support accessing string characters using square
-      // bracket notation. IE 8 only supports this for primitives.
-      isSupported = "a"[0] != "a";
-    } else if (name == "json") {
-      // Indicates whether both `JSON.stringify` and `JSON.parse` are
-      // supported.
-      isSupported = has("json-stringify") && has("json-parse");
-    } else {
-      var value, serialized = '{"a":[1,true,false,null,"\\u0000\\b\\n\\f\\r\\t"]}';
-      // Test `JSON.stringify`.
-      if (name == "json-stringify") {
-        var stringify = JSON3.stringify, stringifySupported = typeof stringify == "function" && isExtended;
-        if (stringifySupported) {
-          // A test function object with a custom `toJSON` method.
-          (value = function () {
-            return 1;
-          }).toJSON = value;
-          try {
-            stringifySupported =
-              // Firefox 3.1b1 and b2 serialize string, number, and boolean
-              // primitives as object literals.
-              stringify(0) === "0" &&
-              // FF 3.1b1, b2, and JSON 2 serialize wrapped primitives as object
-              // literals.
-              stringify(new Number()) === "0" &&
-              stringify(new String()) == '""' &&
-              // FF 3.1b1, 2 throw an error if the value is `null`, `undefined`, or
-              // does not define a canonical JSON representation (this applies to
-              // objects with `toJSON` properties as well, *unless* they are nested
-              // within an object or array).
-              stringify(getClass) === undef &&
-              // IE 8 serializes `undefined` as `"undefined"`. Safari <= 5.1.7 and
-              // FF 3.1b3 pass this test.
-              stringify(undef) === undef &&
-              // Safari <= 5.1.7 and FF 3.1b3 throw `Error`s and `TypeError`s,
-              // respectively, if the value is omitted entirely.
-              stringify() === undef &&
-              // FF 3.1b1, 2 throw an error if the given value is not a number,
-              // string, array, object, Boolean, or `null` literal. This applies to
-              // objects with custom `toJSON` methods as well, unless they are nested
-              // inside object or array literals. YUI 3.0.0b1 ignores custom `toJSON`
-              // methods entirely.
-              stringify(value) === "1" &&
-              stringify([value]) == "[1]" &&
-              // Prototype <= 1.6.1 serializes `[undefined]` as `"[]"` instead of
-              // `"[null]"`.
-              stringify([undef]) == "[null]" &&
-              // YUI 3.0.0b1 fails to serialize `null` literals.
-              stringify(null) == "null" &&
-              // FF 3.1b1, 2 halts serialization if an array contains a function:
-              // `[1, true, getClass, 1]` serializes as "[1,true,],". FF 3.1b3
-              // elides non-JSON values from objects and arrays, unless they
-              // define custom `toJSON` methods.
-              stringify([undef, getClass, null]) == "[null,null,null]" &&
-              // Simple serialization test. FF 3.1b1 uses Unicode escape sequences
-              // where character escape codes are expected (e.g., `\b` => `\u0008`).
-              stringify({ "a": [value, true, false, null, "\x00\b\n\f\r\t"] }) == serialized &&
-              // FF 3.1b1 and b2 ignore the `filter` and `width` arguments.
-              stringify(null, value) === "1" &&
-              stringify([1, 2], null, 1) == "[\n 1,\n 2\n]" &&
-              // JSON 2, Prototype <= 1.7, and older WebKit builds incorrectly
-              // serialize extended years.
-              stringify(new Date(-8.64e15)) == '"-271821-04-20T00:00:00.000Z"' &&
-              // The milliseconds are optional in ES 5, but required in 5.1.
-              stringify(new Date(8.64e15)) == '"+275760-09-13T00:00:00.000Z"' &&
-              // Firefox <= 11.0 incorrectly serializes years prior to 0 as negative
-              // four-digit years instead of six-digit years. Credits: @Yaffle.
-              stringify(new Date(-621987552e5)) == '"-000001-01-01T00:00:00.000Z"' &&
-              // Safari <= 5.1.5 and Opera >= 10.53 incorrectly serialize millisecond
-              // values less than 1000. Credits: @Yaffle.
-              stringify(new Date(-1)) == '"1969-12-31T23:59:59.999Z"';
-          } catch (exception) {
-            stringifySupported = false;
-          }
-        }
-        isSupported = stringifySupported;
-      }
-      // Test `JSON.parse`.
-      if (name == "json-parse") {
-        var parse = JSON3.parse;
-        if (typeof parse == "function") {
-          try {
-            // FF 3.1b1, b2 will throw an exception if a bare literal is provided.
-            // Conforming implementations should also coerce the initial argument to
-            // a string prior to parsing.
-            if (parse("0") === 0 && !parse(false)) {
-              // Simple parsing test.
-              value = parse(serialized);
-              var parseSupported = value["a"].length == 5 && value["a"][0] === 1;
-              if (parseSupported) {
-                try {
-                  // Safari <= 5.1.2 and FF 3.1b1 allow unescaped tabs in strings.
-                  parseSupported = !parse('"\t"');
-                } catch (exception) {}
-                if (parseSupported) {
-                  try {
-                    // FF 4.0 and 4.0.1 allow leading `+` signs and leading
-                    // decimal points. FF 4.0, 4.0.1, and IE 9-10 also allow
-                    // certain octal literals.
-                    parseSupported = parse("01") !== 1;
-                  } catch (exception) {}
-                }
-                if (parseSupported) {
-                  try {
-                    // FF 4.0, 4.0.1, and Rhino 1.7R3-R4 allow trailing decimal
-                    // points. These environments, along with FF 3.1b1 and 2,
-                    // also allow trailing commas in JSON objects and arrays.
-                    parseSupported = parse("1.") !== 1;
-                  } catch (exception) {}
-                }
-              }
-            }
-          } catch (exception) {
-            parseSupported = false;
-          }
-        }
-        isSupported = parseSupported;
-      }
-    }
-    return has[name] = !!isSupported;
-  }
-
-  if (!has("json")) {
-    // Common `[[Class]]` name aliases.
-    var functionClass = "[object Function]";
-    var dateClass = "[object Date]";
-    var numberClass = "[object Number]";
-    var stringClass = "[object String]";
-    var arrayClass = "[object Array]";
-    var booleanClass = "[object Boolean]";
-
-    // Detect incomplete support for accessing string characters by index.
-    var charIndexBuggy = has("bug-string-char-index");
-
-    // Define additional utility methods if the `Date` methods are buggy.
-    if (!isExtended) {
-      var floor = Math.floor;
-      // A mapping between the months of the year and the number of days between
-      // January 1st and the first of the respective month.
-      var Months = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-      // Internal: Calculates the number of days between the Unix epoch and the
-      // first day of the given month.
-      var getDay = function (year, month) {
-        return Months[month] + 365 * (year - 1970) + floor((year - 1969 + (month = +(month > 1))) / 4) - floor((year - 1901 + month) / 100) + floor((year - 1601 + month) / 400);
-      };
-    }
-
-    // Internal: Determines if a property is a direct property of the given
-    // object. Delegates to the native `Object#hasOwnProperty` method.
-    if (!(isProperty = {}.hasOwnProperty)) {
-      isProperty = function (property) {
-        var members = {}, constructor;
-        if ((members.__proto__ = null, members.__proto__ = {
-          // The *proto* property cannot be set multiple times in recent
-          // versions of Firefox and SeaMonkey.
-          "toString": 1
-        }, members).toString != getClass) {
-          // Safari <= 2.0.3 doesn't implement `Object#hasOwnProperty`, but
-          // supports the mutable *proto* property.
-          isProperty = function (property) {
-            // Capture and break the object's prototype chain (see section 8.6.2
-            // of the ES 5.1 spec). The parenthesized expression prevents an
-            // unsafe transformation by the Closure Compiler.
-            var original = this.__proto__, result = property in (this.__proto__ = null, this);
-            // Restore the original prototype chain.
-            this.__proto__ = original;
-            return result;
-          };
-        } else {
-          // Capture a reference to the top-level `Object` constructor.
-          constructor = members.constructor;
-          // Use the `constructor` property to simulate `Object#hasOwnProperty` in
-          // other environments.
-          isProperty = function (property) {
-            var parent = (this.constructor || constructor).prototype;
-            return property in this && !(property in parent && this[property] === parent[property]);
-          };
-        }
-        members = null;
-        return isProperty.call(this, property);
-      };
-    }
-
-    // Internal: A set of primitive types used by `isHostType`.
-    var PrimitiveTypes = {
-      'boolean': 1,
-      'number': 1,
-      'string': 1,
-      'undefined': 1
-    };
-
-    // Internal: Determines if the given object `property` value is a
-    // non-primitive.
-    var isHostType = function (object, property) {
-      var type = typeof object[property];
-      return type == 'object' ? !!object[property] : !PrimitiveTypes[type];
-    };
-
-    // Internal: Normalizes the `for...in` iteration algorithm across
-    // environments. Each enumerated key is yielded to a `callback` function.
-    forEach = function (object, callback) {
-      var size = 0, Properties, members, property;
-
-      // Tests for bugs in the current environment's `for...in` algorithm. The
-      // `valueOf` property inherits the non-enumerable flag from
-      // `Object.prototype` in older versions of IE, Netscape, and Mozilla.
-      (Properties = function () {
-        this.valueOf = 0;
-      }).prototype.valueOf = 0;
-
-      // Iterate over a new instance of the `Properties` class.
-      members = new Properties();
-      for (property in members) {
-        // Ignore all properties inherited from `Object.prototype`.
-        if (isProperty.call(members, property)) {
-          size++;
-        }
-      }
-      Properties = members = null;
-
-      // Normalize the iteration algorithm.
-      if (!size) {
-        // A list of non-enumerable properties inherited from `Object.prototype`.
-        members = ["valueOf", "toString", "toLocaleString", "propertyIsEnumerable", "isPrototypeOf", "hasOwnProperty", "constructor"];
-        // IE <= 8, Mozilla 1.0, and Netscape 6.2 ignore shadowed non-enumerable
-        // properties.
-        forEach = function (object, callback) {
-          var isFunction = getClass.call(object) == functionClass, property, length;
-          var hasProperty = !isFunction && typeof object.constructor != 'function' && isHostType(object, 'hasOwnProperty') ? object.hasOwnProperty : isProperty;
-          for (property in object) {
-            // Gecko <= 1.0 enumerates the `prototype` property of functions under
-            // certain conditions; IE does not.
-            if (!(isFunction && property == "prototype") && hasProperty.call(object, property)) {
-              callback(property);
-            }
-          }
-          // Manually invoke the callback for each non-enumerable property.
-          for (length = members.length; property = members[--length]; hasProperty.call(object, property) && callback(property));
-        };
-      } else if (size == 2) {
-        // Safari <= 2.0.4 enumerates shadowed properties twice.
-        forEach = function (object, callback) {
-          // Create a set of iterated properties.
-          var members = {}, isFunction = getClass.call(object) == functionClass, property;
-          for (property in object) {
-            // Store each property name to prevent double enumeration. The
-            // `prototype` property of functions is not enumerated due to cross-
-            // environment inconsistencies.
-            if (!(isFunction && property == "prototype") && !isProperty.call(members, property) && (members[property] = 1) && isProperty.call(object, property)) {
-              callback(property);
-            }
-          }
-        };
-      } else {
-        // No bugs detected; use the standard `for...in` algorithm.
-        forEach = function (object, callback) {
-          var isFunction = getClass.call(object) == functionClass, property, isConstructor;
-          for (property in object) {
-            if (!(isFunction && property == "prototype") && isProperty.call(object, property) && !(isConstructor = property === "constructor")) {
-              callback(property);
-            }
-          }
-          // Manually invoke the callback for the `constructor` property due to
-          // cross-environment inconsistencies.
-          if (isConstructor || isProperty.call(object, (property = "constructor"))) {
-            callback(property);
-          }
-        };
-      }
-      return forEach(object, callback);
-    };
-
-    // Public: Serializes a JavaScript `value` as a JSON string. The optional
-    // `filter` argument may specify either a function that alters how object and
-    // array members are serialized, or an array of strings and numbers that
-    // indicates which properties should be serialized. The optional `width`
-    // argument may be either a string or number that specifies the indentation
-    // level of the output.
-    if (!has("json-stringify")) {
-      // Internal: A map of control characters and their escaped equivalents.
-      var Escapes = {
-        92: "\\\\",
-        34: '\\"',
-        8: "\\b",
-        12: "\\f",
-        10: "\\n",
-        13: "\\r",
-        9: "\\t"
-      };
-
-      // Internal: Converts `value` into a zero-padded string such that its
-      // length is at least equal to `width`. The `width` must be <= 6.
-      var leadingZeroes = "000000";
-      var toPaddedString = function (width, value) {
-        // The `|| 0` expression is necessary to work around a bug in
-        // Opera <= 7.54u2 where `0 == -0`, but `String(-0) !== "0"`.
-        return (leadingZeroes + (value || 0)).slice(-width);
-      };
-
-      // Internal: Double-quotes a string `value`, replacing all ASCII control
-      // characters (characters with code unit values between 0 and 31) with
-      // their escaped equivalents. This is an implementation of the
-      // `Quote(value)` operation defined in ES 5.1 section 15.12.3.
-      var unicodePrefix = "\\u00";
-      var quote = function (value) {
-        var result = '"', index = 0, length = value.length, isLarge = length > 10 && charIndexBuggy, symbols;
-        if (isLarge) {
-          symbols = value.split("");
-        }
-        for (; index < length; index++) {
-          var charCode = value.charCodeAt(index);
-          // If the character is a control character, append its Unicode or
-          // shorthand escape sequence; otherwise, append the character as-is.
-          switch (charCode) {
-            case 8: case 9: case 10: case 12: case 13: case 34: case 92:
-              result += Escapes[charCode];
-              break;
-            default:
-              if (charCode < 32) {
-                result += unicodePrefix + toPaddedString(2, charCode.toString(16));
-                break;
-              }
-              result += isLarge ? symbols[index] : charIndexBuggy ? value.charAt(index) : value[index];
-          }
-        }
-        return result + '"';
-      };
-
-      // Internal: Recursively serializes an object. Implements the
-      // `Str(key, holder)`, `JO(value)`, and `JA(value)` operations.
-      var serialize = function (property, object, callback, properties, whitespace, indentation, stack) {
-        var value, className, year, month, date, time, hours, minutes, seconds, milliseconds, results, element, index, length, prefix, result;
-        try {
-          // Necessary for host object support.
-          value = object[property];
-        } catch (exception) {}
-        if (typeof value == "object" && value) {
-          className = getClass.call(value);
-          if (className == dateClass && !isProperty.call(value, "toJSON")) {
-            if (value > -1 / 0 && value < 1 / 0) {
-              // Dates are serialized according to the `Date#toJSON` method
-              // specified in ES 5.1 section 15.9.5.44. See section 15.9.1.15
-              // for the ISO 8601 date time string format.
-              if (getDay) {
-                // Manually compute the year, month, date, hours, minutes,
-                // seconds, and milliseconds if the `getUTC*` methods are
-                // buggy. Adapted from @Yaffle's `date-shim` project.
-                date = floor(value / 864e5);
-                for (year = floor(date / 365.2425) + 1970 - 1; getDay(year + 1, 0) <= date; year++);
-                for (month = floor((date - getDay(year, 0)) / 30.42); getDay(year, month + 1) <= date; month++);
-                date = 1 + date - getDay(year, month);
-                // The `time` value specifies the time within the day (see ES
-                // 5.1 section 15.9.1.2). The formula `(A % B + B) % B` is used
-                // to compute `A modulo B`, as the `%` operator does not
-                // correspond to the `modulo` operation for negative numbers.
-                time = (value % 864e5 + 864e5) % 864e5;
-                // The hours, minutes, seconds, and milliseconds are obtained by
-                // decomposing the time within the day. See section 15.9.1.10.
-                hours = floor(time / 36e5) % 24;
-                minutes = floor(time / 6e4) % 60;
-                seconds = floor(time / 1e3) % 60;
-                milliseconds = time % 1e3;
-              } else {
-                year = value.getUTCFullYear();
-                month = value.getUTCMonth();
-                date = value.getUTCDate();
-                hours = value.getUTCHours();
-                minutes = value.getUTCMinutes();
-                seconds = value.getUTCSeconds();
-                milliseconds = value.getUTCMilliseconds();
-              }
-              // Serialize extended years correctly.
-              value = (year <= 0 || year >= 1e4 ? (year < 0 ? "-" : "+") + toPaddedString(6, year < 0 ? -year : year) : toPaddedString(4, year)) +
-                "-" + toPaddedString(2, month + 1) + "-" + toPaddedString(2, date) +
-                // Months, dates, hours, minutes, and seconds should have two
-                // digits; milliseconds should have three.
-                "T" + toPaddedString(2, hours) + ":" + toPaddedString(2, minutes) + ":" + toPaddedString(2, seconds) +
-                // Milliseconds are optional in ES 5.0, but required in 5.1.
-                "." + toPaddedString(3, milliseconds) + "Z";
-            } else {
-              value = null;
-            }
-          } else if (typeof value.toJSON == "function" && ((className != numberClass && className != stringClass && className != arrayClass) || isProperty.call(value, "toJSON"))) {
-            // Prototype <= 1.6.1 adds non-standard `toJSON` methods to the
-            // `Number`, `String`, `Date`, and `Array` prototypes. JSON 3
-            // ignores all `toJSON` methods on these objects unless they are
-            // defined directly on an instance.
-            value = value.toJSON(property);
-          }
-        }
-        if (callback) {
-          // If a replacement function was provided, call it to obtain the value
-          // for serialization.
-          value = callback.call(object, property, value);
-        }
-        if (value === null) {
-          return "null";
-        }
-        className = getClass.call(value);
-        if (className == booleanClass) {
-          // Booleans are represented literally.
-          return "" + value;
-        } else if (className == numberClass) {
-          // JSON numbers must be finite. `Infinity` and `NaN` are serialized as
-          // `"null"`.
-          return value > -1 / 0 && value < 1 / 0 ? "" + value : "null";
-        } else if (className == stringClass) {
-          // Strings are double-quoted and escaped.
-          return quote("" + value);
-        }
-        // Recursively serialize objects and arrays.
-        if (typeof value == "object") {
-          // Check for cyclic structures. This is a linear search; performance
-          // is inversely proportional to the number of unique nested objects.
-          for (length = stack.length; length--;) {
-            if (stack[length] === value) {
-              // Cyclic structures cannot be serialized by `JSON.stringify`.
-              throw TypeError();
-            }
-          }
-          // Add the object to the stack of traversed objects.
-          stack.push(value);
-          results = [];
-          // Save the current indentation level and indent one additional level.
-          prefix = indentation;
-          indentation += whitespace;
-          if (className == arrayClass) {
-            // Recursively serialize array elements.
-            for (index = 0, length = value.length; index < length; index++) {
-              element = serialize(index, value, callback, properties, whitespace, indentation, stack);
-              results.push(element === undef ? "null" : element);
-            }
-            result = results.length ? (whitespace ? "[\n" + indentation + results.join(",\n" + indentation) + "\n" + prefix + "]" : ("[" + results.join(",") + "]")) : "[]";
-          } else {
-            // Recursively serialize object members. Members are selected from
-            // either a user-specified list of property names, or the object
-            // itself.
-            forEach(properties || value, function (property) {
-              var element = serialize(property, value, callback, properties, whitespace, indentation, stack);
-              if (element !== undef) {
-                // According to ES 5.1 section 15.12.3: "If `gap` {whitespace}
-                // is not the empty string, let `member` {quote(property) + ":"}
-                // be the concatenation of `member` and the `space` character."
-                // The "`space` character" refers to the literal space
-                // character, not the `space` {width} argument provided to
-                // `JSON.stringify`.
-                results.push(quote(property) + ":" + (whitespace ? " " : "") + element);
-              }
-            });
-            result = results.length ? (whitespace ? "{\n" + indentation + results.join(",\n" + indentation) + "\n" + prefix + "}" : ("{" + results.join(",") + "}")) : "{}";
-          }
-          // Remove the object from the traversed object stack.
-          stack.pop();
-          return result;
-        }
-      };
-
-      // Public: `JSON.stringify`. See ES 5.1 section 15.12.3.
-      JSON3.stringify = function (source, filter, width) {
-        var whitespace, callback, properties, className;
-        if (typeof filter == "function" || typeof filter == "object" && filter) {
-          if ((className = getClass.call(filter)) == functionClass) {
-            callback = filter;
-          } else if (className == arrayClass) {
-            // Convert the property names array into a makeshift set.
-            properties = {};
-            for (var index = 0, length = filter.length, value; index < length; value = filter[index++], ((className = getClass.call(value)), className == stringClass || className == numberClass) && (properties[value] = 1));
-          }
-        }
-        if (width) {
-          if ((className = getClass.call(width)) == numberClass) {
-            // Convert the `width` to an integer and create a string containing
-            // `width` number of space characters.
-            if ((width -= width % 1) > 0) {
-              for (whitespace = "", width > 10 && (width = 10); whitespace.length < width; whitespace += " ");
-            }
-          } else if (className == stringClass) {
-            whitespace = width.length <= 10 ? width : width.slice(0, 10);
-          }
-        }
-        // Opera <= 7.54u2 discards the values associated with empty string keys
-        // (`""`) only if they are used directly within an object member list
-        // (e.g., `!("" in { "": 1})`).
-        return serialize("", (value = {}, value[""] = source, value), callback, properties, whitespace, "", []);
-      };
-    }
-
-    // Public: Parses a JSON source string.
-    if (!has("json-parse")) {
-      var fromCharCode = String.fromCharCode;
-
-      // Internal: A map of escaped control characters and their unescaped
-      // equivalents.
-      var Unescapes = {
-        92: "\\",
-        34: '"',
-        47: "/",
-        98: "\b",
-        116: "\t",
-        110: "\n",
-        102: "\f",
-        114: "\r"
-      };
-
-      // Internal: Stores the parser state.
-      var Index, Source;
-
-      // Internal: Resets the parser state and throws a `SyntaxError`.
-      var abort = function() {
-        Index = Source = null;
-        throw SyntaxError();
-      };
-
-      // Internal: Returns the next token, or `"$"` if the parser has reached
-      // the end of the source string. A token may be a string, number, `null`
-      // literal, or Boolean literal.
-      var lex = function () {
-        var source = Source, length = source.length, value, begin, position, isSigned, charCode;
-        while (Index < length) {
-          charCode = source.charCodeAt(Index);
-          switch (charCode) {
-            case 9: case 10: case 13: case 32:
-              // Skip whitespace tokens, including tabs, carriage returns, line
-              // feeds, and space characters.
-              Index++;
-              break;
-            case 123: case 125: case 91: case 93: case 58: case 44:
-              // Parse a punctuator token (`{`, `}`, `[`, `]`, `:`, or `,`) at
-              // the current position.
-              value = charIndexBuggy ? source.charAt(Index) : source[Index];
-              Index++;
-              return value;
-            case 34:
-              // `"` delimits a JSON string; advance to the next character and
-              // begin parsing the string. String tokens are prefixed with the
-              // sentinel `@` character to distinguish them from punctuators and
-              // end-of-string tokens.
-              for (value = "@", Index++; Index < length;) {
-                charCode = source.charCodeAt(Index);
-                if (charCode < 32) {
-                  // Unescaped ASCII control characters (those with a code unit
-                  // less than the space character) are not permitted.
-                  abort();
-                } else if (charCode == 92) {
-                  // A reverse solidus (`\`) marks the beginning of an escaped
-                  // control character (including `"`, `\`, and `/`) or Unicode
-                  // escape sequence.
-                  charCode = source.charCodeAt(++Index);
-                  switch (charCode) {
-                    case 92: case 34: case 47: case 98: case 116: case 110: case 102: case 114:
-                      // Revive escaped control characters.
-                      value += Unescapes[charCode];
-                      Index++;
-                      break;
-                    case 117:
-                      // `\u` marks the beginning of a Unicode escape sequence.
-                      // Advance to the first character and validate the
-                      // four-digit code point.
-                      begin = ++Index;
-                      for (position = Index + 4; Index < position; Index++) {
-                        charCode = source.charCodeAt(Index);
-                        // A valid sequence comprises four hexdigits (case-
-                        // insensitive) that form a single hexadecimal value.
-                        if (!(charCode >= 48 && charCode <= 57 || charCode >= 97 && charCode <= 102 || charCode >= 65 && charCode <= 70)) {
-                          // Invalid Unicode escape sequence.
-                          abort();
-                        }
-                      }
-                      // Revive the escaped character.
-                      value += fromCharCode("0x" + source.slice(begin, Index));
-                      break;
-                    default:
-                      // Invalid escape sequence.
-                      abort();
-                  }
-                } else {
-                  if (charCode == 34) {
-                    // An unescaped double-quote character marks the end of the
-                    // string.
-                    break;
-                  }
-                  charCode = source.charCodeAt(Index);
-                  begin = Index;
-                  // Optimize for the common case where a string is valid.
-                  while (charCode >= 32 && charCode != 92 && charCode != 34) {
-                    charCode = source.charCodeAt(++Index);
-                  }
-                  // Append the string as-is.
-                  value += source.slice(begin, Index);
-                }
-              }
-              if (source.charCodeAt(Index) == 34) {
-                // Advance to the next character and return the revived string.
-                Index++;
-                return value;
-              }
-              // Unterminated string.
-              abort();
-            default:
-              // Parse numbers and literals.
-              begin = Index;
-              // Advance past the negative sign, if one is specified.
-              if (charCode == 45) {
-                isSigned = true;
-                charCode = source.charCodeAt(++Index);
-              }
-              // Parse an integer or floating-point value.
-              if (charCode >= 48 && charCode <= 57) {
-                // Leading zeroes are interpreted as octal literals.
-                if (charCode == 48 && ((charCode = source.charCodeAt(Index + 1)), charCode >= 48 && charCode <= 57)) {
-                  // Illegal octal literal.
-                  abort();
-                }
-                isSigned = false;
-                // Parse the integer component.
-                for (; Index < length && ((charCode = source.charCodeAt(Index)), charCode >= 48 && charCode <= 57); Index++);
-                // Floats cannot contain a leading decimal point; however, this
-                // case is already accounted for by the parser.
-                if (source.charCodeAt(Index) == 46) {
-                  position = ++Index;
-                  // Parse the decimal component.
-                  for (; position < length && ((charCode = source.charCodeAt(position)), charCode >= 48 && charCode <= 57); position++);
-                  if (position == Index) {
-                    // Illegal trailing decimal.
-                    abort();
-                  }
-                  Index = position;
-                }
-                // Parse exponents. The `e` denoting the exponent is
-                // case-insensitive.
-                charCode = source.charCodeAt(Index);
-                if (charCode == 101 || charCode == 69) {
-                  charCode = source.charCodeAt(++Index);
-                  // Skip past the sign following the exponent, if one is
-                  // specified.
-                  if (charCode == 43 || charCode == 45) {
-                    Index++;
-                  }
-                  // Parse the exponential component.
-                  for (position = Index; position < length && ((charCode = source.charCodeAt(position)), charCode >= 48 && charCode <= 57); position++);
-                  if (position == Index) {
-                    // Illegal empty exponent.
-                    abort();
-                  }
-                  Index = position;
-                }
-                // Coerce the parsed value to a JavaScript number.
-                return +source.slice(begin, Index);
-              }
-              // A negative sign may only precede numbers.
-              if (isSigned) {
-                abort();
-              }
-              // `true`, `false`, and `null` literals.
-              if (source.slice(Index, Index + 4) == "true") {
-                Index += 4;
-                return true;
-              } else if (source.slice(Index, Index + 5) == "false") {
-                Index += 5;
-                return false;
-              } else if (source.slice(Index, Index + 4) == "null") {
-                Index += 4;
-                return null;
-              }
-              // Unrecognized token.
-              abort();
-          }
-        }
-        // Return the sentinel `$` character if the parser has reached the end
-        // of the source string.
-        return "$";
-      };
-
-      // Internal: Parses a JSON `value` token.
-      var get = function (value) {
-        var results, hasMembers;
-        if (value == "$") {
-          // Unexpected end of input.
-          abort();
-        }
-        if (typeof value == "string") {
-          if ((charIndexBuggy ? value.charAt(0) : value[0]) == "@") {
-            // Remove the sentinel `@` character.
-            return value.slice(1);
-          }
-          // Parse object and array literals.
-          if (value == "[") {
-            // Parses a JSON array, returning a new JavaScript array.
-            results = [];
-            for (;; hasMembers || (hasMembers = true)) {
-              value = lex();
-              // A closing square bracket marks the end of the array literal.
-              if (value == "]") {
-                break;
-              }
-              // If the array literal contains elements, the current token
-              // should be a comma separating the previous element from the
-              // next.
-              if (hasMembers) {
-                if (value == ",") {
-                  value = lex();
-                  if (value == "]") {
-                    // Unexpected trailing `,` in array literal.
-                    abort();
-                  }
-                } else {
-                  // A `,` must separate each array element.
-                  abort();
-                }
-              }
-              // Elisions and leading commas are not permitted.
-              if (value == ",") {
-                abort();
-              }
-              results.push(get(value));
-            }
-            return results;
-          } else if (value == "{") {
-            // Parses a JSON object, returning a new JavaScript object.
-            results = {};
-            for (;; hasMembers || (hasMembers = true)) {
-              value = lex();
-              // A closing curly brace marks the end of the object literal.
-              if (value == "}") {
-                break;
-              }
-              // If the object literal contains members, the current token
-              // should be a comma separator.
-              if (hasMembers) {
-                if (value == ",") {
-                  value = lex();
-                  if (value == "}") {
-                    // Unexpected trailing `,` in object literal.
-                    abort();
-                  }
-                } else {
-                  // A `,` must separate each object member.
-                  abort();
-                }
-              }
-              // Leading commas are not permitted, object property names must be
-              // double-quoted strings, and a `:` must separate each property
-              // name and value.
-              if (value == "," || typeof value != "string" || (charIndexBuggy ? value.charAt(0) : value[0]) != "@" || lex() != ":") {
-                abort();
-              }
-              results[value.slice(1)] = get(lex());
-            }
-            return results;
-          }
-          // Unexpected token encountered.
-          abort();
-        }
-        return value;
-      };
-
-      // Internal: Updates a traversed object member.
-      var update = function(source, property, callback) {
-        var element = walk(source, property, callback);
-        if (element === undef) {
-          delete source[property];
-        } else {
-          source[property] = element;
-        }
-      };
-
-      // Internal: Recursively traverses a parsed JSON object, invoking the
-      // `callback` function for each value. This is an implementation of the
-      // `Walk(holder, name)` operation defined in ES 5.1 section 15.12.2.
-      var walk = function (source, property, callback) {
-        var value = source[property], length;
-        if (typeof value == "object" && value) {
-          // `forEach` can't be used to traverse an array in Opera <= 8.54
-          // because its `Object#hasOwnProperty` implementation returns `false`
-          // for array indices (e.g., `![1, 2, 3].hasOwnProperty("0")`).
-          if (getClass.call(value) == arrayClass) {
-            for (length = value.length; length--;) {
-              update(value, length, callback);
-            }
-          } else {
-            forEach(value, function (property) {
-              update(value, property, callback);
-            });
-          }
-        }
-        return callback.call(source, property, value);
-      };
-
-      // Public: `JSON.parse`. See ES 5.1 section 15.12.2.
-      JSON3.parse = function (source, callback) {
-        var result, value;
-        Index = 0;
-        Source = "" + source;
-        result = get(lex());
-        // If a JSON string contains multiple tokens, it is invalid.
-        if (lex() != "$") {
-          abort();
-        }
-        // Reset the parser state.
-        Index = Source = null;
-        return callback && getClass.call(callback) == functionClass ? walk((value = {}, value[""] = result, value), "", callback) : result;
-      };
-    }
-  }
-
-  // Export for asynchronous module loaders.
-  if (isLoader) {
-    define(function () {
-      return JSON3;
-    });
-  }
-}(this));
-
-},{}],84:[function(require,module,exports){
+},{"./Logger":67}],69:[function(require,module,exports){
 /*
  A JavaScript implementation of the SHA family of hashes, as
  defined in FIPS PUB 180-2 as well as the corresponding HMAC implementation
@@ -22795,205 +22471,7 @@ d[2]),new e(355462360,d[3]),new e(1731405415,d[4]),new e(41048885895,d[5]),new e
 new e(a[m*x+p],a[m*x+p+1]):y(E(A[m-2]),A[m-7],D(A[m-15]),A[m-16]),v=C(u,G(l),H(l,r,t),k[m],A[m]),z=q(F(c),I(c,g,f)),u=t,t=r,r=l,l=q(h,v),h=f,f=g,g=c,c=q(v,z);d[0]=q(c,d[0]);d[1]=q(g,d[1]);d[2]=q(f,d[2]);d[3]=q(h,d[3]);d[4]=q(l,d[4]);d[5]=q(r,d[5]);d[6]=q(t,d[6]);d[7]=q(u,d[7])}if("SHA-224"===b)a=[d[0],d[1],d[2],d[3],d[4],d[5],d[6]];else if("SHA-256"===b)a=d;else if("SHA-384"===b)a=[d[0].a,d[0].b,d[1].a,d[1].b,d[2].a,d[2].b,d[3].a,d[3].b,d[4].a,d[4].b,d[5].a,d[5].b];else if("SHA-512"===b)a=[d[0].a,
 d[0].b,d[1].a,d[1].b,d[2].a,d[2].b,d[3].a,d[3].b,d[4].a,d[4].b,d[5].a,d[5].b,d[6].a,d[6].b,d[7].a,d[7].b];else throw"Unexpected error in SHA-2 implementation";return a}"function"===typeof define&&typeof define.amd?define(function(){return z}):"undefined"!==typeof exports?"undefined"!==typeof module&&module.exports?module.exports=exports=z:exports=z:T.jsSHA=z})(this);
 
-},{}],85:[function(require,module,exports){
-/**
- * Helpers.
- */
-
-var s = 1000;
-var m = s * 60;
-var h = m * 60;
-var d = h * 24;
-var y = d * 365.25;
-
-/**
- * Parse or format the given `val`.
- *
- * Options:
- *
- *  - `long` verbose formatting [false]
- *
- * @param {String|Number} val
- * @param {Object} options
- * @return {String|Number}
- * @api public
- */
-
-module.exports = function(val, options){
-  options = options || {};
-  if ('string' == typeof val) return parse(val);
-  return options.long
-    ? long(val)
-    : short(val);
-};
-
-/**
- * Parse the given `str` and return milliseconds.
- *
- * @param {String} str
- * @return {Number}
- * @api private
- */
-
-function parse(str) {
-  var match = /^((?:\d+)?\.?\d+) *(ms|seconds?|s|minutes?|m|hours?|h|days?|d|years?|y)?$/i.exec(str);
-  if (!match) return;
-  var n = parseFloat(match[1]);
-  var type = (match[2] || 'ms').toLowerCase();
-  switch (type) {
-    case 'years':
-    case 'year':
-    case 'y':
-      return n * y;
-    case 'days':
-    case 'day':
-    case 'd':
-      return n * d;
-    case 'hours':
-    case 'hour':
-    case 'h':
-      return n * h;
-    case 'minutes':
-    case 'minute':
-    case 'm':
-      return n * m;
-    case 'seconds':
-    case 'second':
-    case 's':
-      return n * s;
-    case 'ms':
-      return n;
-  }
-}
-
-/**
- * Short format for `ms`.
- *
- * @param {Number} ms
- * @return {String}
- * @api private
- */
-
-function short(ms) {
-  if (ms >= d) return Math.round(ms / d) + 'd';
-  if (ms >= h) return Math.round(ms / h) + 'h';
-  if (ms >= m) return Math.round(ms / m) + 'm';
-  if (ms >= s) return Math.round(ms / s) + 's';
-  return ms + 'ms';
-}
-
-/**
- * Long format for `ms`.
- *
- * @param {Number} ms
- * @return {String}
- * @api private
- */
-
-function long(ms) {
-  return plural(ms, d, 'day')
-    || plural(ms, h, 'hour')
-    || plural(ms, m, 'minute')
-    || plural(ms, s, 'second')
-    || ms + ' ms';
-}
-
-/**
- * Pluralization helper.
- */
-
-function plural(ms, n, name) {
-  if (ms < n) return;
-  if (ms < n * 1.5) return Math.floor(ms / n) + ' ' + name;
-  return Math.ceil(ms / n) + ' ' + name + 's';
-}
-
-},{}],86:[function(require,module,exports){
-
-/**
- * HOP ref.
- */
-
-var has = Object.prototype.hasOwnProperty;
-
-/**
- * Return own keys in `obj`.
- *
- * @param {Object} obj
- * @return {Array}
- * @api public
- */
-
-exports.keys = Object.keys || function(obj){
-  var keys = [];
-  for (var key in obj) {
-    if (has.call(obj, key)) {
-      keys.push(key);
-    }
-  }
-  return keys;
-};
-
-/**
- * Return own values in `obj`.
- *
- * @param {Object} obj
- * @return {Array}
- * @api public
- */
-
-exports.values = function(obj){
-  var vals = [];
-  for (var key in obj) {
-    if (has.call(obj, key)) {
-      vals.push(obj[key]);
-    }
-  }
-  return vals;
-};
-
-/**
- * Merge `b` into `a`.
- *
- * @param {Object} a
- * @param {Object} b
- * @return {Object} a
- * @api public
- */
-
-exports.merge = function(a, b){
-  for (var key in b) {
-    if (has.call(b, key)) {
-      a[key] = b[key];
-    }
-  }
-  return a;
-};
-
-/**
- * Return length of `obj`.
- *
- * @param {Object} obj
- * @return {Number}
- * @api public
- */
-
-exports.length = function(obj){
-  return exports.keys(obj).length;
-};
-
-/**
- * Check if `obj` is empty.
- *
- * @param {Object} obj
- * @return {Boolean}
- * @api public
- */
-
-exports.isEmpty = function(obj){
-  return 0 == exports.length(obj);
-};
-},{}],87:[function(require,module,exports){
+},{}],70:[function(require,module,exports){
 // Top level file is just a mixin of submodules & constants
 'use strict';
 
@@ -23009,7 +22487,7 @@ assign(pako, deflate, inflate, constants);
 
 module.exports = pako;
 
-},{"./lib/deflate":88,"./lib/inflate":89,"./lib/utils/common":90,"./lib/zlib/constants":93}],88:[function(require,module,exports){
+},{"./lib/deflate":71,"./lib/inflate":72,"./lib/utils/common":73,"./lib/zlib/constants":76}],71:[function(require,module,exports){
 'use strict';
 
 
@@ -23411,7 +22889,7 @@ exports.deflate = deflate;
 exports.deflateRaw = deflateRaw;
 exports.gzip = gzip;
 
-},{"./utils/common":90,"./utils/strings":91,"./zlib/deflate":95,"./zlib/messages":100,"./zlib/zstream":102}],89:[function(require,module,exports){
+},{"./utils/common":73,"./utils/strings":74,"./zlib/deflate":78,"./zlib/messages":83,"./zlib/zstream":85}],72:[function(require,module,exports){
 'use strict';
 
 
@@ -23831,7 +23309,7 @@ exports.inflate = inflate;
 exports.inflateRaw = inflateRaw;
 exports.ungzip  = inflate;
 
-},{"./utils/common":90,"./utils/strings":91,"./zlib/constants":93,"./zlib/gzheader":96,"./zlib/inflate":98,"./zlib/messages":100,"./zlib/zstream":102}],90:[function(require,module,exports){
+},{"./utils/common":73,"./utils/strings":74,"./zlib/constants":76,"./zlib/gzheader":79,"./zlib/inflate":81,"./zlib/messages":83,"./zlib/zstream":85}],73:[function(require,module,exports){
 'use strict';
 
 
@@ -23935,7 +23413,7 @@ exports.setTyped = function (on) {
 
 exports.setTyped(TYPED_OK);
 
-},{}],91:[function(require,module,exports){
+},{}],74:[function(require,module,exports){
 // String encode/decode helpers
 'use strict';
 
@@ -24122,7 +23600,7 @@ exports.utf8border = function (buf, max) {
   return (pos + _utf8len[buf[pos]] > max) ? pos : max;
 };
 
-},{"./common":90}],92:[function(require,module,exports){
+},{"./common":73}],75:[function(require,module,exports){
 'use strict';
 
 // Note: adler32 takes 12% for level 0 and 2% for level 6.
@@ -24156,7 +23634,7 @@ function adler32(adler, buf, len, pos) {
 
 module.exports = adler32;
 
-},{}],93:[function(require,module,exports){
+},{}],76:[function(require,module,exports){
 'use strict';
 
 
@@ -24208,7 +23686,7 @@ module.exports = {
   //Z_NULL:                 null // Use -1 or null inline, depending on var type
 };
 
-},{}],94:[function(require,module,exports){
+},{}],77:[function(require,module,exports){
 'use strict';
 
 // Note: we can't get significant speed boost here.
@@ -24251,7 +23729,7 @@ function crc32(crc, buf, len, pos) {
 
 module.exports = crc32;
 
-},{}],95:[function(require,module,exports){
+},{}],78:[function(require,module,exports){
 'use strict';
 
 var utils   = require('../utils/common');
@@ -26108,7 +25586,7 @@ exports.deflatePrime = deflatePrime;
 exports.deflateTune = deflateTune;
 */
 
-},{"../utils/common":90,"./adler32":92,"./crc32":94,"./messages":100,"./trees":101}],96:[function(require,module,exports){
+},{"../utils/common":73,"./adler32":75,"./crc32":77,"./messages":83,"./trees":84}],79:[function(require,module,exports){
 'use strict';
 
 
@@ -26150,7 +25628,7 @@ function GZheader() {
 
 module.exports = GZheader;
 
-},{}],97:[function(require,module,exports){
+},{}],80:[function(require,module,exports){
 'use strict';
 
 // See state defs from inflate.js
@@ -26478,7 +25956,7 @@ module.exports = function inflate_fast(strm, start) {
   return;
 };
 
-},{}],98:[function(require,module,exports){
+},{}],81:[function(require,module,exports){
 'use strict';
 
 
@@ -28018,7 +27496,7 @@ exports.inflateSyncPoint = inflateSyncPoint;
 exports.inflateUndermine = inflateUndermine;
 */
 
-},{"../utils/common":90,"./adler32":92,"./crc32":94,"./inffast":97,"./inftrees":99}],99:[function(require,module,exports){
+},{"../utils/common":73,"./adler32":75,"./crc32":77,"./inffast":80,"./inftrees":82}],82:[function(require,module,exports){
 'use strict';
 
 
@@ -28347,7 +27825,7 @@ module.exports = function inflate_table(type, lens, lens_index, codes, table, ta
   return 0;
 };
 
-},{"../utils/common":90}],100:[function(require,module,exports){
+},{"../utils/common":73}],83:[function(require,module,exports){
 'use strict';
 
 module.exports = {
@@ -28362,7 +27840,7 @@ module.exports = {
   '-6':   'incompatible version' /* Z_VERSION_ERROR (-6) */
 };
 
-},{}],101:[function(require,module,exports){
+},{}],84:[function(require,module,exports){
 'use strict';
 
 
@@ -29566,7 +29044,7 @@ exports._tr_flush_block  = _tr_flush_block;
 exports._tr_tally = _tr_tally;
 exports._tr_align = _tr_align;
 
-},{"../utils/common":90}],102:[function(require,module,exports){
+},{"../utils/common":73}],85:[function(require,module,exports){
 'use strict';
 
 
@@ -29597,291 +29075,7 @@ function ZStream() {
 
 module.exports = ZStream;
 
-},{}],103:[function(require,module,exports){
-(function (global){
-/**
- * JSON parse.
- *
- * @see Based on jQuery#parseJSON (MIT) and JSON2
- * @api private
- */
-
-var rvalidchars = /^[\],:{}\s]*$/;
-var rvalidescape = /\\(?:["\\\/bfnrt]|u[0-9a-fA-F]{4})/g;
-var rvalidtokens = /"[^"\\\n\r]*"|true|false|null|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?/g;
-var rvalidbraces = /(?:^|:|,)(?:\s*\[)+/g;
-var rtrimLeft = /^\s+/;
-var rtrimRight = /\s+$/;
-
-module.exports = function parsejson(data) {
-  if ('string' != typeof data || !data) {
-    return null;
-  }
-
-  data = data.replace(rtrimLeft, '').replace(rtrimRight, '');
-
-  // Attempt to parse using the native JSON parser first
-  if (global.JSON && JSON.parse) {
-    return JSON.parse(data);
-  }
-
-  if (rvalidchars.test(data.replace(rvalidescape, '@')
-      .replace(rvalidtokens, ']')
-      .replace(rvalidbraces, ''))) {
-    return (new Function('return ' + data))();
-  }
-};
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-
-},{}],104:[function(require,module,exports){
-/**
- * Compiles a querystring
- * Returns string representation of the object
- *
- * @param {Object}
- * @api private
- */
-
-exports.encode = function (obj) {
-  var str = '';
-
-  for (var i in obj) {
-    if (obj.hasOwnProperty(i)) {
-      if (str.length) str += '&';
-      str += encodeURIComponent(i) + '=' + encodeURIComponent(obj[i]);
-    }
-  }
-
-  return str;
-};
-
-/**
- * Parses a simple querystring into an object
- *
- * @param {String} qs
- * @api private
- */
-
-exports.decode = function(qs){
-  var qry = {};
-  var pairs = qs.split('&');
-  for (var i = 0, l = pairs.length; i < l; i++) {
-    var pair = pairs[i].split('=');
-    qry[decodeURIComponent(pair[0])] = decodeURIComponent(pair[1]);
-  }
-  return qry;
-};
-
-},{}],105:[function(require,module,exports){
-/**
- * Parses an URI
- *
- * @author Steven Levithan <stevenlevithan.com> (MIT license)
- * @api private
- */
-
-var re = /^(?:(?![^:@]+:[^:@\/]*@)(http|https|ws|wss):\/\/)?((?:(([^:@]*)(?::([^:@]*))?)?@)?((?:[a-f0-9]{0,4}:){2,7}[a-f0-9]{0,4}|[^:\/?#]*)(?::(\d*))?)(((\/(?:[^?#](?![^?#\/]*\.[^?#\/.]+(?:[?#]|$)))*\/?)?([^?#\/]*))(?:\?([^#]*))?(?:#(.*))?)/;
-
-var parts = [
-    'source', 'protocol', 'authority', 'userInfo', 'user', 'password', 'host'
-  , 'port', 'relative', 'path', 'directory', 'file', 'query', 'anchor'
-];
-
-module.exports = function parseuri(str) {
-  var m = re.exec(str || '')
-    , uri = {}
-    , i = 14;
-
-  while (i--) {
-    uri[parts[i]] = m[i] || '';
-  }
-
-  return uri;
-};
-
-},{}],106:[function(require,module,exports){
-// shim for using process in browser
-var process = module.exports = {};
-
-// cached from whatever global is present so that test runners that stub it
-// don't break things.  But we need to wrap it in a try catch in case it is
-// wrapped in strict mode code which doesn't define any globals.  It's inside a
-// function because try/catches deoptimize in certain engines.
-
-var cachedSetTimeout;
-var cachedClearTimeout;
-
-function defaultSetTimout() {
-    throw new Error('setTimeout has not been defined');
-}
-function defaultClearTimeout () {
-    throw new Error('clearTimeout has not been defined');
-}
-(function () {
-    try {
-        if (typeof setTimeout === 'function') {
-            cachedSetTimeout = setTimeout;
-        } else {
-            cachedSetTimeout = defaultSetTimout;
-        }
-    } catch (e) {
-        cachedSetTimeout = defaultSetTimout;
-    }
-    try {
-        if (typeof clearTimeout === 'function') {
-            cachedClearTimeout = clearTimeout;
-        } else {
-            cachedClearTimeout = defaultClearTimeout;
-        }
-    } catch (e) {
-        cachedClearTimeout = defaultClearTimeout;
-    }
-} ())
-function runTimeout(fun) {
-    if (cachedSetTimeout === setTimeout) {
-        //normal enviroments in sane situations
-        return setTimeout(fun, 0);
-    }
-    // if setTimeout wasn't available but was latter defined
-    if ((cachedSetTimeout === defaultSetTimout || !cachedSetTimeout) && setTimeout) {
-        cachedSetTimeout = setTimeout;
-        return setTimeout(fun, 0);
-    }
-    try {
-        // when when somebody has screwed with setTimeout but no I.E. maddness
-        return cachedSetTimeout(fun, 0);
-    } catch(e){
-        try {
-            // When we are in I.E. but the script has been evaled so I.E. doesn't trust the global object when called normally
-            return cachedSetTimeout.call(null, fun, 0);
-        } catch(e){
-            // same as above but when it's a version of I.E. that must have the global object for 'this', hopfully our context correct otherwise it will throw a global error
-            return cachedSetTimeout.call(this, fun, 0);
-        }
-    }
-
-
-}
-function runClearTimeout(marker) {
-    if (cachedClearTimeout === clearTimeout) {
-        //normal enviroments in sane situations
-        return clearTimeout(marker);
-    }
-    // if clearTimeout wasn't available but was latter defined
-    if ((cachedClearTimeout === defaultClearTimeout || !cachedClearTimeout) && clearTimeout) {
-        cachedClearTimeout = clearTimeout;
-        return clearTimeout(marker);
-    }
-    try {
-        // when when somebody has screwed with setTimeout but no I.E. maddness
-        return cachedClearTimeout(marker);
-    } catch (e){
-        try {
-            // When we are in I.E. but the script has been evaled so I.E. doesn't  trust the global object when called normally
-            return cachedClearTimeout.call(null, marker);
-        } catch (e){
-            // same as above but when it's a version of I.E. that must have the global object for 'this', hopfully our context correct otherwise it will throw a global error.
-            // Some versions of I.E. have different rules for clearTimeout vs setTimeout
-            return cachedClearTimeout.call(this, marker);
-        }
-    }
-
-
-
-}
-var queue = [];
-var draining = false;
-var currentQueue;
-var queueIndex = -1;
-
-function cleanUpNextTick() {
-    if (!draining || !currentQueue) {
-        return;
-    }
-    draining = false;
-    if (currentQueue.length) {
-        queue = currentQueue.concat(queue);
-    } else {
-        queueIndex = -1;
-    }
-    if (queue.length) {
-        drainQueue();
-    }
-}
-
-function drainQueue() {
-    if (draining) {
-        return;
-    }
-    var timeout = runTimeout(cleanUpNextTick);
-    draining = true;
-
-    var len = queue.length;
-    while(len) {
-        currentQueue = queue;
-        queue = [];
-        while (++queueIndex < len) {
-            if (currentQueue) {
-                currentQueue[queueIndex].run();
-            }
-        }
-        queueIndex = -1;
-        len = queue.length;
-    }
-    currentQueue = null;
-    draining = false;
-    runClearTimeout(timeout);
-}
-
-process.nextTick = function (fun) {
-    var args = new Array(arguments.length - 1);
-    if (arguments.length > 1) {
-        for (var i = 1; i < arguments.length; i++) {
-            args[i - 1] = arguments[i];
-        }
-    }
-    queue.push(new Item(fun, args));
-    if (queue.length === 1 && !draining) {
-        runTimeout(drainQueue);
-    }
-};
-
-// v8 likes predictible objects
-function Item(fun, array) {
-    this.fun = fun;
-    this.array = array;
-}
-Item.prototype.run = function () {
-    this.fun.apply(null, this.array);
-};
-process.title = 'browser';
-process.browser = true;
-process.env = {};
-process.argv = [];
-process.version = ''; // empty string to avoid regexp issues
-process.versions = {};
-
-function noop() {}
-
-process.on = noop;
-process.addListener = noop;
-process.once = noop;
-process.off = noop;
-process.removeListener = noop;
-process.removeAllListeners = noop;
-process.emit = noop;
-
-process.binding = function (name) {
-    throw new Error('process.binding is not supported');
-};
-
-process.cwd = function () { return '/' };
-process.chdir = function (dir) {
-    throw new Error('process.chdir is not supported');
-};
-process.umask = function() { return 0; };
-
-},{}],107:[function(require,module,exports){
+},{}],86:[function(require,module,exports){
 /* Copyright @ 2015 Atlassian Pty Ltd
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29922,7 +29116,7 @@ module.exports = function arrayEquals(array) {
 };
 
 
-},{}],108:[function(require,module,exports){
+},{}],87:[function(require,module,exports){
 /* Copyright @ 2015 Atlassian Pty Ltd
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29940,7 +29134,7 @@ module.exports = function arrayEquals(array) {
 
 exports.Interop = require('./interop');
 
-},{"./interop":109}],109:[function(require,module,exports){
+},{"./interop":88}],88:[function(require,module,exports){
 /* Copyright @ 2015 Atlassian Pty Ltd
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30663,7 +29857,7 @@ Interop.prototype.toUnifiedPlan = function(desc) {
     //#endregion
 };
 
-},{"./array-equals":107,"./transform":110}],110:[function(require,module,exports){
+},{"./array-equals":86,"./transform":89}],89:[function(require,module,exports){
 /* Copyright @ 2015 Atlassian Pty Ltd
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30777,7 +29971,7 @@ exports.parse = function(sdp) {
 };
 
 
-},{"sdp-transform":114}],111:[function(require,module,exports){
+},{"sdp-transform":93}],90:[function(require,module,exports){
 /* Copyright @ 2015 Atlassian Pty Ltd
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31026,14 +30220,27 @@ Simulcast.prototype._maybeInitializeLayers = function(mLine) {
     }
 
     // find the base layer (we'll reuse its msid and cname).
-    var baseLayerSSRC = Object.keys(sources)[0];
+    var baseLayerSSRC;
+    // If we have stored layers the first one is the base layer, but pick it
+    // only if it's SSRC still exists in local description. If not then
+    // the layers will be reinitialized(baseline SSRCs will not match).
+    if (this.layers.length > 0 && sources[this.layers[0].ssrc]) {
+        baseLayerSSRC = this.layers[0].ssrc;
+    } else {
+        // FIXME Picking first key is ok only if there is 1 SSRC, otherwise
+        // Object keys will be sorted in ascending order. Usually this is
+        // the initialization case when there are no layers.
+        // Object.keys() returns string
+        baseLayerSSRC = parseInt(Object.keys(sources)[0]);
+    }
     var baseLayer = sources[baseLayerSSRC];
 
     // todo(gp) handle screen sharing.
 
-    // check if base CNAME has changed and reinitialise layers.
+    // check if base CNAME or SSRC has changed and reinitialise layers.
     if (this.layers.length > 0
-        && sources[baseLayerSSRC].cname !== this.layers[0].cname) {
+        && (baseLayer.cname !== this.layers[0].cname ||
+            baseLayerSSRC !== this.layers[0].ssrc)) {
         this.layers = [];
     }
 
@@ -31201,7 +30408,7 @@ Simulcast.prototype.mungeLocalDescription = function (desc) {
 
 module.exports = Simulcast;
 
-},{"./transform-utils":112,"sdp-transform":114}],112:[function(require,module,exports){
+},{"./transform-utils":91,"sdp-transform":93}],91:[function(require,module,exports){
 /* Copyright @ 2015 Atlassian Pty Ltd
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31252,6 +30459,7 @@ exports.writeSsrcs = function(sources, order) {
 
     // Now add the rest of the sources.
     Object.keys(sources).forEach(function (ssrc) {
+      ssrc = parseInt(ssrc); // Object.keys() returns string
       if (order.indexOf(ssrc) >= 0) {
         // Already added.
         return;
@@ -31285,7 +30493,7 @@ exports.parseSsrcs = function (mLine) {
 };
 
 
-},{}],113:[function(require,module,exports){
+},{}],92:[function(require,module,exports){
 var grammar = module.exports = {
   v: [{
       name: 'version',
@@ -31544,7 +30752,7 @@ Object.keys(grammar).forEach(function (key) {
   });
 });
 
-},{}],114:[function(require,module,exports){
+},{}],93:[function(require,module,exports){
 var parser = require('./parser');
 var writer = require('./writer');
 
@@ -31554,7 +30762,7 @@ exports.parseFmtpConfig = parser.parseFmtpConfig;
 exports.parsePayloads = parser.parsePayloads;
 exports.parseRemoteCandidates = parser.parseRemoteCandidates;
 
-},{"./parser":115,"./writer":116}],115:[function(require,module,exports){
+},{"./parser":94,"./writer":95}],94:[function(require,module,exports){
 var toIntIfInt = function (v) {
   return String(Number(v)) === v ? Number(v) : v;
 };
@@ -31649,7 +30857,7 @@ exports.parseRemoteCandidates = function (str) {
   return candidates;
 };
 
-},{"./grammar":113}],116:[function(require,module,exports){
+},{"./grammar":92}],95:[function(require,module,exports){
 var grammar = require('./grammar');
 
 // customized util.format - discards excess arguments and can void middle ones
@@ -31765,11 +30973,11 @@ module.exports = function (session, opts) {
   return sdp.join('\r\n') + '\r\n';
 };
 
-},{"./grammar":113}],117:[function(require,module,exports){
+},{"./grammar":92}],96:[function(require,module,exports){
 
 module.exports = require('./lib/');
 
-},{"./lib/":118}],118:[function(require,module,exports){
+},{"./lib/":97}],97:[function(require,module,exports){
 
 /**
  * Module dependencies.
@@ -31858,7 +31066,7 @@ exports.connect = lookup;
 exports.Manager = require('./manager');
 exports.Socket = require('./socket');
 
-},{"./manager":119,"./socket":121,"./url":122,"debug":58,"socket.io-parser":124}],119:[function(require,module,exports){
+},{"./manager":98,"./socket":100,"./url":101,"debug":105,"socket.io-parser":141}],98:[function(require,module,exports){
 
 /**
  * Module dependencies.
@@ -32363,7 +31571,7 @@ Manager.prototype.onreconnect = function(){
   this.emitAll('reconnect', attempt);
 };
 
-},{"./on":120,"./socket":121,"./url":122,"backo2":51,"component-bind":55,"component-emitter":56,"debug":58,"engine.io-client":59,"indexof":79,"object-component":86,"socket.io-parser":124}],120:[function(require,module,exports){
+},{"./on":99,"./socket":100,"./url":101,"backo2":102,"component-bind":103,"component-emitter":104,"debug":105,"engine.io-client":106,"indexof":137,"object-component":138,"socket.io-parser":141}],99:[function(require,module,exports){
 
 /**
  * Module exports.
@@ -32389,7 +31597,7 @@ function on(obj, ev, fn) {
   };
 }
 
-},{}],121:[function(require,module,exports){
+},{}],100:[function(require,module,exports){
 
 /**
  * Module dependencies.
@@ -32776,7 +31984,7 @@ Socket.prototype.disconnect = function(){
   return this;
 };
 
-},{"./on":120,"component-bind":55,"component-emitter":56,"debug":58,"has-binary":77,"socket.io-parser":124,"to-array":126}],122:[function(require,module,exports){
+},{"./on":99,"component-bind":103,"component-emitter":104,"debug":105,"has-binary":135,"socket.io-parser":141,"to-array":145}],101:[function(require,module,exports){
 (function (global){
 
 /**
@@ -32854,7 +32062,4482 @@ function url(uri, loc){
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{"debug":58,"parseuri":105}],123:[function(require,module,exports){
+},{"debug":105,"parseuri":139}],102:[function(require,module,exports){
+
+/**
+ * Expose `Backoff`.
+ */
+
+module.exports = Backoff;
+
+/**
+ * Initialize backoff timer with `opts`.
+ *
+ * - `min` initial timeout in milliseconds [100]
+ * - `max` max timeout [10000]
+ * - `jitter` [0]
+ * - `factor` [2]
+ *
+ * @param {Object} opts
+ * @api public
+ */
+
+function Backoff(opts) {
+  opts = opts || {};
+  this.ms = opts.min || 100;
+  this.max = opts.max || 10000;
+  this.factor = opts.factor || 2;
+  this.jitter = opts.jitter > 0 && opts.jitter <= 1 ? opts.jitter : 0;
+  this.attempts = 0;
+}
+
+/**
+ * Return the backoff duration.
+ *
+ * @return {Number}
+ * @api public
+ */
+
+Backoff.prototype.duration = function(){
+  var ms = this.ms * Math.pow(this.factor, this.attempts++);
+  if (this.jitter) {
+    var rand =  Math.random();
+    var deviation = Math.floor(rand * this.jitter * ms);
+    ms = (Math.floor(rand * 10) & 1) == 0  ? ms - deviation : ms + deviation;
+  }
+  return Math.min(ms, this.max) | 0;
+};
+
+/**
+ * Reset the number of attempts.
+ *
+ * @api public
+ */
+
+Backoff.prototype.reset = function(){
+  this.attempts = 0;
+};
+
+/**
+ * Set the minimum duration
+ *
+ * @api public
+ */
+
+Backoff.prototype.setMin = function(min){
+  this.ms = min;
+};
+
+/**
+ * Set the maximum duration
+ *
+ * @api public
+ */
+
+Backoff.prototype.setMax = function(max){
+  this.max = max;
+};
+
+/**
+ * Set the jitter
+ *
+ * @api public
+ */
+
+Backoff.prototype.setJitter = function(jitter){
+  this.jitter = jitter;
+};
+
+
+},{}],103:[function(require,module,exports){
+/**
+ * Slice reference.
+ */
+
+var slice = [].slice;
+
+/**
+ * Bind `obj` to `fn`.
+ *
+ * @param {Object} obj
+ * @param {Function|String} fn or string
+ * @return {Function}
+ * @api public
+ */
+
+module.exports = function(obj, fn){
+  if ('string' == typeof fn) fn = obj[fn];
+  if ('function' != typeof fn) throw new Error('bind() requires a function');
+  var args = slice.call(arguments, 2);
+  return function(){
+    return fn.apply(obj, args.concat(slice.call(arguments)));
+  }
+};
+
+},{}],104:[function(require,module,exports){
+
+/**
+ * Expose `Emitter`.
+ */
+
+module.exports = Emitter;
+
+/**
+ * Initialize a new `Emitter`.
+ *
+ * @api public
+ */
+
+function Emitter(obj) {
+  if (obj) return mixin(obj);
+};
+
+/**
+ * Mixin the emitter properties.
+ *
+ * @param {Object} obj
+ * @return {Object}
+ * @api private
+ */
+
+function mixin(obj) {
+  for (var key in Emitter.prototype) {
+    obj[key] = Emitter.prototype[key];
+  }
+  return obj;
+}
+
+/**
+ * Listen on the given `event` with `fn`.
+ *
+ * @param {String} event
+ * @param {Function} fn
+ * @return {Emitter}
+ * @api public
+ */
+
+Emitter.prototype.on =
+Emitter.prototype.addEventListener = function(event, fn){
+  this._callbacks = this._callbacks || {};
+  (this._callbacks[event] = this._callbacks[event] || [])
+    .push(fn);
+  return this;
+};
+
+/**
+ * Adds an `event` listener that will be invoked a single
+ * time then automatically removed.
+ *
+ * @param {String} event
+ * @param {Function} fn
+ * @return {Emitter}
+ * @api public
+ */
+
+Emitter.prototype.once = function(event, fn){
+  var self = this;
+  this._callbacks = this._callbacks || {};
+
+  function on() {
+    self.off(event, on);
+    fn.apply(this, arguments);
+  }
+
+  on.fn = fn;
+  this.on(event, on);
+  return this;
+};
+
+/**
+ * Remove the given callback for `event` or all
+ * registered callbacks.
+ *
+ * @param {String} event
+ * @param {Function} fn
+ * @return {Emitter}
+ * @api public
+ */
+
+Emitter.prototype.off =
+Emitter.prototype.removeListener =
+Emitter.prototype.removeAllListeners =
+Emitter.prototype.removeEventListener = function(event, fn){
+  this._callbacks = this._callbacks || {};
+
+  // all
+  if (0 == arguments.length) {
+    this._callbacks = {};
+    return this;
+  }
+
+  // specific event
+  var callbacks = this._callbacks[event];
+  if (!callbacks) return this;
+
+  // remove all handlers
+  if (1 == arguments.length) {
+    delete this._callbacks[event];
+    return this;
+  }
+
+  // remove specific handler
+  var cb;
+  for (var i = 0; i < callbacks.length; i++) {
+    cb = callbacks[i];
+    if (cb === fn || cb.fn === fn) {
+      callbacks.splice(i, 1);
+      break;
+    }
+  }
+  return this;
+};
+
+/**
+ * Emit `event` with the given args.
+ *
+ * @param {String} event
+ * @param {Mixed} ...
+ * @return {Emitter}
+ */
+
+Emitter.prototype.emit = function(event){
+  this._callbacks = this._callbacks || {};
+  var args = [].slice.call(arguments, 1)
+    , callbacks = this._callbacks[event];
+
+  if (callbacks) {
+    callbacks = callbacks.slice(0);
+    for (var i = 0, len = callbacks.length; i < len; ++i) {
+      callbacks[i].apply(this, args);
+    }
+  }
+
+  return this;
+};
+
+/**
+ * Return array of callbacks for `event`.
+ *
+ * @param {String} event
+ * @return {Array}
+ * @api public
+ */
+
+Emitter.prototype.listeners = function(event){
+  this._callbacks = this._callbacks || {};
+  return this._callbacks[event] || [];
+};
+
+/**
+ * Check if this emitter has `event` handlers.
+ *
+ * @param {String} event
+ * @return {Boolean}
+ * @api public
+ */
+
+Emitter.prototype.hasListeners = function(event){
+  return !! this.listeners(event).length;
+};
+
+},{}],105:[function(require,module,exports){
+
+/**
+ * Expose `debug()` as the module.
+ */
+
+module.exports = debug;
+
+/**
+ * Create a debugger with the given `name`.
+ *
+ * @param {String} name
+ * @return {Type}
+ * @api public
+ */
+
+function debug(name) {
+  if (!debug.enabled(name)) return function(){};
+
+  return function(fmt){
+    fmt = coerce(fmt);
+
+    var curr = new Date;
+    var ms = curr - (debug[name] || curr);
+    debug[name] = curr;
+
+    fmt = name
+      + ' '
+      + fmt
+      + ' +' + debug.humanize(ms);
+
+    // This hackery is required for IE8
+    // where `console.log` doesn't have 'apply'
+    window.console
+      && console.log
+      && Function.prototype.apply.call(console.log, console, arguments);
+  }
+}
+
+/**
+ * The currently active debug mode names.
+ */
+
+debug.names = [];
+debug.skips = [];
+
+/**
+ * Enables a debug mode by name. This can include modes
+ * separated by a colon and wildcards.
+ *
+ * @param {String} name
+ * @api public
+ */
+
+debug.enable = function(name) {
+  try {
+    localStorage.debug = name;
+  } catch(e){}
+
+  var split = (name || '').split(/[\s,]+/)
+    , len = split.length;
+
+  for (var i = 0; i < len; i++) {
+    name = split[i].replace('*', '.*?');
+    if (name[0] === '-') {
+      debug.skips.push(new RegExp('^' + name.substr(1) + '$'));
+    }
+    else {
+      debug.names.push(new RegExp('^' + name + '$'));
+    }
+  }
+};
+
+/**
+ * Disable debug output.
+ *
+ * @api public
+ */
+
+debug.disable = function(){
+  debug.enable('');
+};
+
+/**
+ * Humanize the given `ms`.
+ *
+ * @param {Number} m
+ * @return {String}
+ * @api private
+ */
+
+debug.humanize = function(ms) {
+  var sec = 1000
+    , min = 60 * 1000
+    , hour = 60 * min;
+
+  if (ms >= hour) return (ms / hour).toFixed(1) + 'h';
+  if (ms >= min) return (ms / min).toFixed(1) + 'm';
+  if (ms >= sec) return (ms / sec | 0) + 's';
+  return ms + 'ms';
+};
+
+/**
+ * Returns true if the given mode name is enabled, false otherwise.
+ *
+ * @param {String} name
+ * @return {Boolean}
+ * @api public
+ */
+
+debug.enabled = function(name) {
+  for (var i = 0, len = debug.skips.length; i < len; i++) {
+    if (debug.skips[i].test(name)) {
+      return false;
+    }
+  }
+  for (var i = 0, len = debug.names.length; i < len; i++) {
+    if (debug.names[i].test(name)) {
+      return true;
+    }
+  }
+  return false;
+};
+
+/**
+ * Coerce `val`.
+ */
+
+function coerce(val) {
+  if (val instanceof Error) return val.stack || val.message;
+  return val;
+}
+
+// persist
+
+try {
+  if (window.localStorage) debug.enable(localStorage.debug);
+} catch(e){}
+
+},{}],106:[function(require,module,exports){
+
+module.exports =  require('./lib/');
+
+},{"./lib/":107}],107:[function(require,module,exports){
+
+module.exports = require('./socket');
+
+/**
+ * Exports parser
+ *
+ * @api public
+ *
+ */
+module.exports.parser = require('engine.io-parser');
+
+},{"./socket":108,"engine.io-parser":120}],108:[function(require,module,exports){
+(function (global){
+/**
+ * Module dependencies.
+ */
+
+var transports = require('./transports');
+var Emitter = require('component-emitter');
+var debug = require('debug')('engine.io-client:socket');
+var index = require('indexof');
+var parser = require('engine.io-parser');
+var parseuri = require('parseuri');
+var parsejson = require('parsejson');
+var parseqs = require('parseqs');
+
+/**
+ * Module exports.
+ */
+
+module.exports = Socket;
+
+/**
+ * Noop function.
+ *
+ * @api private
+ */
+
+function noop(){}
+
+/**
+ * Socket constructor.
+ *
+ * @param {String|Object} uri or options
+ * @param {Object} options
+ * @api public
+ */
+
+function Socket(uri, opts){
+  if (!(this instanceof Socket)) return new Socket(uri, opts);
+
+  opts = opts || {};
+
+  if (uri && 'object' == typeof uri) {
+    opts = uri;
+    uri = null;
+  }
+
+  if (uri) {
+    uri = parseuri(uri);
+    opts.host = uri.host;
+    opts.secure = uri.protocol == 'https' || uri.protocol == 'wss';
+    opts.port = uri.port;
+    if (uri.query) opts.query = uri.query;
+  }
+
+  this.secure = null != opts.secure ? opts.secure :
+    (global.location && 'https:' == location.protocol);
+
+  if (opts.host) {
+    var pieces = opts.host.split(':');
+    opts.hostname = pieces.shift();
+    if (pieces.length) {
+      opts.port = pieces.pop();
+    } else if (!opts.port) {
+      // if no port is specified manually, use the protocol default
+      opts.port = this.secure ? '443' : '80';
+    }
+  }
+
+  this.agent = opts.agent || false;
+  this.hostname = opts.hostname ||
+    (global.location ? location.hostname : 'localhost');
+  this.port = opts.port || (global.location && location.port ?
+       location.port :
+       (this.secure ? 443 : 80));
+  this.query = opts.query || {};
+  if ('string' == typeof this.query) this.query = parseqs.decode(this.query);
+  this.upgrade = false !== opts.upgrade;
+  this.path = (opts.path || '/engine.io').replace(/\/$/, '') + '/';
+  this.forceJSONP = !!opts.forceJSONP;
+  this.jsonp = false !== opts.jsonp;
+  this.forceBase64 = !!opts.forceBase64;
+  this.enablesXDR = !!opts.enablesXDR;
+  this.timestampParam = opts.timestampParam || 't';
+  this.timestampRequests = opts.timestampRequests;
+  this.transports = opts.transports || ['polling', 'websocket'];
+  this.readyState = '';
+  this.writeBuffer = [];
+  this.callbackBuffer = [];
+  this.policyPort = opts.policyPort || 843;
+  this.rememberUpgrade = opts.rememberUpgrade || false;
+  this.binaryType = null;
+  this.onlyBinaryUpgrades = opts.onlyBinaryUpgrades;
+
+  // SSL options for Node.js client
+  this.pfx = opts.pfx || null;
+  this.key = opts.key || null;
+  this.passphrase = opts.passphrase || null;
+  this.cert = opts.cert || null;
+  this.ca = opts.ca || null;
+  this.ciphers = opts.ciphers || null;
+  this.rejectUnauthorized = opts.rejectUnauthorized || null;
+
+  this.open();
+}
+
+Socket.priorWebsocketSuccess = false;
+
+/**
+ * Mix in `Emitter`.
+ */
+
+Emitter(Socket.prototype);
+
+/**
+ * Protocol version.
+ *
+ * @api public
+ */
+
+Socket.protocol = parser.protocol; // this is an int
+
+/**
+ * Expose deps for legacy compatibility
+ * and standalone browser access.
+ */
+
+Socket.Socket = Socket;
+Socket.Transport = require('./transport');
+Socket.transports = require('./transports');
+Socket.parser = require('engine.io-parser');
+
+/**
+ * Creates transport of the given type.
+ *
+ * @param {String} transport name
+ * @return {Transport}
+ * @api private
+ */
+
+Socket.prototype.createTransport = function (name) {
+  debug('creating transport "%s"', name);
+  var query = clone(this.query);
+
+  // append engine.io protocol identifier
+  query.EIO = parser.protocol;
+
+  // transport name
+  query.transport = name;
+
+  // session id if we already have one
+  if (this.id) query.sid = this.id;
+
+  var transport = new transports[name]({
+    agent: this.agent,
+    hostname: this.hostname,
+    port: this.port,
+    secure: this.secure,
+    path: this.path,
+    query: query,
+    forceJSONP: this.forceJSONP,
+    jsonp: this.jsonp,
+    forceBase64: this.forceBase64,
+    enablesXDR: this.enablesXDR,
+    timestampRequests: this.timestampRequests,
+    timestampParam: this.timestampParam,
+    policyPort: this.policyPort,
+    socket: this,
+    pfx: this.pfx,
+    key: this.key,
+    passphrase: this.passphrase,
+    cert: this.cert,
+    ca: this.ca,
+    ciphers: this.ciphers,
+    rejectUnauthorized: this.rejectUnauthorized
+  });
+
+  return transport;
+};
+
+function clone (obj) {
+  var o = {};
+  for (var i in obj) {
+    if (obj.hasOwnProperty(i)) {
+      o[i] = obj[i];
+    }
+  }
+  return o;
+}
+
+/**
+ * Initializes transport to use and starts probe.
+ *
+ * @api private
+ */
+Socket.prototype.open = function () {
+  var transport;
+  if (this.rememberUpgrade && Socket.priorWebsocketSuccess && this.transports.indexOf('websocket') != -1) {
+    transport = 'websocket';
+  } else if (0 == this.transports.length) {
+    // Emit error on next tick so it can be listened to
+    var self = this;
+    setTimeout(function() {
+      self.emit('error', 'No transports available');
+    }, 0);
+    return;
+  } else {
+    transport = this.transports[0];
+  }
+  this.readyState = 'opening';
+
+  // Retry with the next transport if the transport is disabled (jsonp: false)
+  var transport;
+  try {
+    transport = this.createTransport(transport);
+  } catch (e) {
+    this.transports.shift();
+    this.open();
+    return;
+  }
+
+  transport.open();
+  this.setTransport(transport);
+};
+
+/**
+ * Sets the current transport. Disables the existing one (if any).
+ *
+ * @api private
+ */
+
+Socket.prototype.setTransport = function(transport){
+  debug('setting transport %s', transport.name);
+  var self = this;
+
+  if (this.transport) {
+    debug('clearing existing transport %s', this.transport.name);
+    this.transport.removeAllListeners();
+  }
+
+  // set up transport
+  this.transport = transport;
+
+  // set up transport listeners
+  transport
+  .on('drain', function(){
+    self.onDrain();
+  })
+  .on('packet', function(packet){
+    self.onPacket(packet);
+  })
+  .on('error', function(e){
+    self.onError(e);
+  })
+  .on('close', function(){
+    self.onClose('transport close');
+  });
+};
+
+/**
+ * Probes a transport.
+ *
+ * @param {String} transport name
+ * @api private
+ */
+
+Socket.prototype.probe = function (name) {
+  debug('probing transport "%s"', name);
+  var transport = this.createTransport(name, { probe: 1 })
+    , failed = false
+    , self = this;
+
+  Socket.priorWebsocketSuccess = false;
+
+  function onTransportOpen(){
+    if (self.onlyBinaryUpgrades) {
+      var upgradeLosesBinary = !this.supportsBinary && self.transport.supportsBinary;
+      failed = failed || upgradeLosesBinary;
+    }
+    if (failed) return;
+
+    debug('probe transport "%s" opened', name);
+    transport.send([{ type: 'ping', data: 'probe' }]);
+    transport.once('packet', function (msg) {
+      if (failed) return;
+      if ('pong' == msg.type && 'probe' == msg.data) {
+        debug('probe transport "%s" pong', name);
+        self.upgrading = true;
+        self.emit('upgrading', transport);
+        if (!transport) return;
+        Socket.priorWebsocketSuccess = 'websocket' == transport.name;
+
+        debug('pausing current transport "%s"', self.transport.name);
+        self.transport.pause(function () {
+          if (failed) return;
+          if ('closed' == self.readyState) return;
+          debug('changing transport and sending upgrade packet');
+
+          cleanup();
+
+          self.setTransport(transport);
+          transport.send([{ type: 'upgrade' }]);
+          self.emit('upgrade', transport);
+          transport = null;
+          self.upgrading = false;
+          self.flush();
+        });
+      } else {
+        debug('probe transport "%s" failed', name);
+        var err = new Error('probe error');
+        err.transport = transport.name;
+        self.emit('upgradeError', err);
+      }
+    });
+  }
+
+  function freezeTransport() {
+    if (failed) return;
+
+    // Any callback called by transport should be ignored since now
+    failed = true;
+
+    cleanup();
+
+    transport.close();
+    transport = null;
+  }
+
+  //Handle any error that happens while probing
+  function onerror(err) {
+    var error = new Error('probe error: ' + err);
+    error.transport = transport.name;
+
+    freezeTransport();
+
+    debug('probe transport "%s" failed because of error: %s', name, err);
+
+    self.emit('upgradeError', error);
+  }
+
+  function onTransportClose(){
+    onerror("transport closed");
+  }
+
+  //When the socket is closed while we're probing
+  function onclose(){
+    onerror("socket closed");
+  }
+
+  //When the socket is upgraded while we're probing
+  function onupgrade(to){
+    if (transport && to.name != transport.name) {
+      debug('"%s" works - aborting "%s"', to.name, transport.name);
+      freezeTransport();
+    }
+  }
+
+  //Remove all listeners on the transport and on self
+  function cleanup(){
+    transport.removeListener('open', onTransportOpen);
+    transport.removeListener('error', onerror);
+    transport.removeListener('close', onTransportClose);
+    self.removeListener('close', onclose);
+    self.removeListener('upgrading', onupgrade);
+  }
+
+  transport.once('open', onTransportOpen);
+  transport.once('error', onerror);
+  transport.once('close', onTransportClose);
+
+  this.once('close', onclose);
+  this.once('upgrading', onupgrade);
+
+  transport.open();
+
+};
+
+/**
+ * Called when connection is deemed open.
+ *
+ * @api public
+ */
+
+Socket.prototype.onOpen = function () {
+  debug('socket open');
+  this.readyState = 'open';
+  Socket.priorWebsocketSuccess = 'websocket' == this.transport.name;
+  this.emit('open');
+  this.flush();
+
+  // we check for `readyState` in case an `open`
+  // listener already closed the socket
+  if ('open' == this.readyState && this.upgrade && this.transport.pause) {
+    debug('starting upgrade probes');
+    for (var i = 0, l = this.upgrades.length; i < l; i++) {
+      this.probe(this.upgrades[i]);
+    }
+  }
+};
+
+/**
+ * Handles a packet.
+ *
+ * @api private
+ */
+
+Socket.prototype.onPacket = function (packet) {
+  if ('opening' == this.readyState || 'open' == this.readyState) {
+    debug('socket receive: type "%s", data "%s"', packet.type, packet.data);
+
+    this.emit('packet', packet);
+
+    // Socket is live - any packet counts
+    this.emit('heartbeat');
+
+    switch (packet.type) {
+      case 'open':
+        this.onHandshake(parsejson(packet.data));
+        break;
+
+      case 'pong':
+        this.setPing();
+        break;
+
+      case 'error':
+        var err = new Error('server error');
+        err.code = packet.data;
+        this.emit('error', err);
+        break;
+
+      case 'message':
+        this.emit('data', packet.data);
+        this.emit('message', packet.data);
+        break;
+    }
+  } else {
+    debug('packet received with socket readyState "%s"', this.readyState);
+  }
+};
+
+/**
+ * Called upon handshake completion.
+ *
+ * @param {Object} handshake obj
+ * @api private
+ */
+
+Socket.prototype.onHandshake = function (data) {
+  this.emit('handshake', data);
+  this.id = data.sid;
+  this.transport.query.sid = data.sid;
+  this.upgrades = this.filterUpgrades(data.upgrades);
+  this.pingInterval = data.pingInterval;
+  this.pingTimeout = data.pingTimeout;
+  this.onOpen();
+  // In case open handler closes socket
+  if  ('closed' == this.readyState) return;
+  this.setPing();
+
+  // Prolong liveness of socket on heartbeat
+  this.removeListener('heartbeat', this.onHeartbeat);
+  this.on('heartbeat', this.onHeartbeat);
+};
+
+/**
+ * Resets ping timeout.
+ *
+ * @api private
+ */
+
+Socket.prototype.onHeartbeat = function (timeout) {
+  clearTimeout(this.pingTimeoutTimer);
+  var self = this;
+  self.pingTimeoutTimer = setTimeout(function () {
+    if ('closed' == self.readyState) return;
+    self.onClose('ping timeout');
+  }, timeout || (self.pingInterval + self.pingTimeout));
+};
+
+/**
+ * Pings server every `this.pingInterval` and expects response
+ * within `this.pingTimeout` or closes connection.
+ *
+ * @api private
+ */
+
+Socket.prototype.setPing = function () {
+  var self = this;
+  clearTimeout(self.pingIntervalTimer);
+  self.pingIntervalTimer = setTimeout(function () {
+    debug('writing ping packet - expecting pong within %sms', self.pingTimeout);
+    self.ping();
+    self.onHeartbeat(self.pingTimeout);
+  }, self.pingInterval);
+};
+
+/**
+* Sends a ping packet.
+*
+* @api public
+*/
+
+Socket.prototype.ping = function () {
+  this.sendPacket('ping');
+};
+
+/**
+ * Called on `drain` event
+ *
+ * @api private
+ */
+
+Socket.prototype.onDrain = function() {
+  for (var i = 0; i < this.prevBufferLen; i++) {
+    if (this.callbackBuffer[i]) {
+      this.callbackBuffer[i]();
+    }
+  }
+
+  this.writeBuffer.splice(0, this.prevBufferLen);
+  this.callbackBuffer.splice(0, this.prevBufferLen);
+
+  // setting prevBufferLen = 0 is very important
+  // for example, when upgrading, upgrade packet is sent over,
+  // and a nonzero prevBufferLen could cause problems on `drain`
+  this.prevBufferLen = 0;
+
+  if (this.writeBuffer.length == 0) {
+    this.emit('drain');
+  } else {
+    this.flush();
+  }
+};
+
+/**
+ * Flush write buffers.
+ *
+ * @api private
+ */
+
+Socket.prototype.flush = function () {
+  if ('closed' != this.readyState && this.transport.writable &&
+    !this.upgrading && this.writeBuffer.length) {
+    debug('flushing %d packets in socket', this.writeBuffer.length);
+    this.transport.send(this.writeBuffer);
+    // keep track of current length of writeBuffer
+    // splice writeBuffer and callbackBuffer on `drain`
+    this.prevBufferLen = this.writeBuffer.length;
+    this.emit('flush');
+  }
+};
+
+/**
+ * Sends a message.
+ *
+ * @param {String} message.
+ * @param {Function} callback function.
+ * @return {Socket} for chaining.
+ * @api public
+ */
+
+Socket.prototype.write =
+Socket.prototype.send = function (msg, fn) {
+  this.sendPacket('message', msg, fn);
+  return this;
+};
+
+/**
+ * Sends a packet.
+ *
+ * @param {String} packet type.
+ * @param {String} data.
+ * @param {Function} callback function.
+ * @api private
+ */
+
+Socket.prototype.sendPacket = function (type, data, fn) {
+  if ('closing' == this.readyState || 'closed' == this.readyState) {
+    return;
+  }
+
+  var packet = { type: type, data: data };
+  this.emit('packetCreate', packet);
+  this.writeBuffer.push(packet);
+  this.callbackBuffer.push(fn);
+  this.flush();
+};
+
+/**
+ * Closes the connection.
+ *
+ * @api private
+ */
+
+Socket.prototype.close = function () {
+  if ('opening' == this.readyState || 'open' == this.readyState) {
+    this.readyState = 'closing';
+
+    var self = this;
+
+    function close() {
+      self.onClose('forced close');
+      debug('socket closing - telling transport to close');
+      self.transport.close();
+    }
+
+    function cleanupAndClose() {
+      self.removeListener('upgrade', cleanupAndClose);
+      self.removeListener('upgradeError', cleanupAndClose);
+      close();
+    }
+
+    function waitForUpgrade() {
+      // wait for upgrade to finish since we can't send packets while pausing a transport
+      self.once('upgrade', cleanupAndClose);
+      self.once('upgradeError', cleanupAndClose);
+    }
+
+    if (this.writeBuffer.length) {
+      this.once('drain', function() {
+        if (this.upgrading) {
+          waitForUpgrade();
+        } else {
+          close();
+        }
+      });
+    } else if (this.upgrading) {
+      waitForUpgrade();
+    } else {
+      close();
+    }
+  }
+
+  return this;
+};
+
+/**
+ * Called upon transport error
+ *
+ * @api private
+ */
+
+Socket.prototype.onError = function (err) {
+  debug('socket error %j', err);
+  Socket.priorWebsocketSuccess = false;
+  this.emit('error', err);
+  this.onClose('transport error', err);
+};
+
+/**
+ * Called upon transport close.
+ *
+ * @api private
+ */
+
+Socket.prototype.onClose = function (reason, desc) {
+  if ('opening' == this.readyState || 'open' == this.readyState || 'closing' == this.readyState) {
+    debug('socket close with reason: "%s"', reason);
+    var self = this;
+
+    // clear timers
+    clearTimeout(this.pingIntervalTimer);
+    clearTimeout(this.pingTimeoutTimer);
+
+    // clean buffers in next tick, so developers can still
+    // grab the buffers on `close` event
+    setTimeout(function() {
+      self.writeBuffer = [];
+      self.callbackBuffer = [];
+      self.prevBufferLen = 0;
+    }, 0);
+
+    // stop event from firing again for transport
+    this.transport.removeAllListeners('close');
+
+    // ensure transport won't stay open
+    this.transport.close();
+
+    // ignore further transport communication
+    this.transport.removeAllListeners();
+
+    // set ready state
+    this.readyState = 'closed';
+
+    // clear session id
+    this.id = null;
+
+    // emit close event
+    this.emit('close', reason, desc);
+  }
+};
+
+/**
+ * Filters upgrades, returning only those matching client transports.
+ *
+ * @param {Array} server upgrades
+ * @api private
+ *
+ */
+
+Socket.prototype.filterUpgrades = function (upgrades) {
+  var filteredUpgrades = [];
+  for (var i = 0, j = upgrades.length; i<j; i++) {
+    if (~index(this.transports, upgrades[i])) filteredUpgrades.push(upgrades[i]);
+  }
+  return filteredUpgrades;
+};
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+
+},{"./transport":109,"./transports":110,"component-emitter":104,"debug":117,"engine.io-parser":120,"indexof":137,"parsejson":131,"parseqs":132,"parseuri":133}],109:[function(require,module,exports){
+/**
+ * Module dependencies.
+ */
+
+var parser = require('engine.io-parser');
+var Emitter = require('component-emitter');
+
+/**
+ * Module exports.
+ */
+
+module.exports = Transport;
+
+/**
+ * Transport abstract constructor.
+ *
+ * @param {Object} options.
+ * @api private
+ */
+
+function Transport (opts) {
+  this.path = opts.path;
+  this.hostname = opts.hostname;
+  this.port = opts.port;
+  this.secure = opts.secure;
+  this.query = opts.query;
+  this.timestampParam = opts.timestampParam;
+  this.timestampRequests = opts.timestampRequests;
+  this.readyState = '';
+  this.agent = opts.agent || false;
+  this.socket = opts.socket;
+  this.enablesXDR = opts.enablesXDR;
+
+  // SSL options for Node.js client
+  this.pfx = opts.pfx;
+  this.key = opts.key;
+  this.passphrase = opts.passphrase;
+  this.cert = opts.cert;
+  this.ca = opts.ca;
+  this.ciphers = opts.ciphers;
+  this.rejectUnauthorized = opts.rejectUnauthorized;
+}
+
+/**
+ * Mix in `Emitter`.
+ */
+
+Emitter(Transport.prototype);
+
+/**
+ * A counter used to prevent collisions in the timestamps used
+ * for cache busting.
+ */
+
+Transport.timestamps = 0;
+
+/**
+ * Emits an error.
+ *
+ * @param {String} str
+ * @return {Transport} for chaining
+ * @api public
+ */
+
+Transport.prototype.onError = function (msg, desc) {
+  var err = new Error(msg);
+  err.type = 'TransportError';
+  err.description = desc;
+  this.emit('error', err);
+  return this;
+};
+
+/**
+ * Opens the transport.
+ *
+ * @api public
+ */
+
+Transport.prototype.open = function () {
+  if ('closed' == this.readyState || '' == this.readyState) {
+    this.readyState = 'opening';
+    this.doOpen();
+  }
+
+  return this;
+};
+
+/**
+ * Closes the transport.
+ *
+ * @api private
+ */
+
+Transport.prototype.close = function () {
+  if ('opening' == this.readyState || 'open' == this.readyState) {
+    this.doClose();
+    this.onClose();
+  }
+
+  return this;
+};
+
+/**
+ * Sends multiple packets.
+ *
+ * @param {Array} packets
+ * @api private
+ */
+
+Transport.prototype.send = function(packets){
+  if ('open' == this.readyState) {
+    this.write(packets);
+  } else {
+    throw new Error('Transport not open');
+  }
+};
+
+/**
+ * Called upon open
+ *
+ * @api private
+ */
+
+Transport.prototype.onOpen = function () {
+  this.readyState = 'open';
+  this.writable = true;
+  this.emit('open');
+};
+
+/**
+ * Called with data.
+ *
+ * @param {String} data
+ * @api private
+ */
+
+Transport.prototype.onData = function(data){
+  var packet = parser.decodePacket(data, this.socket.binaryType);
+  this.onPacket(packet);
+};
+
+/**
+ * Called with a decoded packet.
+ */
+
+Transport.prototype.onPacket = function (packet) {
+  this.emit('packet', packet);
+};
+
+/**
+ * Called upon close.
+ *
+ * @api private
+ */
+
+Transport.prototype.onClose = function () {
+  this.readyState = 'closed';
+  this.emit('close');
+};
+
+},{"component-emitter":104,"engine.io-parser":120}],110:[function(require,module,exports){
+(function (global){
+/**
+ * Module dependencies
+ */
+
+var XMLHttpRequest = require('xmlhttprequest');
+var XHR = require('./polling-xhr');
+var JSONP = require('./polling-jsonp');
+var websocket = require('./websocket');
+
+/**
+ * Export transports.
+ */
+
+exports.polling = polling;
+exports.websocket = websocket;
+
+/**
+ * Polling transport polymorphic constructor.
+ * Decides on xhr vs jsonp based on feature detection.
+ *
+ * @api private
+ */
+
+function polling(opts){
+  var xhr;
+  var xd = false;
+  var xs = false;
+  var jsonp = false !== opts.jsonp;
+
+  if (global.location) {
+    var isSSL = 'https:' == location.protocol;
+    var port = location.port;
+
+    // some user agents have empty `location.port`
+    if (!port) {
+      port = isSSL ? 443 : 80;
+    }
+
+    xd = opts.hostname != location.hostname || port != opts.port;
+    xs = opts.secure != isSSL;
+  }
+
+  opts.xdomain = xd;
+  opts.xscheme = xs;
+  xhr = new XMLHttpRequest(opts);
+
+  if ('open' in xhr && !opts.forceJSONP) {
+    return new XHR(opts);
+  } else {
+    if (!jsonp) throw new Error('JSONP disabled');
+    return new JSONP(opts);
+  }
+}
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+
+},{"./polling-jsonp":111,"./polling-xhr":112,"./websocket":114,"xmlhttprequest":115}],111:[function(require,module,exports){
+(function (global){
+
+/**
+ * Module requirements.
+ */
+
+var Polling = require('./polling');
+var inherit = require('component-inherit');
+
+/**
+ * Module exports.
+ */
+
+module.exports = JSONPPolling;
+
+/**
+ * Cached regular expressions.
+ */
+
+var rNewline = /\n/g;
+var rEscapedNewline = /\\n/g;
+
+/**
+ * Global JSONP callbacks.
+ */
+
+var callbacks;
+
+/**
+ * Callbacks count.
+ */
+
+var index = 0;
+
+/**
+ * Noop.
+ */
+
+function empty () { }
+
+/**
+ * JSONP Polling constructor.
+ *
+ * @param {Object} opts.
+ * @api public
+ */
+
+function JSONPPolling (opts) {
+  Polling.call(this, opts);
+
+  this.query = this.query || {};
+
+  // define global callbacks array if not present
+  // we do this here (lazily) to avoid unneeded global pollution
+  if (!callbacks) {
+    // we need to consider multiple engines in the same page
+    if (!global.___eio) global.___eio = [];
+    callbacks = global.___eio;
+  }
+
+  // callback identifier
+  this.index = callbacks.length;
+
+  // add callback to jsonp global
+  var self = this;
+  callbacks.push(function (msg) {
+    self.onData(msg);
+  });
+
+  // append to query string
+  this.query.j = this.index;
+
+  // prevent spurious errors from being emitted when the window is unloaded
+  if (global.document && global.addEventListener) {
+    global.addEventListener('beforeunload', function () {
+      if (self.script) self.script.onerror = empty;
+    }, false);
+  }
+}
+
+/**
+ * Inherits from Polling.
+ */
+
+inherit(JSONPPolling, Polling);
+
+/*
+ * JSONP only supports binary as base64 encoded strings
+ */
+
+JSONPPolling.prototype.supportsBinary = false;
+
+/**
+ * Closes the socket.
+ *
+ * @api private
+ */
+
+JSONPPolling.prototype.doClose = function () {
+  if (this.script) {
+    this.script.parentNode.removeChild(this.script);
+    this.script = null;
+  }
+
+  if (this.form) {
+    this.form.parentNode.removeChild(this.form);
+    this.form = null;
+    this.iframe = null;
+  }
+
+  Polling.prototype.doClose.call(this);
+};
+
+/**
+ * Starts a poll cycle.
+ *
+ * @api private
+ */
+
+JSONPPolling.prototype.doPoll = function () {
+  var self = this;
+  var script = document.createElement('script');
+
+  if (this.script) {
+    this.script.parentNode.removeChild(this.script);
+    this.script = null;
+  }
+
+  script.async = true;
+  script.src = this.uri();
+  script.onerror = function(e){
+    self.onError('jsonp poll error',e);
+  };
+
+  var insertAt = document.getElementsByTagName('script')[0];
+  insertAt.parentNode.insertBefore(script, insertAt);
+  this.script = script;
+
+  var isUAgecko = 'undefined' != typeof navigator && /gecko/i.test(navigator.userAgent);
+  
+  if (isUAgecko) {
+    setTimeout(function () {
+      var iframe = document.createElement('iframe');
+      document.body.appendChild(iframe);
+      document.body.removeChild(iframe);
+    }, 100);
+  }
+};
+
+/**
+ * Writes with a hidden iframe.
+ *
+ * @param {String} data to send
+ * @param {Function} called upon flush.
+ * @api private
+ */
+
+JSONPPolling.prototype.doWrite = function (data, fn) {
+  var self = this;
+
+  if (!this.form) {
+    var form = document.createElement('form');
+    var area = document.createElement('textarea');
+    var id = this.iframeId = 'eio_iframe_' + this.index;
+    var iframe;
+
+    form.className = 'socketio';
+    form.style.position = 'absolute';
+    form.style.top = '-1000px';
+    form.style.left = '-1000px';
+    form.target = id;
+    form.method = 'POST';
+    form.setAttribute('accept-charset', 'utf-8');
+    area.name = 'd';
+    form.appendChild(area);
+    document.body.appendChild(form);
+
+    this.form = form;
+    this.area = area;
+  }
+
+  this.form.action = this.uri();
+
+  function complete () {
+    initIframe();
+    fn();
+  }
+
+  function initIframe () {
+    if (self.iframe) {
+      try {
+        self.form.removeChild(self.iframe);
+      } catch (e) {
+        self.onError('jsonp polling iframe removal error', e);
+      }
+    }
+
+    try {
+      // ie6 dynamic iframes with target="" support (thanks Chris Lambacher)
+      var html = '<iframe src="javascript:0" name="'+ self.iframeId +'">';
+      iframe = document.createElement(html);
+    } catch (e) {
+      iframe = document.createElement('iframe');
+      iframe.name = self.iframeId;
+      iframe.src = 'javascript:0';
+    }
+
+    iframe.id = self.iframeId;
+
+    self.form.appendChild(iframe);
+    self.iframe = iframe;
+  }
+
+  initIframe();
+
+  // escape \n to prevent it from being converted into \r\n by some UAs
+  // double escaping is required for escaped new lines because unescaping of new lines can be done safely on server-side
+  data = data.replace(rEscapedNewline, '\\\n');
+  this.area.value = data.replace(rNewline, '\\n');
+
+  try {
+    this.form.submit();
+  } catch(e) {}
+
+  if (this.iframe.attachEvent) {
+    this.iframe.onreadystatechange = function(){
+      if (self.iframe.readyState == 'complete') {
+        complete();
+      }
+    };
+  } else {
+    this.iframe.onload = complete;
+  }
+};
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+
+},{"./polling":113,"component-inherit":116}],112:[function(require,module,exports){
+(function (global){
+/**
+ * Module requirements.
+ */
+
+var XMLHttpRequest = require('xmlhttprequest');
+var Polling = require('./polling');
+var Emitter = require('component-emitter');
+var inherit = require('component-inherit');
+var debug = require('debug')('engine.io-client:polling-xhr');
+
+/**
+ * Module exports.
+ */
+
+module.exports = XHR;
+module.exports.Request = Request;
+
+/**
+ * Empty function
+ */
+
+function empty(){}
+
+/**
+ * XHR Polling constructor.
+ *
+ * @param {Object} opts
+ * @api public
+ */
+
+function XHR(opts){
+  Polling.call(this, opts);
+
+  if (global.location) {
+    var isSSL = 'https:' == location.protocol;
+    var port = location.port;
+
+    // some user agents have empty `location.port`
+    if (!port) {
+      port = isSSL ? 443 : 80;
+    }
+
+    this.xd = opts.hostname != global.location.hostname ||
+      port != opts.port;
+    this.xs = opts.secure != isSSL;
+  }
+}
+
+/**
+ * Inherits from Polling.
+ */
+
+inherit(XHR, Polling);
+
+/**
+ * XHR supports binary
+ */
+
+XHR.prototype.supportsBinary = true;
+
+/**
+ * Creates a request.
+ *
+ * @param {String} method
+ * @api private
+ */
+
+XHR.prototype.request = function(opts){
+  opts = opts || {};
+  opts.uri = this.uri();
+  opts.xd = this.xd;
+  opts.xs = this.xs;
+  opts.agent = this.agent || false;
+  opts.supportsBinary = this.supportsBinary;
+  opts.enablesXDR = this.enablesXDR;
+
+  // SSL options for Node.js client
+  opts.pfx = this.pfx;
+  opts.key = this.key;
+  opts.passphrase = this.passphrase;
+  opts.cert = this.cert;
+  opts.ca = this.ca;
+  opts.ciphers = this.ciphers;
+  opts.rejectUnauthorized = this.rejectUnauthorized;
+
+  return new Request(opts);
+};
+
+/**
+ * Sends data.
+ *
+ * @param {String} data to send.
+ * @param {Function} called upon flush.
+ * @api private
+ */
+
+XHR.prototype.doWrite = function(data, fn){
+  var isBinary = typeof data !== 'string' && data !== undefined;
+  var req = this.request({ method: 'POST', data: data, isBinary: isBinary });
+  var self = this;
+  req.on('success', fn);
+  req.on('error', function(err){
+    self.onError('xhr post error', err);
+  });
+  this.sendXhr = req;
+};
+
+/**
+ * Starts a poll cycle.
+ *
+ * @api private
+ */
+
+XHR.prototype.doPoll = function(){
+  debug('xhr poll');
+  var req = this.request();
+  var self = this;
+  req.on('data', function(data){
+    self.onData(data);
+  });
+  req.on('error', function(err){
+    self.onError('xhr poll error', err);
+  });
+  this.pollXhr = req;
+};
+
+/**
+ * Request constructor
+ *
+ * @param {Object} options
+ * @api public
+ */
+
+function Request(opts){
+  this.method = opts.method || 'GET';
+  this.uri = opts.uri;
+  this.xd = !!opts.xd;
+  this.xs = !!opts.xs;
+  this.async = false !== opts.async;
+  this.data = undefined != opts.data ? opts.data : null;
+  this.agent = opts.agent;
+  this.isBinary = opts.isBinary;
+  this.supportsBinary = opts.supportsBinary;
+  this.enablesXDR = opts.enablesXDR;
+
+  // SSL options for Node.js client
+  this.pfx = opts.pfx;
+  this.key = opts.key;
+  this.passphrase = opts.passphrase;
+  this.cert = opts.cert;
+  this.ca = opts.ca;
+  this.ciphers = opts.ciphers;
+  this.rejectUnauthorized = opts.rejectUnauthorized;
+
+  this.create();
+}
+
+/**
+ * Mix in `Emitter`.
+ */
+
+Emitter(Request.prototype);
+
+/**
+ * Creates the XHR object and sends the request.
+ *
+ * @api private
+ */
+
+Request.prototype.create = function(){
+  var opts = { agent: this.agent, xdomain: this.xd, xscheme: this.xs, enablesXDR: this.enablesXDR };
+
+  // SSL options for Node.js client
+  opts.pfx = this.pfx;
+  opts.key = this.key;
+  opts.passphrase = this.passphrase;
+  opts.cert = this.cert;
+  opts.ca = this.ca;
+  opts.ciphers = this.ciphers;
+  opts.rejectUnauthorized = this.rejectUnauthorized;
+
+  var xhr = this.xhr = new XMLHttpRequest(opts);
+  var self = this;
+
+  try {
+    debug('xhr open %s: %s', this.method, this.uri);
+    xhr.open(this.method, this.uri, this.async);
+    if (this.supportsBinary) {
+      // This has to be done after open because Firefox is stupid
+      // http://stackoverflow.com/questions/13216903/get-binary-data-with-xmlhttprequest-in-a-firefox-extension
+      xhr.responseType = 'arraybuffer';
+    }
+
+    if ('POST' == this.method) {
+      try {
+        if (this.isBinary) {
+          xhr.setRequestHeader('Content-type', 'application/octet-stream');
+        } else {
+          xhr.setRequestHeader('Content-type', 'text/plain;charset=UTF-8');
+        }
+      } catch (e) {}
+    }
+
+    // ie6 check
+    if ('withCredentials' in xhr) {
+      xhr.withCredentials = true;
+    }
+
+    if (this.hasXDR()) {
+      xhr.onload = function(){
+        self.onLoad();
+      };
+      xhr.onerror = function(){
+        self.onError(xhr.responseText);
+      };
+    } else {
+      xhr.onreadystatechange = function(){
+        if (4 != xhr.readyState) return;
+        if (200 == xhr.status || 1223 == xhr.status) {
+          self.onLoad();
+        } else {
+          // make sure the `error` event handler that's user-set
+          // does not throw in the same tick and gets caught here
+          setTimeout(function(){
+            self.onError(xhr.status);
+          }, 0);
+        }
+      };
+    }
+
+    debug('xhr data %s', this.data);
+    xhr.send(this.data);
+  } catch (e) {
+    // Need to defer since .create() is called directly fhrom the constructor
+    // and thus the 'error' event can only be only bound *after* this exception
+    // occurs.  Therefore, also, we cannot throw here at all.
+    setTimeout(function() {
+      self.onError(e);
+    }, 0);
+    return;
+  }
+
+  if (global.document) {
+    this.index = Request.requestsCount++;
+    Request.requests[this.index] = this;
+  }
+};
+
+/**
+ * Called upon successful response.
+ *
+ * @api private
+ */
+
+Request.prototype.onSuccess = function(){
+  this.emit('success');
+  this.cleanup();
+};
+
+/**
+ * Called if we have data.
+ *
+ * @api private
+ */
+
+Request.prototype.onData = function(data){
+  this.emit('data', data);
+  this.onSuccess();
+};
+
+/**
+ * Called upon error.
+ *
+ * @api private
+ */
+
+Request.prototype.onError = function(err){
+  this.emit('error', err);
+  this.cleanup(true);
+};
+
+/**
+ * Cleans up house.
+ *
+ * @api private
+ */
+
+Request.prototype.cleanup = function(fromError){
+  if ('undefined' == typeof this.xhr || null === this.xhr) {
+    return;
+  }
+  // xmlhttprequest
+  if (this.hasXDR()) {
+    this.xhr.onload = this.xhr.onerror = empty;
+  } else {
+    this.xhr.onreadystatechange = empty;
+  }
+
+  if (fromError) {
+    try {
+      this.xhr.abort();
+    } catch(e) {}
+  }
+
+  if (global.document) {
+    delete Request.requests[this.index];
+  }
+
+  this.xhr = null;
+};
+
+/**
+ * Called upon load.
+ *
+ * @api private
+ */
+
+Request.prototype.onLoad = function(){
+  var data;
+  try {
+    var contentType;
+    try {
+      contentType = this.xhr.getResponseHeader('Content-Type').split(';')[0];
+    } catch (e) {}
+    if (contentType === 'application/octet-stream') {
+      data = this.xhr.response;
+    } else {
+      if (!this.supportsBinary) {
+        data = this.xhr.responseText;
+      } else {
+        data = 'ok';
+      }
+    }
+  } catch (e) {
+    this.onError(e);
+  }
+  if (null != data) {
+    this.onData(data);
+  }
+};
+
+/**
+ * Check if it has XDomainRequest.
+ *
+ * @api private
+ */
+
+Request.prototype.hasXDR = function(){
+  return 'undefined' !== typeof global.XDomainRequest && !this.xs && this.enablesXDR;
+};
+
+/**
+ * Aborts the request.
+ *
+ * @api public
+ */
+
+Request.prototype.abort = function(){
+  this.cleanup();
+};
+
+/**
+ * Aborts pending requests when unloading the window. This is needed to prevent
+ * memory leaks (e.g. when using IE) and to ensure that no spurious error is
+ * emitted.
+ */
+
+if (global.document) {
+  Request.requestsCount = 0;
+  Request.requests = {};
+  if (global.attachEvent) {
+    global.attachEvent('onunload', unloadHandler);
+  } else if (global.addEventListener) {
+    global.addEventListener('beforeunload', unloadHandler, false);
+  }
+}
+
+function unloadHandler() {
+  for (var i in Request.requests) {
+    if (Request.requests.hasOwnProperty(i)) {
+      Request.requests[i].abort();
+    }
+  }
+}
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+
+},{"./polling":113,"component-emitter":104,"component-inherit":116,"debug":117,"xmlhttprequest":115}],113:[function(require,module,exports){
+/**
+ * Module dependencies.
+ */
+
+var Transport = require('../transport');
+var parseqs = require('parseqs');
+var parser = require('engine.io-parser');
+var inherit = require('component-inherit');
+var debug = require('debug')('engine.io-client:polling');
+
+/**
+ * Module exports.
+ */
+
+module.exports = Polling;
+
+/**
+ * Is XHR2 supported?
+ */
+
+var hasXHR2 = (function() {
+  var XMLHttpRequest = require('xmlhttprequest');
+  var xhr = new XMLHttpRequest({ xdomain: false });
+  return null != xhr.responseType;
+})();
+
+/**
+ * Polling interface.
+ *
+ * @param {Object} opts
+ * @api private
+ */
+
+function Polling(opts){
+  var forceBase64 = (opts && opts.forceBase64);
+  if (!hasXHR2 || forceBase64) {
+    this.supportsBinary = false;
+  }
+  Transport.call(this, opts);
+}
+
+/**
+ * Inherits from Transport.
+ */
+
+inherit(Polling, Transport);
+
+/**
+ * Transport name.
+ */
+
+Polling.prototype.name = 'polling';
+
+/**
+ * Opens the socket (triggers polling). We write a PING message to determine
+ * when the transport is open.
+ *
+ * @api private
+ */
+
+Polling.prototype.doOpen = function(){
+  this.poll();
+};
+
+/**
+ * Pauses polling.
+ *
+ * @param {Function} callback upon buffers are flushed and transport is paused
+ * @api private
+ */
+
+Polling.prototype.pause = function(onPause){
+  var pending = 0;
+  var self = this;
+
+  this.readyState = 'pausing';
+
+  function pause(){
+    debug('paused');
+    self.readyState = 'paused';
+    onPause();
+  }
+
+  if (this.polling || !this.writable) {
+    var total = 0;
+
+    if (this.polling) {
+      debug('we are currently polling - waiting to pause');
+      total++;
+      this.once('pollComplete', function(){
+        debug('pre-pause polling complete');
+        --total || pause();
+      });
+    }
+
+    if (!this.writable) {
+      debug('we are currently writing - waiting to pause');
+      total++;
+      this.once('drain', function(){
+        debug('pre-pause writing complete');
+        --total || pause();
+      });
+    }
+  } else {
+    pause();
+  }
+};
+
+/**
+ * Starts polling cycle.
+ *
+ * @api public
+ */
+
+Polling.prototype.poll = function(){
+  debug('polling');
+  this.polling = true;
+  this.doPoll();
+  this.emit('poll');
+};
+
+/**
+ * Overloads onData to detect payloads.
+ *
+ * @api private
+ */
+
+Polling.prototype.onData = function(data){
+  var self = this;
+  debug('polling got data %s', data);
+  var callback = function(packet, index, total) {
+    // if its the first message we consider the transport open
+    if ('opening' == self.readyState) {
+      self.onOpen();
+    }
+
+    // if its a close packet, we close the ongoing requests
+    if ('close' == packet.type) {
+      self.onClose();
+      return false;
+    }
+
+    // otherwise bypass onData and handle the message
+    self.onPacket(packet);
+  };
+
+  // decode payload
+  parser.decodePayload(data, this.socket.binaryType, callback);
+
+  // if an event did not trigger closing
+  if ('closed' != this.readyState) {
+    // if we got data we're not polling
+    this.polling = false;
+    this.emit('pollComplete');
+
+    if ('open' == this.readyState) {
+      this.poll();
+    } else {
+      debug('ignoring poll - transport state "%s"', this.readyState);
+    }
+  }
+};
+
+/**
+ * For polling, send a close packet.
+ *
+ * @api private
+ */
+
+Polling.prototype.doClose = function(){
+  var self = this;
+
+  function close(){
+    debug('writing close packet');
+    self.write([{ type: 'close' }]);
+  }
+
+  if ('open' == this.readyState) {
+    debug('transport open - closing');
+    close();
+  } else {
+    // in case we're trying to close while
+    // handshaking is in progress (GH-164)
+    debug('transport not open - deferring close');
+    this.once('open', close);
+  }
+};
+
+/**
+ * Writes a packets payload.
+ *
+ * @param {Array} data packets
+ * @param {Function} drain callback
+ * @api private
+ */
+
+Polling.prototype.write = function(packets){
+  var self = this;
+  this.writable = false;
+  var callbackfn = function() {
+    self.writable = true;
+    self.emit('drain');
+  };
+
+  var self = this;
+  parser.encodePayload(packets, this.supportsBinary, function(data) {
+    self.doWrite(data, callbackfn);
+  });
+};
+
+/**
+ * Generates uri for connection.
+ *
+ * @api private
+ */
+
+Polling.prototype.uri = function(){
+  var query = this.query || {};
+  var schema = this.secure ? 'https' : 'http';
+  var port = '';
+
+  // cache busting is forced
+  if (false !== this.timestampRequests) {
+    query[this.timestampParam] = +new Date + '-' + Transport.timestamps++;
+  }
+
+  if (!this.supportsBinary && !query.sid) {
+    query.b64 = 1;
+  }
+
+  query = parseqs.encode(query);
+
+  // avoid port if default for schema
+  if (this.port && (('https' == schema && this.port != 443) ||
+     ('http' == schema && this.port != 80))) {
+    port = ':' + this.port;
+  }
+
+  // prepend ? to query
+  if (query.length) {
+    query = '?' + query;
+  }
+
+  return schema + '://' + this.hostname + port + this.path + query;
+};
+
+},{"../transport":109,"component-inherit":116,"debug":117,"engine.io-parser":120,"parseqs":132,"xmlhttprequest":115}],114:[function(require,module,exports){
+/**
+ * Module dependencies.
+ */
+
+var Transport = require('../transport');
+var parser = require('engine.io-parser');
+var parseqs = require('parseqs');
+var inherit = require('component-inherit');
+var debug = require('debug')('engine.io-client:websocket');
+
+/**
+ * `ws` exposes a WebSocket-compatible interface in
+ * Node, or the `WebSocket` or `MozWebSocket` globals
+ * in the browser.
+ */
+
+var WebSocket = require('ws');
+
+/**
+ * Module exports.
+ */
+
+module.exports = WS;
+
+/**
+ * WebSocket transport constructor.
+ *
+ * @api {Object} connection options
+ * @api public
+ */
+
+function WS(opts){
+  var forceBase64 = (opts && opts.forceBase64);
+  if (forceBase64) {
+    this.supportsBinary = false;
+  }
+  Transport.call(this, opts);
+}
+
+/**
+ * Inherits from Transport.
+ */
+
+inherit(WS, Transport);
+
+/**
+ * Transport name.
+ *
+ * @api public
+ */
+
+WS.prototype.name = 'websocket';
+
+/*
+ * WebSockets support binary
+ */
+
+WS.prototype.supportsBinary = true;
+
+/**
+ * Opens socket.
+ *
+ * @api private
+ */
+
+WS.prototype.doOpen = function(){
+  if (!this.check()) {
+    // let probe timeout
+    return;
+  }
+
+  var self = this;
+  var uri = this.uri();
+  var protocols = void(0);
+  var opts = { agent: this.agent };
+
+  // SSL options for Node.js client
+  opts.pfx = this.pfx;
+  opts.key = this.key;
+  opts.passphrase = this.passphrase;
+  opts.cert = this.cert;
+  opts.ca = this.ca;
+  opts.ciphers = this.ciphers;
+  opts.rejectUnauthorized = this.rejectUnauthorized;
+
+  this.ws = new WebSocket(uri, protocols, opts);
+
+  if (this.ws.binaryType === undefined) {
+    this.supportsBinary = false;
+  }
+
+  this.ws.binaryType = 'arraybuffer';
+  this.addEventListeners();
+};
+
+/**
+ * Adds event listeners to the socket
+ *
+ * @api private
+ */
+
+WS.prototype.addEventListeners = function(){
+  var self = this;
+
+  this.ws.onopen = function(){
+    self.onOpen();
+  };
+  this.ws.onclose = function(){
+    self.onClose();
+  };
+  this.ws.onmessage = function(ev){
+    self.onData(ev.data);
+  };
+  this.ws.onerror = function(e){
+    self.onError('websocket error', e);
+  };
+};
+
+/**
+ * Override `onData` to use a timer on iOS.
+ * See: https://gist.github.com/mloughran/2052006
+ *
+ * @api private
+ */
+
+if ('undefined' != typeof navigator
+  && /iPad|iPhone|iPod/i.test(navigator.userAgent)) {
+  WS.prototype.onData = function(data){
+    var self = this;
+    setTimeout(function(){
+      Transport.prototype.onData.call(self, data);
+    }, 0);
+  };
+}
+
+/**
+ * Writes data to socket.
+ *
+ * @param {Array} array of packets.
+ * @api private
+ */
+
+WS.prototype.write = function(packets){
+  var self = this;
+  this.writable = false;
+  // encodePacket efficient as it uses WS framing
+  // no need for encodePayload
+  for (var i = 0, l = packets.length; i < l; i++) {
+    parser.encodePacket(packets[i], this.supportsBinary, function(data) {
+      //Sometimes the websocket has already been closed but the browser didn't
+      //have a chance of informing us about it yet, in that case send will
+      //throw an error
+      try {
+        self.ws.send(data);
+      } catch (e){
+        debug('websocket closed before onclose event');
+      }
+    });
+  }
+
+  function ondrain() {
+    self.writable = true;
+    self.emit('drain');
+  }
+  // fake drain
+  // defer to next tick to allow Socket to clear writeBuffer
+  setTimeout(ondrain, 0);
+};
+
+/**
+ * Called upon close
+ *
+ * @api private
+ */
+
+WS.prototype.onClose = function(){
+  Transport.prototype.onClose.call(this);
+};
+
+/**
+ * Closes socket.
+ *
+ * @api private
+ */
+
+WS.prototype.doClose = function(){
+  if (typeof this.ws !== 'undefined') {
+    this.ws.close();
+  }
+};
+
+/**
+ * Generates uri for connection.
+ *
+ * @api private
+ */
+
+WS.prototype.uri = function(){
+  var query = this.query || {};
+  var schema = this.secure ? 'wss' : 'ws';
+  var port = '';
+
+  // avoid port if default for schema
+  if (this.port && (('wss' == schema && this.port != 443)
+    || ('ws' == schema && this.port != 80))) {
+    port = ':' + this.port;
+  }
+
+  // append timestamp to URI
+  if (this.timestampRequests) {
+    query[this.timestampParam] = +new Date;
+  }
+
+  // communicate binary support capabilities
+  if (!this.supportsBinary) {
+    query.b64 = 1;
+  }
+
+  query = parseqs.encode(query);
+
+  // prepend ? to query
+  if (query.length) {
+    query = '?' + query;
+  }
+
+  return schema + '://' + this.hostname + port + this.path + query;
+};
+
+/**
+ * Feature detection for WebSocket.
+ *
+ * @return {Boolean} whether this transport is available.
+ * @api public
+ */
+
+WS.prototype.check = function(){
+  return !!WebSocket && !('__initialize' in WebSocket && this.name === WS.prototype.name);
+};
+
+},{"../transport":109,"component-inherit":116,"debug":117,"engine.io-parser":120,"parseqs":132,"ws":134}],115:[function(require,module,exports){
+// browser shim for xmlhttprequest module
+var hasCORS = require('has-cors');
+
+module.exports = function(opts) {
+  var xdomain = opts.xdomain;
+
+  // scheme must be same when usign XDomainRequest
+  // http://blogs.msdn.com/b/ieinternals/archive/2010/05/13/xdomainrequest-restrictions-limitations-and-workarounds.aspx
+  var xscheme = opts.xscheme;
+
+  // XDomainRequest has a flow of not sending cookie, therefore it should be disabled as a default.
+  // https://github.com/Automattic/engine.io-client/pull/217
+  var enablesXDR = opts.enablesXDR;
+
+  // XMLHttpRequest can be disabled on IE
+  try {
+    if ('undefined' != typeof XMLHttpRequest && (!xdomain || hasCORS)) {
+      return new XMLHttpRequest();
+    }
+  } catch (e) { }
+
+  // Use XDomainRequest for IE8 if enablesXDR is true
+  // because loading bar keeps flashing when using jsonp-polling
+  // https://github.com/yujiosaka/socke.io-ie8-loading-example
+  try {
+    if ('undefined' != typeof XDomainRequest && !xscheme && enablesXDR) {
+      return new XDomainRequest();
+    }
+  } catch (e) { }
+
+  if (!xdomain) {
+    try {
+      return new ActiveXObject('Microsoft.XMLHTTP');
+    } catch(e) { }
+  }
+}
+
+},{"has-cors":129}],116:[function(require,module,exports){
+
+module.exports = function(a, b){
+  var fn = function(){};
+  fn.prototype = b.prototype;
+  a.prototype = new fn;
+  a.prototype.constructor = a;
+};
+},{}],117:[function(require,module,exports){
+
+/**
+ * This is the web browser implementation of `debug()`.
+ *
+ * Expose `debug()` as the module.
+ */
+
+exports = module.exports = require('./debug');
+exports.log = log;
+exports.formatArgs = formatArgs;
+exports.save = save;
+exports.load = load;
+exports.useColors = useColors;
+
+/**
+ * Colors.
+ */
+
+exports.colors = [
+  'lightseagreen',
+  'forestgreen',
+  'goldenrod',
+  'dodgerblue',
+  'darkorchid',
+  'crimson'
+];
+
+/**
+ * Currently only WebKit-based Web Inspectors, Firefox >= v31,
+ * and the Firebug extension (any Firefox version) are known
+ * to support "%c" CSS customizations.
+ *
+ * TODO: add a `localStorage` variable to explicitly enable/disable colors
+ */
+
+function useColors() {
+  // is webkit? http://stackoverflow.com/a/16459606/376773
+  return ('WebkitAppearance' in document.documentElement.style) ||
+    // is firebug? http://stackoverflow.com/a/398120/376773
+    (window.console && (console.firebug || (console.exception && console.table))) ||
+    // is firefox >= v31?
+    // https://developer.mozilla.org/en-US/docs/Tools/Web_Console#Styling_messages
+    (navigator.userAgent.toLowerCase().match(/firefox\/(\d+)/) && parseInt(RegExp.$1, 10) >= 31);
+}
+
+/**
+ * Map %j to `JSON.stringify()`, since no Web Inspectors do that by default.
+ */
+
+exports.formatters.j = function(v) {
+  return JSON.stringify(v);
+};
+
+
+/**
+ * Colorize log arguments if enabled.
+ *
+ * @api public
+ */
+
+function formatArgs() {
+  var args = arguments;
+  var useColors = this.useColors;
+
+  args[0] = (useColors ? '%c' : '')
+    + this.namespace
+    + (useColors ? ' %c' : ' ')
+    + args[0]
+    + (useColors ? '%c ' : ' ')
+    + '+' + exports.humanize(this.diff);
+
+  if (!useColors) return args;
+
+  var c = 'color: ' + this.color;
+  args = [args[0], c, 'color: inherit'].concat(Array.prototype.slice.call(args, 1));
+
+  // the final "%c" is somewhat tricky, because there could be other
+  // arguments passed either before or after the %c, so we need to
+  // figure out the correct index to insert the CSS into
+  var index = 0;
+  var lastC = 0;
+  args[0].replace(/%[a-z%]/g, function(match) {
+    if ('%%' === match) return;
+    index++;
+    if ('%c' === match) {
+      // we only are interested in the *last* %c
+      // (the user may have provided their own)
+      lastC = index;
+    }
+  });
+
+  args.splice(lastC, 0, c);
+  return args;
+}
+
+/**
+ * Invokes `console.log()` when available.
+ * No-op when `console.log` is not a "function".
+ *
+ * @api public
+ */
+
+function log() {
+  // This hackery is required for IE8,
+  // where the `console.log` function doesn't have 'apply'
+  return 'object' == typeof console
+    && 'function' == typeof console.log
+    && Function.prototype.apply.call(console.log, console, arguments);
+}
+
+/**
+ * Save `namespaces`.
+ *
+ * @param {String} namespaces
+ * @api private
+ */
+
+function save(namespaces) {
+  try {
+    if (null == namespaces) {
+      localStorage.removeItem('debug');
+    } else {
+      localStorage.debug = namespaces;
+    }
+  } catch(e) {}
+}
+
+/**
+ * Load `namespaces`.
+ *
+ * @return {String} returns the previously persisted debug modes
+ * @api private
+ */
+
+function load() {
+  var r;
+  try {
+    r = localStorage.debug;
+  } catch(e) {}
+  return r;
+}
+
+/**
+ * Enable namespaces listed in `localStorage.debug` initially.
+ */
+
+exports.enable(load());
+
+},{"./debug":118}],118:[function(require,module,exports){
+
+/**
+ * This is the common logic for both the Node.js and web browser
+ * implementations of `debug()`.
+ *
+ * Expose `debug()` as the module.
+ */
+
+exports = module.exports = debug;
+exports.coerce = coerce;
+exports.disable = disable;
+exports.enable = enable;
+exports.enabled = enabled;
+exports.humanize = require('ms');
+
+/**
+ * The currently active debug mode names, and names to skip.
+ */
+
+exports.names = [];
+exports.skips = [];
+
+/**
+ * Map of special "%n" handling functions, for the debug "format" argument.
+ *
+ * Valid key names are a single, lowercased letter, i.e. "n".
+ */
+
+exports.formatters = {};
+
+/**
+ * Previously assigned color.
+ */
+
+var prevColor = 0;
+
+/**
+ * Previous log timestamp.
+ */
+
+var prevTime;
+
+/**
+ * Select a color.
+ *
+ * @return {Number}
+ * @api private
+ */
+
+function selectColor() {
+  return exports.colors[prevColor++ % exports.colors.length];
+}
+
+/**
+ * Create a debugger with the given `namespace`.
+ *
+ * @param {String} namespace
+ * @return {Function}
+ * @api public
+ */
+
+function debug(namespace) {
+
+  // define the `disabled` version
+  function disabled() {
+  }
+  disabled.enabled = false;
+
+  // define the `enabled` version
+  function enabled() {
+
+    var self = enabled;
+
+    // set `diff` timestamp
+    var curr = +new Date();
+    var ms = curr - (prevTime || curr);
+    self.diff = ms;
+    self.prev = prevTime;
+    self.curr = curr;
+    prevTime = curr;
+
+    // add the `color` if not set
+    if (null == self.useColors) self.useColors = exports.useColors();
+    if (null == self.color && self.useColors) self.color = selectColor();
+
+    var args = Array.prototype.slice.call(arguments);
+
+    args[0] = exports.coerce(args[0]);
+
+    if ('string' !== typeof args[0]) {
+      // anything else let's inspect with %o
+      args = ['%o'].concat(args);
+    }
+
+    // apply any `formatters` transformations
+    var index = 0;
+    args[0] = args[0].replace(/%([a-z%])/g, function(match, format) {
+      // if we encounter an escaped % then don't increase the array index
+      if (match === '%%') return match;
+      index++;
+      var formatter = exports.formatters[format];
+      if ('function' === typeof formatter) {
+        var val = args[index];
+        match = formatter.call(self, val);
+
+        // now we need to remove `args[index]` since it's inlined in the `format`
+        args.splice(index, 1);
+        index--;
+      }
+      return match;
+    });
+
+    if ('function' === typeof exports.formatArgs) {
+      args = exports.formatArgs.apply(self, args);
+    }
+    var logFn = enabled.log || exports.log || console.log.bind(console);
+    logFn.apply(self, args);
+  }
+  enabled.enabled = true;
+
+  var fn = exports.enabled(namespace) ? enabled : disabled;
+
+  fn.namespace = namespace;
+
+  return fn;
+}
+
+/**
+ * Enables a debug mode by namespaces. This can include modes
+ * separated by a colon and wildcards.
+ *
+ * @param {String} namespaces
+ * @api public
+ */
+
+function enable(namespaces) {
+  exports.save(namespaces);
+
+  var split = (namespaces || '').split(/[\s,]+/);
+  var len = split.length;
+
+  for (var i = 0; i < len; i++) {
+    if (!split[i]) continue; // ignore empty strings
+    namespaces = split[i].replace(/\*/g, '.*?');
+    if (namespaces[0] === '-') {
+      exports.skips.push(new RegExp('^' + namespaces.substr(1) + '$'));
+    } else {
+      exports.names.push(new RegExp('^' + namespaces + '$'));
+    }
+  }
+}
+
+/**
+ * Disable debug output.
+ *
+ * @api public
+ */
+
+function disable() {
+  exports.enable('');
+}
+
+/**
+ * Returns true if the given mode name is enabled, false otherwise.
+ *
+ * @param {String} name
+ * @return {Boolean}
+ * @api public
+ */
+
+function enabled(name) {
+  var i, len;
+  for (i = 0, len = exports.skips.length; i < len; i++) {
+    if (exports.skips[i].test(name)) {
+      return false;
+    }
+  }
+  for (i = 0, len = exports.names.length; i < len; i++) {
+    if (exports.names[i].test(name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Coerce `val`.
+ *
+ * @param {Mixed} val
+ * @return {Mixed}
+ * @api private
+ */
+
+function coerce(val) {
+  if (val instanceof Error) return val.stack || val.message;
+  return val;
+}
+
+},{"ms":119}],119:[function(require,module,exports){
+/**
+ * Helpers.
+ */
+
+var s = 1000;
+var m = s * 60;
+var h = m * 60;
+var d = h * 24;
+var y = d * 365.25;
+
+/**
+ * Parse or format the given `val`.
+ *
+ * Options:
+ *
+ *  - `long` verbose formatting [false]
+ *
+ * @param {String|Number} val
+ * @param {Object} options
+ * @return {String|Number}
+ * @api public
+ */
+
+module.exports = function(val, options){
+  options = options || {};
+  if ('string' == typeof val) return parse(val);
+  return options.long
+    ? long(val)
+    : short(val);
+};
+
+/**
+ * Parse the given `str` and return milliseconds.
+ *
+ * @param {String} str
+ * @return {Number}
+ * @api private
+ */
+
+function parse(str) {
+  var match = /^((?:\d+)?\.?\d+) *(ms|seconds?|s|minutes?|m|hours?|h|days?|d|years?|y)?$/i.exec(str);
+  if (!match) return;
+  var n = parseFloat(match[1]);
+  var type = (match[2] || 'ms').toLowerCase();
+  switch (type) {
+    case 'years':
+    case 'year':
+    case 'y':
+      return n * y;
+    case 'days':
+    case 'day':
+    case 'd':
+      return n * d;
+    case 'hours':
+    case 'hour':
+    case 'h':
+      return n * h;
+    case 'minutes':
+    case 'minute':
+    case 'm':
+      return n * m;
+    case 'seconds':
+    case 'second':
+    case 's':
+      return n * s;
+    case 'ms':
+      return n;
+  }
+}
+
+/**
+ * Short format for `ms`.
+ *
+ * @param {Number} ms
+ * @return {String}
+ * @api private
+ */
+
+function short(ms) {
+  if (ms >= d) return Math.round(ms / d) + 'd';
+  if (ms >= h) return Math.round(ms / h) + 'h';
+  if (ms >= m) return Math.round(ms / m) + 'm';
+  if (ms >= s) return Math.round(ms / s) + 's';
+  return ms + 'ms';
+}
+
+/**
+ * Long format for `ms`.
+ *
+ * @param {Number} ms
+ * @return {String}
+ * @api private
+ */
+
+function long(ms) {
+  return plural(ms, d, 'day')
+    || plural(ms, h, 'hour')
+    || plural(ms, m, 'minute')
+    || plural(ms, s, 'second')
+    || ms + ' ms';
+}
+
+/**
+ * Pluralization helper.
+ */
+
+function plural(ms, n, name) {
+  if (ms < n) return;
+  if (ms < n * 1.5) return Math.floor(ms / n) + ' ' + name;
+  return Math.ceil(ms / n) + ' ' + name + 's';
+}
+
+},{}],120:[function(require,module,exports){
+(function (global){
+/**
+ * Module dependencies.
+ */
+
+var keys = require('./keys');
+var hasBinary = require('has-binary');
+var sliceBuffer = require('arraybuffer.slice');
+var base64encoder = require('base64-arraybuffer');
+var after = require('after');
+var utf8 = require('utf8');
+
+/**
+ * Check if we are running an android browser. That requires us to use
+ * ArrayBuffer with polling transports...
+ *
+ * http://ghinda.net/jpeg-blob-ajax-android/
+ */
+
+var isAndroid = navigator.userAgent.match(/Android/i);
+
+/**
+ * Check if we are running in PhantomJS.
+ * Uploading a Blob with PhantomJS does not work correctly, as reported here:
+ * https://github.com/ariya/phantomjs/issues/11395
+ * @type boolean
+ */
+var isPhantomJS = /PhantomJS/i.test(navigator.userAgent);
+
+/**
+ * When true, avoids using Blobs to encode payloads.
+ * @type boolean
+ */
+var dontSendBlobs = isAndroid || isPhantomJS;
+
+/**
+ * Current protocol version.
+ */
+
+exports.protocol = 3;
+
+/**
+ * Packet types.
+ */
+
+var packets = exports.packets = {
+    open:     0    // non-ws
+  , close:    1    // non-ws
+  , ping:     2
+  , pong:     3
+  , message:  4
+  , upgrade:  5
+  , noop:     6
+};
+
+var packetslist = keys(packets);
+
+/**
+ * Premade error packet.
+ */
+
+var err = { type: 'error', data: 'parser error' };
+
+/**
+ * Create a blob api even for blob builder when vendor prefixes exist
+ */
+
+var Blob = require('blob');
+
+/**
+ * Encodes a packet.
+ *
+ *     <packet type id> [ <data> ]
+ *
+ * Example:
+ *
+ *     5hello world
+ *     3
+ *     4
+ *
+ * Binary is encoded in an identical principle
+ *
+ * @api private
+ */
+
+exports.encodePacket = function (packet, supportsBinary, utf8encode, callback) {
+  if ('function' == typeof supportsBinary) {
+    callback = supportsBinary;
+    supportsBinary = false;
+  }
+
+  if ('function' == typeof utf8encode) {
+    callback = utf8encode;
+    utf8encode = null;
+  }
+
+  var data = (packet.data === undefined)
+    ? undefined
+    : packet.data.buffer || packet.data;
+
+  if (global.ArrayBuffer && data instanceof ArrayBuffer) {
+    return encodeArrayBuffer(packet, supportsBinary, callback);
+  } else if (Blob && data instanceof global.Blob) {
+    return encodeBlob(packet, supportsBinary, callback);
+  }
+
+  // might be an object with { base64: true, data: dataAsBase64String }
+  if (data && data.base64) {
+    return encodeBase64Object(packet, callback);
+  }
+
+  // Sending data as a utf-8 string
+  var encoded = packets[packet.type];
+
+  // data fragment is optional
+  if (undefined !== packet.data) {
+    encoded += utf8encode ? utf8.encode(String(packet.data)) : String(packet.data);
+  }
+
+  return callback('' + encoded);
+
+};
+
+function encodeBase64Object(packet, callback) {
+  // packet data is an object { base64: true, data: dataAsBase64String }
+  var message = 'b' + exports.packets[packet.type] + packet.data.data;
+  return callback(message);
+}
+
+/**
+ * Encode packet helpers for binary types
+ */
+
+function encodeArrayBuffer(packet, supportsBinary, callback) {
+  if (!supportsBinary) {
+    return exports.encodeBase64Packet(packet, callback);
+  }
+
+  var data = packet.data;
+  var contentArray = new Uint8Array(data);
+  var resultBuffer = new Uint8Array(1 + data.byteLength);
+
+  resultBuffer[0] = packets[packet.type];
+  for (var i = 0; i < contentArray.length; i++) {
+    resultBuffer[i+1] = contentArray[i];
+  }
+
+  return callback(resultBuffer.buffer);
+}
+
+function encodeBlobAsArrayBuffer(packet, supportsBinary, callback) {
+  if (!supportsBinary) {
+    return exports.encodeBase64Packet(packet, callback);
+  }
+
+  var fr = new FileReader();
+  fr.onload = function() {
+    packet.data = fr.result;
+    exports.encodePacket(packet, supportsBinary, true, callback);
+  };
+  return fr.readAsArrayBuffer(packet.data);
+}
+
+function encodeBlob(packet, supportsBinary, callback) {
+  if (!supportsBinary) {
+    return exports.encodeBase64Packet(packet, callback);
+  }
+
+  if (dontSendBlobs) {
+    return encodeBlobAsArrayBuffer(packet, supportsBinary, callback);
+  }
+
+  var length = new Uint8Array(1);
+  length[0] = packets[packet.type];
+  var blob = new Blob([length.buffer, packet.data]);
+
+  return callback(blob);
+}
+
+/**
+ * Encodes a packet with binary data in a base64 string
+ *
+ * @param {Object} packet, has `type` and `data`
+ * @return {String} base64 encoded message
+ */
+
+exports.encodeBase64Packet = function(packet, callback) {
+  var message = 'b' + exports.packets[packet.type];
+  if (Blob && packet.data instanceof Blob) {
+    var fr = new FileReader();
+    fr.onload = function() {
+      var b64 = fr.result.split(',')[1];
+      callback(message + b64);
+    };
+    return fr.readAsDataURL(packet.data);
+  }
+
+  var b64data;
+  try {
+    b64data = String.fromCharCode.apply(null, new Uint8Array(packet.data));
+  } catch (e) {
+    // iPhone Safari doesn't let you apply with typed arrays
+    var typed = new Uint8Array(packet.data);
+    var basic = new Array(typed.length);
+    for (var i = 0; i < typed.length; i++) {
+      basic[i] = typed[i];
+    }
+    b64data = String.fromCharCode.apply(null, basic);
+  }
+  message += global.btoa(b64data);
+  return callback(message);
+};
+
+/**
+ * Decodes a packet. Changes format to Blob if requested.
+ *
+ * @return {Object} with `type` and `data` (if any)
+ * @api private
+ */
+
+exports.decodePacket = function (data, binaryType, utf8decode) {
+  // String data
+  if (typeof data == 'string' || data === undefined) {
+    if (data.charAt(0) == 'b') {
+      return exports.decodeBase64Packet(data.substr(1), binaryType);
+    }
+
+    if (utf8decode) {
+      try {
+        data = utf8.decode(data);
+      } catch (e) {
+        return err;
+      }
+    }
+    var type = data.charAt(0);
+
+    if (Number(type) != type || !packetslist[type]) {
+      return err;
+    }
+
+    if (data.length > 1) {
+      return { type: packetslist[type], data: data.substring(1) };
+    } else {
+      return { type: packetslist[type] };
+    }
+  }
+
+  var asArray = new Uint8Array(data);
+  var type = asArray[0];
+  var rest = sliceBuffer(data, 1);
+  if (Blob && binaryType === 'blob') {
+    rest = new Blob([rest]);
+  }
+  return { type: packetslist[type], data: rest };
+};
+
+/**
+ * Decodes a packet encoded in a base64 string
+ *
+ * @param {String} base64 encoded message
+ * @return {Object} with `type` and `data` (if any)
+ */
+
+exports.decodeBase64Packet = function(msg, binaryType) {
+  var type = packetslist[msg.charAt(0)];
+  if (!global.ArrayBuffer) {
+    return { type: type, data: { base64: true, data: msg.substr(1) } };
+  }
+
+  var data = base64encoder.decode(msg.substr(1));
+
+  if (binaryType === 'blob' && Blob) {
+    data = new Blob([data]);
+  }
+
+  return { type: type, data: data };
+};
+
+/**
+ * Encodes multiple messages (payload).
+ *
+ *     <length>:data
+ *
+ * Example:
+ *
+ *     11:hello world2:hi
+ *
+ * If any contents are binary, they will be encoded as base64 strings. Base64
+ * encoded strings are marked with a b before the length specifier
+ *
+ * @param {Array} packets
+ * @api private
+ */
+
+exports.encodePayload = function (packets, supportsBinary, callback) {
+  if (typeof supportsBinary == 'function') {
+    callback = supportsBinary;
+    supportsBinary = null;
+  }
+
+  var isBinary = hasBinary(packets);
+
+  if (supportsBinary && isBinary) {
+    if (Blob && !dontSendBlobs) {
+      return exports.encodePayloadAsBlob(packets, callback);
+    }
+
+    return exports.encodePayloadAsArrayBuffer(packets, callback);
+  }
+
+  if (!packets.length) {
+    return callback('0:');
+  }
+
+  function setLengthHeader(message) {
+    return message.length + ':' + message;
+  }
+
+  function encodeOne(packet, doneCallback) {
+    exports.encodePacket(packet, !isBinary ? false : supportsBinary, true, function(message) {
+      doneCallback(null, setLengthHeader(message));
+    });
+  }
+
+  map(packets, encodeOne, function(err, results) {
+    return callback(results.join(''));
+  });
+};
+
+/**
+ * Async array map using after
+ */
+
+function map(ary, each, done) {
+  var result = new Array(ary.length);
+  var next = after(ary.length, done);
+
+  var eachWithIndex = function(i, el, cb) {
+    each(el, function(error, msg) {
+      result[i] = msg;
+      cb(error, result);
+    });
+  };
+
+  for (var i = 0; i < ary.length; i++) {
+    eachWithIndex(i, ary[i], next);
+  }
+}
+
+/*
+ * Decodes data when a payload is maybe expected. Possible binary contents are
+ * decoded from their base64 representation
+ *
+ * @param {String} data, callback method
+ * @api public
+ */
+
+exports.decodePayload = function (data, binaryType, callback) {
+  if (typeof data != 'string') {
+    return exports.decodePayloadAsBinary(data, binaryType, callback);
+  }
+
+  if (typeof binaryType === 'function') {
+    callback = binaryType;
+    binaryType = null;
+  }
+
+  var packet;
+  if (data == '') {
+    // parser error - ignoring payload
+    return callback(err, 0, 1);
+  }
+
+  var length = ''
+    , n, msg;
+
+  for (var i = 0, l = data.length; i < l; i++) {
+    var chr = data.charAt(i);
+
+    if (':' != chr) {
+      length += chr;
+    } else {
+      if ('' == length || (length != (n = Number(length)))) {
+        // parser error - ignoring payload
+        return callback(err, 0, 1);
+      }
+
+      msg = data.substr(i + 1, n);
+
+      if (length != msg.length) {
+        // parser error - ignoring payload
+        return callback(err, 0, 1);
+      }
+
+      if (msg.length) {
+        packet = exports.decodePacket(msg, binaryType, true);
+
+        if (err.type == packet.type && err.data == packet.data) {
+          // parser error in individual packet - ignoring payload
+          return callback(err, 0, 1);
+        }
+
+        var ret = callback(packet, i + n, l);
+        if (false === ret) return;
+      }
+
+      // advance cursor
+      i += n;
+      length = '';
+    }
+  }
+
+  if (length != '') {
+    // parser error - ignoring payload
+    return callback(err, 0, 1);
+  }
+
+};
+
+/**
+ * Encodes multiple messages (payload) as binary.
+ *
+ * <1 = binary, 0 = string><number from 0-9><number from 0-9>[...]<number
+ * 255><data>
+ *
+ * Example:
+ * 1 3 255 1 2 3, if the binary contents are interpreted as 8 bit integers
+ *
+ * @param {Array} packets
+ * @return {ArrayBuffer} encoded payload
+ * @api private
+ */
+
+exports.encodePayloadAsArrayBuffer = function(packets, callback) {
+  if (!packets.length) {
+    return callback(new ArrayBuffer(0));
+  }
+
+  function encodeOne(packet, doneCallback) {
+    exports.encodePacket(packet, true, true, function(data) {
+      return doneCallback(null, data);
+    });
+  }
+
+  map(packets, encodeOne, function(err, encodedPackets) {
+    var totalLength = encodedPackets.reduce(function(acc, p) {
+      var len;
+      if (typeof p === 'string'){
+        len = p.length;
+      } else {
+        len = p.byteLength;
+      }
+      return acc + len.toString().length + len + 2; // string/binary identifier + separator = 2
+    }, 0);
+
+    var resultArray = new Uint8Array(totalLength);
+
+    var bufferIndex = 0;
+    encodedPackets.forEach(function(p) {
+      var isString = typeof p === 'string';
+      var ab = p;
+      if (isString) {
+        var view = new Uint8Array(p.length);
+        for (var i = 0; i < p.length; i++) {
+          view[i] = p.charCodeAt(i);
+        }
+        ab = view.buffer;
+      }
+
+      if (isString) { // not true binary
+        resultArray[bufferIndex++] = 0;
+      } else { // true binary
+        resultArray[bufferIndex++] = 1;
+      }
+
+      var lenStr = ab.byteLength.toString();
+      for (var i = 0; i < lenStr.length; i++) {
+        resultArray[bufferIndex++] = parseInt(lenStr[i]);
+      }
+      resultArray[bufferIndex++] = 255;
+
+      var view = new Uint8Array(ab);
+      for (var i = 0; i < view.length; i++) {
+        resultArray[bufferIndex++] = view[i];
+      }
+    });
+
+    return callback(resultArray.buffer);
+  });
+};
+
+/**
+ * Encode as Blob
+ */
+
+exports.encodePayloadAsBlob = function(packets, callback) {
+  function encodeOne(packet, doneCallback) {
+    exports.encodePacket(packet, true, true, function(encoded) {
+      var binaryIdentifier = new Uint8Array(1);
+      binaryIdentifier[0] = 1;
+      if (typeof encoded === 'string') {
+        var view = new Uint8Array(encoded.length);
+        for (var i = 0; i < encoded.length; i++) {
+          view[i] = encoded.charCodeAt(i);
+        }
+        encoded = view.buffer;
+        binaryIdentifier[0] = 0;
+      }
+
+      var len = (encoded instanceof ArrayBuffer)
+        ? encoded.byteLength
+        : encoded.size;
+
+      var lenStr = len.toString();
+      var lengthAry = new Uint8Array(lenStr.length + 1);
+      for (var i = 0; i < lenStr.length; i++) {
+        lengthAry[i] = parseInt(lenStr[i]);
+      }
+      lengthAry[lenStr.length] = 255;
+
+      if (Blob) {
+        var blob = new Blob([binaryIdentifier.buffer, lengthAry.buffer, encoded]);
+        doneCallback(null, blob);
+      }
+    });
+  }
+
+  map(packets, encodeOne, function(err, results) {
+    return callback(new Blob(results));
+  });
+};
+
+/*
+ * Decodes data when a payload is maybe expected. Strings are decoded by
+ * interpreting each byte as a key code for entries marked to start with 0. See
+ * description of encodePayloadAsBinary
+ *
+ * @param {ArrayBuffer} data, callback method
+ * @api public
+ */
+
+exports.decodePayloadAsBinary = function (data, binaryType, callback) {
+  if (typeof binaryType === 'function') {
+    callback = binaryType;
+    binaryType = null;
+  }
+
+  var bufferTail = data;
+  var buffers = [];
+
+  var numberTooLong = false;
+  while (bufferTail.byteLength > 0) {
+    var tailArray = new Uint8Array(bufferTail);
+    var isString = tailArray[0] === 0;
+    var msgLength = '';
+
+    for (var i = 1; ; i++) {
+      if (tailArray[i] == 255) break;
+
+      if (msgLength.length > 310) {
+        numberTooLong = true;
+        break;
+      }
+
+      msgLength += tailArray[i];
+    }
+
+    if(numberTooLong) return callback(err, 0, 1);
+
+    bufferTail = sliceBuffer(bufferTail, 2 + msgLength.length);
+    msgLength = parseInt(msgLength);
+
+    var msg = sliceBuffer(bufferTail, 0, msgLength);
+    if (isString) {
+      try {
+        msg = String.fromCharCode.apply(null, new Uint8Array(msg));
+      } catch (e) {
+        // iPhone Safari doesn't let you apply to typed arrays
+        var typed = new Uint8Array(msg);
+        msg = '';
+        for (var i = 0; i < typed.length; i++) {
+          msg += String.fromCharCode(typed[i]);
+        }
+      }
+    }
+
+    buffers.push(msg);
+    bufferTail = sliceBuffer(bufferTail, msgLength);
+  }
+
+  var total = buffers.length;
+  buffers.forEach(function(buffer, i) {
+    callback(exports.decodePacket(buffer, binaryType, true), i, total);
+  });
+};
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+
+},{"./keys":121,"after":122,"arraybuffer.slice":123,"base64-arraybuffer":124,"blob":125,"has-binary":126,"utf8":128}],121:[function(require,module,exports){
+
+/**
+ * Gets the keys for an object.
+ *
+ * @return {Array} keys
+ * @api private
+ */
+
+module.exports = Object.keys || function keys (obj){
+  var arr = [];
+  var has = Object.prototype.hasOwnProperty;
+
+  for (var i in obj) {
+    if (has.call(obj, i)) {
+      arr.push(i);
+    }
+  }
+  return arr;
+};
+
+},{}],122:[function(require,module,exports){
+module.exports = after
+
+function after(count, callback, err_cb) {
+    var bail = false
+    err_cb = err_cb || noop
+    proxy.count = count
+
+    return (count === 0) ? callback() : proxy
+
+    function proxy(err, result) {
+        if (proxy.count <= 0) {
+            throw new Error('after called too many times')
+        }
+        --proxy.count
+
+        // after first error, rest are passed to err_cb
+        if (err) {
+            bail = true
+            callback(err)
+            // future error callbacks will go to error handler
+            callback = err_cb
+        } else if (proxy.count === 0 && !bail) {
+            callback(null, result)
+        }
+    }
+}
+
+function noop() {}
+
+},{}],123:[function(require,module,exports){
+/**
+ * An abstraction for slicing an arraybuffer even when
+ * ArrayBuffer.prototype.slice is not supported
+ *
+ * @api public
+ */
+
+module.exports = function(arraybuffer, start, end) {
+  var bytes = arraybuffer.byteLength;
+  start = start || 0;
+  end = end || bytes;
+
+  if (arraybuffer.slice) { return arraybuffer.slice(start, end); }
+
+  if (start < 0) { start += bytes; }
+  if (end < 0) { end += bytes; }
+  if (end > bytes) { end = bytes; }
+
+  if (start >= bytes || start >= end || bytes === 0) {
+    return new ArrayBuffer(0);
+  }
+
+  var abv = new Uint8Array(arraybuffer);
+  var result = new Uint8Array(end - start);
+  for (var i = start, ii = 0; i < end; i++, ii++) {
+    result[ii] = abv[i];
+  }
+  return result.buffer;
+};
+
+},{}],124:[function(require,module,exports){
+/*
+ * base64-arraybuffer
+ * https://github.com/niklasvh/base64-arraybuffer
+ *
+ * Copyright (c) 2012 Niklas von Hertzen
+ * Licensed under the MIT license.
+ */
+(function(chars){
+  "use strict";
+
+  exports.encode = function(arraybuffer) {
+    var bytes = new Uint8Array(arraybuffer),
+    i, len = bytes.length, base64 = "";
+
+    for (i = 0; i < len; i+=3) {
+      base64 += chars[bytes[i] >> 2];
+      base64 += chars[((bytes[i] & 3) << 4) | (bytes[i + 1] >> 4)];
+      base64 += chars[((bytes[i + 1] & 15) << 2) | (bytes[i + 2] >> 6)];
+      base64 += chars[bytes[i + 2] & 63];
+    }
+
+    if ((len % 3) === 2) {
+      base64 = base64.substring(0, base64.length - 1) + "=";
+    } else if (len % 3 === 1) {
+      base64 = base64.substring(0, base64.length - 2) + "==";
+    }
+
+    return base64;
+  };
+
+  exports.decode =  function(base64) {
+    var bufferLength = base64.length * 0.75,
+    len = base64.length, i, p = 0,
+    encoded1, encoded2, encoded3, encoded4;
+
+    if (base64[base64.length - 1] === "=") {
+      bufferLength--;
+      if (base64[base64.length - 2] === "=") {
+        bufferLength--;
+      }
+    }
+
+    var arraybuffer = new ArrayBuffer(bufferLength),
+    bytes = new Uint8Array(arraybuffer);
+
+    for (i = 0; i < len; i+=4) {
+      encoded1 = chars.indexOf(base64[i]);
+      encoded2 = chars.indexOf(base64[i+1]);
+      encoded3 = chars.indexOf(base64[i+2]);
+      encoded4 = chars.indexOf(base64[i+3]);
+
+      bytes[p++] = (encoded1 << 2) | (encoded2 >> 4);
+      bytes[p++] = ((encoded2 & 15) << 4) | (encoded3 >> 2);
+      bytes[p++] = ((encoded3 & 3) << 6) | (encoded4 & 63);
+    }
+
+    return arraybuffer;
+  };
+})("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/");
+
+},{}],125:[function(require,module,exports){
+(function (global){
+/**
+ * Create a blob builder even when vendor prefixes exist
+ */
+
+var BlobBuilder = global.BlobBuilder
+  || global.WebKitBlobBuilder
+  || global.MSBlobBuilder
+  || global.MozBlobBuilder;
+
+/**
+ * Check if Blob constructor is supported
+ */
+
+var blobSupported = (function() {
+  try {
+    var b = new Blob(['hi']);
+    return b.size == 2;
+  } catch(e) {
+    return false;
+  }
+})();
+
+/**
+ * Check if BlobBuilder is supported
+ */
+
+var blobBuilderSupported = BlobBuilder
+  && BlobBuilder.prototype.append
+  && BlobBuilder.prototype.getBlob;
+
+function BlobBuilderConstructor(ary, options) {
+  options = options || {};
+
+  var bb = new BlobBuilder();
+  for (var i = 0; i < ary.length; i++) {
+    bb.append(ary[i]);
+  }
+  return (options.type) ? bb.getBlob(options.type) : bb.getBlob();
+};
+
+module.exports = (function() {
+  if (blobSupported) {
+    return global.Blob;
+  } else if (blobBuilderSupported) {
+    return BlobBuilderConstructor;
+  } else {
+    return undefined;
+  }
+})();
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+
+},{}],126:[function(require,module,exports){
+(function (global){
+
+/*
+ * Module requirements.
+ */
+
+var isArray = require('isarray');
+
+/**
+ * Module exports.
+ */
+
+module.exports = hasBinary;
+
+/**
+ * Checks for binary data.
+ *
+ * Right now only Buffer and ArrayBuffer are supported..
+ *
+ * @param {Object} anything
+ * @api public
+ */
+
+function hasBinary(data) {
+
+  function _hasBinary(obj) {
+    if (!obj) return false;
+
+    if ( (global.Buffer && global.Buffer.isBuffer(obj)) ||
+         (global.ArrayBuffer && obj instanceof ArrayBuffer) ||
+         (global.Blob && obj instanceof Blob) ||
+         (global.File && obj instanceof File)
+        ) {
+      return true;
+    }
+
+    if (isArray(obj)) {
+      for (var i = 0; i < obj.length; i++) {
+          if (_hasBinary(obj[i])) {
+              return true;
+          }
+      }
+    } else if (obj && 'object' == typeof obj) {
+      if (obj.toJSON) {
+        obj = obj.toJSON();
+      }
+
+      for (var key in obj) {
+        if (obj.hasOwnProperty(key) && _hasBinary(obj[key])) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  return _hasBinary(data);
+}
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+
+},{"isarray":127}],127:[function(require,module,exports){
+module.exports = Array.isArray || function (arr) {
+  return Object.prototype.toString.call(arr) == '[object Array]';
+};
+
+},{}],128:[function(require,module,exports){
+(function (global){
+/*! http://mths.be/utf8js v2.0.0 by @mathias */
+;(function(root) {
+
+	// Detect free variables `exports`
+	var freeExports = typeof exports == 'object' && exports;
+
+	// Detect free variable `module`
+	var freeModule = typeof module == 'object' && module &&
+		module.exports == freeExports && module;
+
+	// Detect free variable `global`, from Node.js or Browserified code,
+	// and use it as `root`
+	var freeGlobal = typeof global == 'object' && global;
+	if (freeGlobal.global === freeGlobal || freeGlobal.window === freeGlobal) {
+		root = freeGlobal;
+	}
+
+	/*--------------------------------------------------------------------------*/
+
+	var stringFromCharCode = String.fromCharCode;
+
+	// Taken from http://mths.be/punycode
+	function ucs2decode(string) {
+		var output = [];
+		var counter = 0;
+		var length = string.length;
+		var value;
+		var extra;
+		while (counter < length) {
+			value = string.charCodeAt(counter++);
+			if (value >= 0xD800 && value <= 0xDBFF && counter < length) {
+				// high surrogate, and there is a next character
+				extra = string.charCodeAt(counter++);
+				if ((extra & 0xFC00) == 0xDC00) { // low surrogate
+					output.push(((value & 0x3FF) << 10) + (extra & 0x3FF) + 0x10000);
+				} else {
+					// unmatched surrogate; only append this code unit, in case the next
+					// code unit is the high surrogate of a surrogate pair
+					output.push(value);
+					counter--;
+				}
+			} else {
+				output.push(value);
+			}
+		}
+		return output;
+	}
+
+	// Taken from http://mths.be/punycode
+	function ucs2encode(array) {
+		var length = array.length;
+		var index = -1;
+		var value;
+		var output = '';
+		while (++index < length) {
+			value = array[index];
+			if (value > 0xFFFF) {
+				value -= 0x10000;
+				output += stringFromCharCode(value >>> 10 & 0x3FF | 0xD800);
+				value = 0xDC00 | value & 0x3FF;
+			}
+			output += stringFromCharCode(value);
+		}
+		return output;
+	}
+
+	/*--------------------------------------------------------------------------*/
+
+	function createByte(codePoint, shift) {
+		return stringFromCharCode(((codePoint >> shift) & 0x3F) | 0x80);
+	}
+
+	function encodeCodePoint(codePoint) {
+		if ((codePoint & 0xFFFFFF80) == 0) { // 1-byte sequence
+			return stringFromCharCode(codePoint);
+		}
+		var symbol = '';
+		if ((codePoint & 0xFFFFF800) == 0) { // 2-byte sequence
+			symbol = stringFromCharCode(((codePoint >> 6) & 0x1F) | 0xC0);
+		}
+		else if ((codePoint & 0xFFFF0000) == 0) { // 3-byte sequence
+			symbol = stringFromCharCode(((codePoint >> 12) & 0x0F) | 0xE0);
+			symbol += createByte(codePoint, 6);
+		}
+		else if ((codePoint & 0xFFE00000) == 0) { // 4-byte sequence
+			symbol = stringFromCharCode(((codePoint >> 18) & 0x07) | 0xF0);
+			symbol += createByte(codePoint, 12);
+			symbol += createByte(codePoint, 6);
+		}
+		symbol += stringFromCharCode((codePoint & 0x3F) | 0x80);
+		return symbol;
+	}
+
+	function utf8encode(string) {
+		var codePoints = ucs2decode(string);
+
+		// console.log(JSON.stringify(codePoints.map(function(x) {
+		// 	return 'U+' + x.toString(16).toUpperCase();
+		// })));
+
+		var length = codePoints.length;
+		var index = -1;
+		var codePoint;
+		var byteString = '';
+		while (++index < length) {
+			codePoint = codePoints[index];
+			byteString += encodeCodePoint(codePoint);
+		}
+		return byteString;
+	}
+
+	/*--------------------------------------------------------------------------*/
+
+	function readContinuationByte() {
+		if (byteIndex >= byteCount) {
+			throw Error('Invalid byte index');
+		}
+
+		var continuationByte = byteArray[byteIndex] & 0xFF;
+		byteIndex++;
+
+		if ((continuationByte & 0xC0) == 0x80) {
+			return continuationByte & 0x3F;
+		}
+
+		// If we end up here, it’s not a continuation byte
+		throw Error('Invalid continuation byte');
+	}
+
+	function decodeSymbol() {
+		var byte1;
+		var byte2;
+		var byte3;
+		var byte4;
+		var codePoint;
+
+		if (byteIndex > byteCount) {
+			throw Error('Invalid byte index');
+		}
+
+		if (byteIndex == byteCount) {
+			return false;
+		}
+
+		// Read first byte
+		byte1 = byteArray[byteIndex] & 0xFF;
+		byteIndex++;
+
+		// 1-byte sequence (no continuation bytes)
+		if ((byte1 & 0x80) == 0) {
+			return byte1;
+		}
+
+		// 2-byte sequence
+		if ((byte1 & 0xE0) == 0xC0) {
+			var byte2 = readContinuationByte();
+			codePoint = ((byte1 & 0x1F) << 6) | byte2;
+			if (codePoint >= 0x80) {
+				return codePoint;
+			} else {
+				throw Error('Invalid continuation byte');
+			}
+		}
+
+		// 3-byte sequence (may include unpaired surrogates)
+		if ((byte1 & 0xF0) == 0xE0) {
+			byte2 = readContinuationByte();
+			byte3 = readContinuationByte();
+			codePoint = ((byte1 & 0x0F) << 12) | (byte2 << 6) | byte3;
+			if (codePoint >= 0x0800) {
+				return codePoint;
+			} else {
+				throw Error('Invalid continuation byte');
+			}
+		}
+
+		// 4-byte sequence
+		if ((byte1 & 0xF8) == 0xF0) {
+			byte2 = readContinuationByte();
+			byte3 = readContinuationByte();
+			byte4 = readContinuationByte();
+			codePoint = ((byte1 & 0x0F) << 0x12) | (byte2 << 0x0C) |
+				(byte3 << 0x06) | byte4;
+			if (codePoint >= 0x010000 && codePoint <= 0x10FFFF) {
+				return codePoint;
+			}
+		}
+
+		throw Error('Invalid UTF-8 detected');
+	}
+
+	var byteArray;
+	var byteCount;
+	var byteIndex;
+	function utf8decode(byteString) {
+		byteArray = ucs2decode(byteString);
+		byteCount = byteArray.length;
+		byteIndex = 0;
+		var codePoints = [];
+		var tmp;
+		while ((tmp = decodeSymbol()) !== false) {
+			codePoints.push(tmp);
+		}
+		return ucs2encode(codePoints);
+	}
+
+	/*--------------------------------------------------------------------------*/
+
+	var utf8 = {
+		'version': '2.0.0',
+		'encode': utf8encode,
+		'decode': utf8decode
+	};
+
+	// Some AMD build optimizers, like r.js, check for specific condition patterns
+	// like the following:
+	if (
+		typeof define == 'function' &&
+		typeof define.amd == 'object' &&
+		define.amd
+	) {
+		define(function() {
+			return utf8;
+		});
+	}	else if (freeExports && !freeExports.nodeType) {
+		if (freeModule) { // in Node.js or RingoJS v0.8.0+
+			freeModule.exports = utf8;
+		} else { // in Narwhal or RingoJS v0.7.0-
+			var object = {};
+			var hasOwnProperty = object.hasOwnProperty;
+			for (var key in utf8) {
+				hasOwnProperty.call(utf8, key) && (freeExports[key] = utf8[key]);
+			}
+		}
+	} else { // in Rhino or a web browser
+		root.utf8 = utf8;
+	}
+
+}(this));
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+
+},{}],129:[function(require,module,exports){
+
+/**
+ * Module dependencies.
+ */
+
+var global = require('global');
+
+/**
+ * Module exports.
+ *
+ * Logic borrowed from Modernizr:
+ *
+ *   - https://github.com/Modernizr/Modernizr/blob/master/feature-detects/cors.js
+ */
+
+try {
+  module.exports = 'XMLHttpRequest' in global &&
+    'withCredentials' in new global.XMLHttpRequest();
+} catch (err) {
+  // if XMLHttp support is disabled in IE then it will throw
+  // when trying to create
+  module.exports = false;
+}
+
+},{"global":130}],130:[function(require,module,exports){
+
+/**
+ * Returns `this`. Execute this without a "context" (i.e. without it being
+ * attached to an object of the left-hand side), and `this` points to the
+ * "global" scope of the current JS execution.
+ */
+
+module.exports = (function () { return this; })();
+
+},{}],131:[function(require,module,exports){
+(function (global){
+/**
+ * JSON parse.
+ *
+ * @see Based on jQuery#parseJSON (MIT) and JSON2
+ * @api private
+ */
+
+var rvalidchars = /^[\],:{}\s]*$/;
+var rvalidescape = /\\(?:["\\\/bfnrt]|u[0-9a-fA-F]{4})/g;
+var rvalidtokens = /"[^"\\\n\r]*"|true|false|null|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?/g;
+var rvalidbraces = /(?:^|:|,)(?:\s*\[)+/g;
+var rtrimLeft = /^\s+/;
+var rtrimRight = /\s+$/;
+
+module.exports = function parsejson(data) {
+  if ('string' != typeof data || !data) {
+    return null;
+  }
+
+  data = data.replace(rtrimLeft, '').replace(rtrimRight, '');
+
+  // Attempt to parse using the native JSON parser first
+  if (global.JSON && JSON.parse) {
+    return JSON.parse(data);
+  }
+
+  if (rvalidchars.test(data.replace(rvalidescape, '@')
+      .replace(rvalidtokens, ']')
+      .replace(rvalidbraces, ''))) {
+    return (new Function('return ' + data))();
+  }
+};
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+
+},{}],132:[function(require,module,exports){
+/**
+ * Compiles a querystring
+ * Returns string representation of the object
+ *
+ * @param {Object}
+ * @api private
+ */
+
+exports.encode = function (obj) {
+  var str = '';
+
+  for (var i in obj) {
+    if (obj.hasOwnProperty(i)) {
+      if (str.length) str += '&';
+      str += encodeURIComponent(i) + '=' + encodeURIComponent(obj[i]);
+    }
+  }
+
+  return str;
+};
+
+/**
+ * Parses a simple querystring into an object
+ *
+ * @param {String} qs
+ * @api private
+ */
+
+exports.decode = function(qs){
+  var qry = {};
+  var pairs = qs.split('&');
+  for (var i = 0, l = pairs.length; i < l; i++) {
+    var pair = pairs[i].split('=');
+    qry[decodeURIComponent(pair[0])] = decodeURIComponent(pair[1]);
+  }
+  return qry;
+};
+
+},{}],133:[function(require,module,exports){
+/**
+ * Parses an URI
+ *
+ * @author Steven Levithan <stevenlevithan.com> (MIT license)
+ * @api private
+ */
+
+var re = /^(?:(?![^:@]+:[^:@\/]*@)(http|https|ws|wss):\/\/)?((?:(([^:@]*)(?::([^:@]*))?)?@)?((?:[a-f0-9]{0,4}:){2,7}[a-f0-9]{0,4}|[^:\/?#]*)(?::(\d*))?)(((\/(?:[^?#](?![^?#\/]*\.[^?#\/.]+(?:[?#]|$)))*\/?)?([^?#\/]*))(?:\?([^#]*))?(?:#(.*))?)/;
+
+var parts = [
+    'source', 'protocol', 'authority', 'userInfo', 'user', 'password', 'host', 'port', 'relative', 'path', 'directory', 'file', 'query', 'anchor'
+];
+
+module.exports = function parseuri(str) {
+    var src = str,
+        b = str.indexOf('['),
+        e = str.indexOf(']');
+
+    if (b != -1 && e != -1) {
+        str = str.substring(0, b) + str.substring(b, e).replace(/:/g, ';') + str.substring(e, str.length);
+    }
+
+    var m = re.exec(str || ''),
+        uri = {},
+        i = 14;
+
+    while (i--) {
+        uri[parts[i]] = m[i] || '';
+    }
+
+    if (b != -1 && e != -1) {
+        uri.source = src;
+        uri.host = uri.host.substring(1, uri.host.length - 1).replace(/;/g, ':');
+        uri.authority = uri.authority.replace('[', '').replace(']', '').replace(/;/g, ':');
+        uri.ipv6uri = true;
+    }
+
+    return uri;
+};
+
+},{}],134:[function(require,module,exports){
+
+/**
+ * Module dependencies.
+ */
+
+var global = (function() { return this; })();
+
+/**
+ * WebSocket constructor.
+ */
+
+var WebSocket = global.WebSocket || global.MozWebSocket;
+
+/**
+ * Module exports.
+ */
+
+module.exports = WebSocket ? ws : null;
+
+/**
+ * WebSocket constructor.
+ *
+ * The third `opts` options object gets ignored in web browsers, since it's
+ * non-standard, and throws a TypeError if passed to the constructor.
+ * See: https://github.com/einaros/ws/issues/227
+ *
+ * @param {String} uri
+ * @param {Array} protocols (optional)
+ * @param {Object) opts (optional)
+ * @api public
+ */
+
+function ws(uri, protocols, opts) {
+  var instance;
+  if (protocols) {
+    instance = new WebSocket(uri, protocols);
+  } else {
+    instance = new WebSocket(uri);
+  }
+  return instance;
+}
+
+if (WebSocket) ws.prototype = WebSocket.prototype;
+
+},{}],135:[function(require,module,exports){
+(function (global){
+
+/*
+ * Module requirements.
+ */
+
+var isArray = require('isarray');
+
+/**
+ * Module exports.
+ */
+
+module.exports = hasBinary;
+
+/**
+ * Checks for binary data.
+ *
+ * Right now only Buffer and ArrayBuffer are supported..
+ *
+ * @param {Object} anything
+ * @api public
+ */
+
+function hasBinary(data) {
+
+  function _hasBinary(obj) {
+    if (!obj) return false;
+
+    if ( (global.Buffer && global.Buffer.isBuffer(obj)) ||
+         (global.ArrayBuffer && obj instanceof ArrayBuffer) ||
+         (global.Blob && obj instanceof Blob) ||
+         (global.File && obj instanceof File)
+        ) {
+      return true;
+    }
+
+    if (isArray(obj)) {
+      for (var i = 0; i < obj.length; i++) {
+          if (_hasBinary(obj[i])) {
+              return true;
+          }
+      }
+    } else if (obj && 'object' == typeof obj) {
+      if (obj.toJSON) {
+        obj = obj.toJSON();
+      }
+
+      for (var key in obj) {
+        if (Object.prototype.hasOwnProperty.call(obj, key) && _hasBinary(obj[key])) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  return _hasBinary(data);
+}
+
+}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+
+},{"isarray":136}],136:[function(require,module,exports){
+arguments[4][127][0].apply(exports,arguments)
+},{"dup":127}],137:[function(require,module,exports){
+
+var indexOf = [].indexOf;
+
+module.exports = function(arr, obj){
+  if (indexOf) return arr.indexOf(obj);
+  for (var i = 0; i < arr.length; ++i) {
+    if (arr[i] === obj) return i;
+  }
+  return -1;
+};
+},{}],138:[function(require,module,exports){
+
+/**
+ * HOP ref.
+ */
+
+var has = Object.prototype.hasOwnProperty;
+
+/**
+ * Return own keys in `obj`.
+ *
+ * @param {Object} obj
+ * @return {Array}
+ * @api public
+ */
+
+exports.keys = Object.keys || function(obj){
+  var keys = [];
+  for (var key in obj) {
+    if (has.call(obj, key)) {
+      keys.push(key);
+    }
+  }
+  return keys;
+};
+
+/**
+ * Return own values in `obj`.
+ *
+ * @param {Object} obj
+ * @return {Array}
+ * @api public
+ */
+
+exports.values = function(obj){
+  var vals = [];
+  for (var key in obj) {
+    if (has.call(obj, key)) {
+      vals.push(obj[key]);
+    }
+  }
+  return vals;
+};
+
+/**
+ * Merge `b` into `a`.
+ *
+ * @param {Object} a
+ * @param {Object} b
+ * @return {Object} a
+ * @api public
+ */
+
+exports.merge = function(a, b){
+  for (var key in b) {
+    if (has.call(b, key)) {
+      a[key] = b[key];
+    }
+  }
+  return a;
+};
+
+/**
+ * Return length of `obj`.
+ *
+ * @param {Object} obj
+ * @return {Number}
+ * @api public
+ */
+
+exports.length = function(obj){
+  return exports.keys(obj).length;
+};
+
+/**
+ * Check if `obj` is empty.
+ *
+ * @param {Object} obj
+ * @return {Boolean}
+ * @api public
+ */
+
+exports.isEmpty = function(obj){
+  return 0 == exports.length(obj);
+};
+},{}],139:[function(require,module,exports){
+/**
+ * Parses an URI
+ *
+ * @author Steven Levithan <stevenlevithan.com> (MIT license)
+ * @api private
+ */
+
+var re = /^(?:(?![^:@]+:[^:@\/]*@)(http|https|ws|wss):\/\/)?((?:(([^:@]*)(?::([^:@]*))?)?@)?((?:[a-f0-9]{0,4}:){2,7}[a-f0-9]{0,4}|[^:\/?#]*)(?::(\d*))?)(((\/(?:[^?#](?![^?#\/]*\.[^?#\/.]+(?:[?#]|$)))*\/?)?([^?#\/]*))(?:\?([^#]*))?(?:#(.*))?)/;
+
+var parts = [
+    'source', 'protocol', 'authority', 'userInfo', 'user', 'password', 'host'
+  , 'port', 'relative', 'path', 'directory', 'file', 'query', 'anchor'
+];
+
+module.exports = function parseuri(str) {
+  var m = re.exec(str || '')
+    , uri = {}
+    , i = 14;
+
+  while (i--) {
+    uri[parts[i]] = m[i] || '';
+  }
+
+  return uri;
+};
+
+},{}],140:[function(require,module,exports){
 (function (global){
 /*global Blob,File*/
 
@@ -33000,7 +36683,7 @@ exports.removeBlobs = function(data, callback) {
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{"./is-buffer":125,"isarray":80}],124:[function(require,module,exports){
+},{"./is-buffer":142,"isarray":143}],141:[function(require,module,exports){
 
 /**
  * Module dependencies.
@@ -33402,7 +37085,7 @@ function error(data){
   };
 }
 
-},{"./binary":123,"./is-buffer":125,"component-emitter":56,"debug":58,"isarray":80,"json3":83}],125:[function(require,module,exports){
+},{"./binary":140,"./is-buffer":142,"component-emitter":104,"debug":105,"isarray":143,"json3":144}],142:[function(require,module,exports){
 (function (global){
 
 module.exports = isBuf;
@@ -33420,7 +37103,872 @@ function isBuf(obj) {
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
 
-},{}],126:[function(require,module,exports){
+},{}],143:[function(require,module,exports){
+arguments[4][127][0].apply(exports,arguments)
+},{"dup":127}],144:[function(require,module,exports){
+/*! JSON v3.2.6 | http://bestiejs.github.io/json3 | Copyright 2012-2013, Kit Cambridge | http://kit.mit-license.org */
+;(function (window) {
+  // Convenience aliases.
+  var getClass = {}.toString, isProperty, forEach, undef;
+
+  // Detect the `define` function exposed by asynchronous module loaders. The
+  // strict `define` check is necessary for compatibility with `r.js`.
+  var isLoader = typeof define === "function" && define.amd;
+
+  // Detect native implementations.
+  var nativeJSON = typeof JSON == "object" && JSON;
+
+  // Set up the JSON 3 namespace, preferring the CommonJS `exports` object if
+  // available.
+  var JSON3 = typeof exports == "object" && exports && !exports.nodeType && exports;
+
+  if (JSON3 && nativeJSON) {
+    // Explicitly delegate to the native `stringify` and `parse`
+    // implementations in CommonJS environments.
+    JSON3.stringify = nativeJSON.stringify;
+    JSON3.parse = nativeJSON.parse;
+  } else {
+    // Export for web browsers, JavaScript engines, and asynchronous module
+    // loaders, using the global `JSON` object if available.
+    JSON3 = window.JSON = nativeJSON || {};
+  }
+
+  // Test the `Date#getUTC*` methods. Based on work by @Yaffle.
+  var isExtended = new Date(-3509827334573292);
+  try {
+    // The `getUTCFullYear`, `Month`, and `Date` methods return nonsensical
+    // results for certain dates in Opera >= 10.53.
+    isExtended = isExtended.getUTCFullYear() == -109252 && isExtended.getUTCMonth() === 0 && isExtended.getUTCDate() === 1 &&
+      // Safari < 2.0.2 stores the internal millisecond time value correctly,
+      // but clips the values returned by the date methods to the range of
+      // signed 32-bit integers ([-2 ** 31, 2 ** 31 - 1]).
+      isExtended.getUTCHours() == 10 && isExtended.getUTCMinutes() == 37 && isExtended.getUTCSeconds() == 6 && isExtended.getUTCMilliseconds() == 708;
+  } catch (exception) {}
+
+  // Internal: Determines whether the native `JSON.stringify` and `parse`
+  // implementations are spec-compliant. Based on work by Ken Snyder.
+  function has(name) {
+    if (has[name] !== undef) {
+      // Return cached feature test result.
+      return has[name];
+    }
+
+    var isSupported;
+    if (name == "bug-string-char-index") {
+      // IE <= 7 doesn't support accessing string characters using square
+      // bracket notation. IE 8 only supports this for primitives.
+      isSupported = "a"[0] != "a";
+    } else if (name == "json") {
+      // Indicates whether both `JSON.stringify` and `JSON.parse` are
+      // supported.
+      isSupported = has("json-stringify") && has("json-parse");
+    } else {
+      var value, serialized = '{"a":[1,true,false,null,"\\u0000\\b\\n\\f\\r\\t"]}';
+      // Test `JSON.stringify`.
+      if (name == "json-stringify") {
+        var stringify = JSON3.stringify, stringifySupported = typeof stringify == "function" && isExtended;
+        if (stringifySupported) {
+          // A test function object with a custom `toJSON` method.
+          (value = function () {
+            return 1;
+          }).toJSON = value;
+          try {
+            stringifySupported =
+              // Firefox 3.1b1 and b2 serialize string, number, and boolean
+              // primitives as object literals.
+              stringify(0) === "0" &&
+              // FF 3.1b1, b2, and JSON 2 serialize wrapped primitives as object
+              // literals.
+              stringify(new Number()) === "0" &&
+              stringify(new String()) == '""' &&
+              // FF 3.1b1, 2 throw an error if the value is `null`, `undefined`, or
+              // does not define a canonical JSON representation (this applies to
+              // objects with `toJSON` properties as well, *unless* they are nested
+              // within an object or array).
+              stringify(getClass) === undef &&
+              // IE 8 serializes `undefined` as `"undefined"`. Safari <= 5.1.7 and
+              // FF 3.1b3 pass this test.
+              stringify(undef) === undef &&
+              // Safari <= 5.1.7 and FF 3.1b3 throw `Error`s and `TypeError`s,
+              // respectively, if the value is omitted entirely.
+              stringify() === undef &&
+              // FF 3.1b1, 2 throw an error if the given value is not a number,
+              // string, array, object, Boolean, or `null` literal. This applies to
+              // objects with custom `toJSON` methods as well, unless they are nested
+              // inside object or array literals. YUI 3.0.0b1 ignores custom `toJSON`
+              // methods entirely.
+              stringify(value) === "1" &&
+              stringify([value]) == "[1]" &&
+              // Prototype <= 1.6.1 serializes `[undefined]` as `"[]"` instead of
+              // `"[null]"`.
+              stringify([undef]) == "[null]" &&
+              // YUI 3.0.0b1 fails to serialize `null` literals.
+              stringify(null) == "null" &&
+              // FF 3.1b1, 2 halts serialization if an array contains a function:
+              // `[1, true, getClass, 1]` serializes as "[1,true,],". FF 3.1b3
+              // elides non-JSON values from objects and arrays, unless they
+              // define custom `toJSON` methods.
+              stringify([undef, getClass, null]) == "[null,null,null]" &&
+              // Simple serialization test. FF 3.1b1 uses Unicode escape sequences
+              // where character escape codes are expected (e.g., `\b` => `\u0008`).
+              stringify({ "a": [value, true, false, null, "\x00\b\n\f\r\t"] }) == serialized &&
+              // FF 3.1b1 and b2 ignore the `filter` and `width` arguments.
+              stringify(null, value) === "1" &&
+              stringify([1, 2], null, 1) == "[\n 1,\n 2\n]" &&
+              // JSON 2, Prototype <= 1.7, and older WebKit builds incorrectly
+              // serialize extended years.
+              stringify(new Date(-8.64e15)) == '"-271821-04-20T00:00:00.000Z"' &&
+              // The milliseconds are optional in ES 5, but required in 5.1.
+              stringify(new Date(8.64e15)) == '"+275760-09-13T00:00:00.000Z"' &&
+              // Firefox <= 11.0 incorrectly serializes years prior to 0 as negative
+              // four-digit years instead of six-digit years. Credits: @Yaffle.
+              stringify(new Date(-621987552e5)) == '"-000001-01-01T00:00:00.000Z"' &&
+              // Safari <= 5.1.5 and Opera >= 10.53 incorrectly serialize millisecond
+              // values less than 1000. Credits: @Yaffle.
+              stringify(new Date(-1)) == '"1969-12-31T23:59:59.999Z"';
+          } catch (exception) {
+            stringifySupported = false;
+          }
+        }
+        isSupported = stringifySupported;
+      }
+      // Test `JSON.parse`.
+      if (name == "json-parse") {
+        var parse = JSON3.parse;
+        if (typeof parse == "function") {
+          try {
+            // FF 3.1b1, b2 will throw an exception if a bare literal is provided.
+            // Conforming implementations should also coerce the initial argument to
+            // a string prior to parsing.
+            if (parse("0") === 0 && !parse(false)) {
+              // Simple parsing test.
+              value = parse(serialized);
+              var parseSupported = value["a"].length == 5 && value["a"][0] === 1;
+              if (parseSupported) {
+                try {
+                  // Safari <= 5.1.2 and FF 3.1b1 allow unescaped tabs in strings.
+                  parseSupported = !parse('"\t"');
+                } catch (exception) {}
+                if (parseSupported) {
+                  try {
+                    // FF 4.0 and 4.0.1 allow leading `+` signs and leading
+                    // decimal points. FF 4.0, 4.0.1, and IE 9-10 also allow
+                    // certain octal literals.
+                    parseSupported = parse("01") !== 1;
+                  } catch (exception) {}
+                }
+                if (parseSupported) {
+                  try {
+                    // FF 4.0, 4.0.1, and Rhino 1.7R3-R4 allow trailing decimal
+                    // points. These environments, along with FF 3.1b1 and 2,
+                    // also allow trailing commas in JSON objects and arrays.
+                    parseSupported = parse("1.") !== 1;
+                  } catch (exception) {}
+                }
+              }
+            }
+          } catch (exception) {
+            parseSupported = false;
+          }
+        }
+        isSupported = parseSupported;
+      }
+    }
+    return has[name] = !!isSupported;
+  }
+
+  if (!has("json")) {
+    // Common `[[Class]]` name aliases.
+    var functionClass = "[object Function]";
+    var dateClass = "[object Date]";
+    var numberClass = "[object Number]";
+    var stringClass = "[object String]";
+    var arrayClass = "[object Array]";
+    var booleanClass = "[object Boolean]";
+
+    // Detect incomplete support for accessing string characters by index.
+    var charIndexBuggy = has("bug-string-char-index");
+
+    // Define additional utility methods if the `Date` methods are buggy.
+    if (!isExtended) {
+      var floor = Math.floor;
+      // A mapping between the months of the year and the number of days between
+      // January 1st and the first of the respective month.
+      var Months = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+      // Internal: Calculates the number of days between the Unix epoch and the
+      // first day of the given month.
+      var getDay = function (year, month) {
+        return Months[month] + 365 * (year - 1970) + floor((year - 1969 + (month = +(month > 1))) / 4) - floor((year - 1901 + month) / 100) + floor((year - 1601 + month) / 400);
+      };
+    }
+
+    // Internal: Determines if a property is a direct property of the given
+    // object. Delegates to the native `Object#hasOwnProperty` method.
+    if (!(isProperty = {}.hasOwnProperty)) {
+      isProperty = function (property) {
+        var members = {}, constructor;
+        if ((members.__proto__ = null, members.__proto__ = {
+          // The *proto* property cannot be set multiple times in recent
+          // versions of Firefox and SeaMonkey.
+          "toString": 1
+        }, members).toString != getClass) {
+          // Safari <= 2.0.3 doesn't implement `Object#hasOwnProperty`, but
+          // supports the mutable *proto* property.
+          isProperty = function (property) {
+            // Capture and break the object's prototype chain (see section 8.6.2
+            // of the ES 5.1 spec). The parenthesized expression prevents an
+            // unsafe transformation by the Closure Compiler.
+            var original = this.__proto__, result = property in (this.__proto__ = null, this);
+            // Restore the original prototype chain.
+            this.__proto__ = original;
+            return result;
+          };
+        } else {
+          // Capture a reference to the top-level `Object` constructor.
+          constructor = members.constructor;
+          // Use the `constructor` property to simulate `Object#hasOwnProperty` in
+          // other environments.
+          isProperty = function (property) {
+            var parent = (this.constructor || constructor).prototype;
+            return property in this && !(property in parent && this[property] === parent[property]);
+          };
+        }
+        members = null;
+        return isProperty.call(this, property);
+      };
+    }
+
+    // Internal: A set of primitive types used by `isHostType`.
+    var PrimitiveTypes = {
+      'boolean': 1,
+      'number': 1,
+      'string': 1,
+      'undefined': 1
+    };
+
+    // Internal: Determines if the given object `property` value is a
+    // non-primitive.
+    var isHostType = function (object, property) {
+      var type = typeof object[property];
+      return type == 'object' ? !!object[property] : !PrimitiveTypes[type];
+    };
+
+    // Internal: Normalizes the `for...in` iteration algorithm across
+    // environments. Each enumerated key is yielded to a `callback` function.
+    forEach = function (object, callback) {
+      var size = 0, Properties, members, property;
+
+      // Tests for bugs in the current environment's `for...in` algorithm. The
+      // `valueOf` property inherits the non-enumerable flag from
+      // `Object.prototype` in older versions of IE, Netscape, and Mozilla.
+      (Properties = function () {
+        this.valueOf = 0;
+      }).prototype.valueOf = 0;
+
+      // Iterate over a new instance of the `Properties` class.
+      members = new Properties();
+      for (property in members) {
+        // Ignore all properties inherited from `Object.prototype`.
+        if (isProperty.call(members, property)) {
+          size++;
+        }
+      }
+      Properties = members = null;
+
+      // Normalize the iteration algorithm.
+      if (!size) {
+        // A list of non-enumerable properties inherited from `Object.prototype`.
+        members = ["valueOf", "toString", "toLocaleString", "propertyIsEnumerable", "isPrototypeOf", "hasOwnProperty", "constructor"];
+        // IE <= 8, Mozilla 1.0, and Netscape 6.2 ignore shadowed non-enumerable
+        // properties.
+        forEach = function (object, callback) {
+          var isFunction = getClass.call(object) == functionClass, property, length;
+          var hasProperty = !isFunction && typeof object.constructor != 'function' && isHostType(object, 'hasOwnProperty') ? object.hasOwnProperty : isProperty;
+          for (property in object) {
+            // Gecko <= 1.0 enumerates the `prototype` property of functions under
+            // certain conditions; IE does not.
+            if (!(isFunction && property == "prototype") && hasProperty.call(object, property)) {
+              callback(property);
+            }
+          }
+          // Manually invoke the callback for each non-enumerable property.
+          for (length = members.length; property = members[--length]; hasProperty.call(object, property) && callback(property));
+        };
+      } else if (size == 2) {
+        // Safari <= 2.0.4 enumerates shadowed properties twice.
+        forEach = function (object, callback) {
+          // Create a set of iterated properties.
+          var members = {}, isFunction = getClass.call(object) == functionClass, property;
+          for (property in object) {
+            // Store each property name to prevent double enumeration. The
+            // `prototype` property of functions is not enumerated due to cross-
+            // environment inconsistencies.
+            if (!(isFunction && property == "prototype") && !isProperty.call(members, property) && (members[property] = 1) && isProperty.call(object, property)) {
+              callback(property);
+            }
+          }
+        };
+      } else {
+        // No bugs detected; use the standard `for...in` algorithm.
+        forEach = function (object, callback) {
+          var isFunction = getClass.call(object) == functionClass, property, isConstructor;
+          for (property in object) {
+            if (!(isFunction && property == "prototype") && isProperty.call(object, property) && !(isConstructor = property === "constructor")) {
+              callback(property);
+            }
+          }
+          // Manually invoke the callback for the `constructor` property due to
+          // cross-environment inconsistencies.
+          if (isConstructor || isProperty.call(object, (property = "constructor"))) {
+            callback(property);
+          }
+        };
+      }
+      return forEach(object, callback);
+    };
+
+    // Public: Serializes a JavaScript `value` as a JSON string. The optional
+    // `filter` argument may specify either a function that alters how object and
+    // array members are serialized, or an array of strings and numbers that
+    // indicates which properties should be serialized. The optional `width`
+    // argument may be either a string or number that specifies the indentation
+    // level of the output.
+    if (!has("json-stringify")) {
+      // Internal: A map of control characters and their escaped equivalents.
+      var Escapes = {
+        92: "\\\\",
+        34: '\\"',
+        8: "\\b",
+        12: "\\f",
+        10: "\\n",
+        13: "\\r",
+        9: "\\t"
+      };
+
+      // Internal: Converts `value` into a zero-padded string such that its
+      // length is at least equal to `width`. The `width` must be <= 6.
+      var leadingZeroes = "000000";
+      var toPaddedString = function (width, value) {
+        // The `|| 0` expression is necessary to work around a bug in
+        // Opera <= 7.54u2 where `0 == -0`, but `String(-0) !== "0"`.
+        return (leadingZeroes + (value || 0)).slice(-width);
+      };
+
+      // Internal: Double-quotes a string `value`, replacing all ASCII control
+      // characters (characters with code unit values between 0 and 31) with
+      // their escaped equivalents. This is an implementation of the
+      // `Quote(value)` operation defined in ES 5.1 section 15.12.3.
+      var unicodePrefix = "\\u00";
+      var quote = function (value) {
+        var result = '"', index = 0, length = value.length, isLarge = length > 10 && charIndexBuggy, symbols;
+        if (isLarge) {
+          symbols = value.split("");
+        }
+        for (; index < length; index++) {
+          var charCode = value.charCodeAt(index);
+          // If the character is a control character, append its Unicode or
+          // shorthand escape sequence; otherwise, append the character as-is.
+          switch (charCode) {
+            case 8: case 9: case 10: case 12: case 13: case 34: case 92:
+              result += Escapes[charCode];
+              break;
+            default:
+              if (charCode < 32) {
+                result += unicodePrefix + toPaddedString(2, charCode.toString(16));
+                break;
+              }
+              result += isLarge ? symbols[index] : charIndexBuggy ? value.charAt(index) : value[index];
+          }
+        }
+        return result + '"';
+      };
+
+      // Internal: Recursively serializes an object. Implements the
+      // `Str(key, holder)`, `JO(value)`, and `JA(value)` operations.
+      var serialize = function (property, object, callback, properties, whitespace, indentation, stack) {
+        var value, className, year, month, date, time, hours, minutes, seconds, milliseconds, results, element, index, length, prefix, result;
+        try {
+          // Necessary for host object support.
+          value = object[property];
+        } catch (exception) {}
+        if (typeof value == "object" && value) {
+          className = getClass.call(value);
+          if (className == dateClass && !isProperty.call(value, "toJSON")) {
+            if (value > -1 / 0 && value < 1 / 0) {
+              // Dates are serialized according to the `Date#toJSON` method
+              // specified in ES 5.1 section 15.9.5.44. See section 15.9.1.15
+              // for the ISO 8601 date time string format.
+              if (getDay) {
+                // Manually compute the year, month, date, hours, minutes,
+                // seconds, and milliseconds if the `getUTC*` methods are
+                // buggy. Adapted from @Yaffle's `date-shim` project.
+                date = floor(value / 864e5);
+                for (year = floor(date / 365.2425) + 1970 - 1; getDay(year + 1, 0) <= date; year++);
+                for (month = floor((date - getDay(year, 0)) / 30.42); getDay(year, month + 1) <= date; month++);
+                date = 1 + date - getDay(year, month);
+                // The `time` value specifies the time within the day (see ES
+                // 5.1 section 15.9.1.2). The formula `(A % B + B) % B` is used
+                // to compute `A modulo B`, as the `%` operator does not
+                // correspond to the `modulo` operation for negative numbers.
+                time = (value % 864e5 + 864e5) % 864e5;
+                // The hours, minutes, seconds, and milliseconds are obtained by
+                // decomposing the time within the day. See section 15.9.1.10.
+                hours = floor(time / 36e5) % 24;
+                minutes = floor(time / 6e4) % 60;
+                seconds = floor(time / 1e3) % 60;
+                milliseconds = time % 1e3;
+              } else {
+                year = value.getUTCFullYear();
+                month = value.getUTCMonth();
+                date = value.getUTCDate();
+                hours = value.getUTCHours();
+                minutes = value.getUTCMinutes();
+                seconds = value.getUTCSeconds();
+                milliseconds = value.getUTCMilliseconds();
+              }
+              // Serialize extended years correctly.
+              value = (year <= 0 || year >= 1e4 ? (year < 0 ? "-" : "+") + toPaddedString(6, year < 0 ? -year : year) : toPaddedString(4, year)) +
+                "-" + toPaddedString(2, month + 1) + "-" + toPaddedString(2, date) +
+                // Months, dates, hours, minutes, and seconds should have two
+                // digits; milliseconds should have three.
+                "T" + toPaddedString(2, hours) + ":" + toPaddedString(2, minutes) + ":" + toPaddedString(2, seconds) +
+                // Milliseconds are optional in ES 5.0, but required in 5.1.
+                "." + toPaddedString(3, milliseconds) + "Z";
+            } else {
+              value = null;
+            }
+          } else if (typeof value.toJSON == "function" && ((className != numberClass && className != stringClass && className != arrayClass) || isProperty.call(value, "toJSON"))) {
+            // Prototype <= 1.6.1 adds non-standard `toJSON` methods to the
+            // `Number`, `String`, `Date`, and `Array` prototypes. JSON 3
+            // ignores all `toJSON` methods on these objects unless they are
+            // defined directly on an instance.
+            value = value.toJSON(property);
+          }
+        }
+        if (callback) {
+          // If a replacement function was provided, call it to obtain the value
+          // for serialization.
+          value = callback.call(object, property, value);
+        }
+        if (value === null) {
+          return "null";
+        }
+        className = getClass.call(value);
+        if (className == booleanClass) {
+          // Booleans are represented literally.
+          return "" + value;
+        } else if (className == numberClass) {
+          // JSON numbers must be finite. `Infinity` and `NaN` are serialized as
+          // `"null"`.
+          return value > -1 / 0 && value < 1 / 0 ? "" + value : "null";
+        } else if (className == stringClass) {
+          // Strings are double-quoted and escaped.
+          return quote("" + value);
+        }
+        // Recursively serialize objects and arrays.
+        if (typeof value == "object") {
+          // Check for cyclic structures. This is a linear search; performance
+          // is inversely proportional to the number of unique nested objects.
+          for (length = stack.length; length--;) {
+            if (stack[length] === value) {
+              // Cyclic structures cannot be serialized by `JSON.stringify`.
+              throw TypeError();
+            }
+          }
+          // Add the object to the stack of traversed objects.
+          stack.push(value);
+          results = [];
+          // Save the current indentation level and indent one additional level.
+          prefix = indentation;
+          indentation += whitespace;
+          if (className == arrayClass) {
+            // Recursively serialize array elements.
+            for (index = 0, length = value.length; index < length; index++) {
+              element = serialize(index, value, callback, properties, whitespace, indentation, stack);
+              results.push(element === undef ? "null" : element);
+            }
+            result = results.length ? (whitespace ? "[\n" + indentation + results.join(",\n" + indentation) + "\n" + prefix + "]" : ("[" + results.join(",") + "]")) : "[]";
+          } else {
+            // Recursively serialize object members. Members are selected from
+            // either a user-specified list of property names, or the object
+            // itself.
+            forEach(properties || value, function (property) {
+              var element = serialize(property, value, callback, properties, whitespace, indentation, stack);
+              if (element !== undef) {
+                // According to ES 5.1 section 15.12.3: "If `gap` {whitespace}
+                // is not the empty string, let `member` {quote(property) + ":"}
+                // be the concatenation of `member` and the `space` character."
+                // The "`space` character" refers to the literal space
+                // character, not the `space` {width} argument provided to
+                // `JSON.stringify`.
+                results.push(quote(property) + ":" + (whitespace ? " " : "") + element);
+              }
+            });
+            result = results.length ? (whitespace ? "{\n" + indentation + results.join(",\n" + indentation) + "\n" + prefix + "}" : ("{" + results.join(",") + "}")) : "{}";
+          }
+          // Remove the object from the traversed object stack.
+          stack.pop();
+          return result;
+        }
+      };
+
+      // Public: `JSON.stringify`. See ES 5.1 section 15.12.3.
+      JSON3.stringify = function (source, filter, width) {
+        var whitespace, callback, properties, className;
+        if (typeof filter == "function" || typeof filter == "object" && filter) {
+          if ((className = getClass.call(filter)) == functionClass) {
+            callback = filter;
+          } else if (className == arrayClass) {
+            // Convert the property names array into a makeshift set.
+            properties = {};
+            for (var index = 0, length = filter.length, value; index < length; value = filter[index++], ((className = getClass.call(value)), className == stringClass || className == numberClass) && (properties[value] = 1));
+          }
+        }
+        if (width) {
+          if ((className = getClass.call(width)) == numberClass) {
+            // Convert the `width` to an integer and create a string containing
+            // `width` number of space characters.
+            if ((width -= width % 1) > 0) {
+              for (whitespace = "", width > 10 && (width = 10); whitespace.length < width; whitespace += " ");
+            }
+          } else if (className == stringClass) {
+            whitespace = width.length <= 10 ? width : width.slice(0, 10);
+          }
+        }
+        // Opera <= 7.54u2 discards the values associated with empty string keys
+        // (`""`) only if they are used directly within an object member list
+        // (e.g., `!("" in { "": 1})`).
+        return serialize("", (value = {}, value[""] = source, value), callback, properties, whitespace, "", []);
+      };
+    }
+
+    // Public: Parses a JSON source string.
+    if (!has("json-parse")) {
+      var fromCharCode = String.fromCharCode;
+
+      // Internal: A map of escaped control characters and their unescaped
+      // equivalents.
+      var Unescapes = {
+        92: "\\",
+        34: '"',
+        47: "/",
+        98: "\b",
+        116: "\t",
+        110: "\n",
+        102: "\f",
+        114: "\r"
+      };
+
+      // Internal: Stores the parser state.
+      var Index, Source;
+
+      // Internal: Resets the parser state and throws a `SyntaxError`.
+      var abort = function() {
+        Index = Source = null;
+        throw SyntaxError();
+      };
+
+      // Internal: Returns the next token, or `"$"` if the parser has reached
+      // the end of the source string. A token may be a string, number, `null`
+      // literal, or Boolean literal.
+      var lex = function () {
+        var source = Source, length = source.length, value, begin, position, isSigned, charCode;
+        while (Index < length) {
+          charCode = source.charCodeAt(Index);
+          switch (charCode) {
+            case 9: case 10: case 13: case 32:
+              // Skip whitespace tokens, including tabs, carriage returns, line
+              // feeds, and space characters.
+              Index++;
+              break;
+            case 123: case 125: case 91: case 93: case 58: case 44:
+              // Parse a punctuator token (`{`, `}`, `[`, `]`, `:`, or `,`) at
+              // the current position.
+              value = charIndexBuggy ? source.charAt(Index) : source[Index];
+              Index++;
+              return value;
+            case 34:
+              // `"` delimits a JSON string; advance to the next character and
+              // begin parsing the string. String tokens are prefixed with the
+              // sentinel `@` character to distinguish them from punctuators and
+              // end-of-string tokens.
+              for (value = "@", Index++; Index < length;) {
+                charCode = source.charCodeAt(Index);
+                if (charCode < 32) {
+                  // Unescaped ASCII control characters (those with a code unit
+                  // less than the space character) are not permitted.
+                  abort();
+                } else if (charCode == 92) {
+                  // A reverse solidus (`\`) marks the beginning of an escaped
+                  // control character (including `"`, `\`, and `/`) or Unicode
+                  // escape sequence.
+                  charCode = source.charCodeAt(++Index);
+                  switch (charCode) {
+                    case 92: case 34: case 47: case 98: case 116: case 110: case 102: case 114:
+                      // Revive escaped control characters.
+                      value += Unescapes[charCode];
+                      Index++;
+                      break;
+                    case 117:
+                      // `\u` marks the beginning of a Unicode escape sequence.
+                      // Advance to the first character and validate the
+                      // four-digit code point.
+                      begin = ++Index;
+                      for (position = Index + 4; Index < position; Index++) {
+                        charCode = source.charCodeAt(Index);
+                        // A valid sequence comprises four hexdigits (case-
+                        // insensitive) that form a single hexadecimal value.
+                        if (!(charCode >= 48 && charCode <= 57 || charCode >= 97 && charCode <= 102 || charCode >= 65 && charCode <= 70)) {
+                          // Invalid Unicode escape sequence.
+                          abort();
+                        }
+                      }
+                      // Revive the escaped character.
+                      value += fromCharCode("0x" + source.slice(begin, Index));
+                      break;
+                    default:
+                      // Invalid escape sequence.
+                      abort();
+                  }
+                } else {
+                  if (charCode == 34) {
+                    // An unescaped double-quote character marks the end of the
+                    // string.
+                    break;
+                  }
+                  charCode = source.charCodeAt(Index);
+                  begin = Index;
+                  // Optimize for the common case where a string is valid.
+                  while (charCode >= 32 && charCode != 92 && charCode != 34) {
+                    charCode = source.charCodeAt(++Index);
+                  }
+                  // Append the string as-is.
+                  value += source.slice(begin, Index);
+                }
+              }
+              if (source.charCodeAt(Index) == 34) {
+                // Advance to the next character and return the revived string.
+                Index++;
+                return value;
+              }
+              // Unterminated string.
+              abort();
+            default:
+              // Parse numbers and literals.
+              begin = Index;
+              // Advance past the negative sign, if one is specified.
+              if (charCode == 45) {
+                isSigned = true;
+                charCode = source.charCodeAt(++Index);
+              }
+              // Parse an integer or floating-point value.
+              if (charCode >= 48 && charCode <= 57) {
+                // Leading zeroes are interpreted as octal literals.
+                if (charCode == 48 && ((charCode = source.charCodeAt(Index + 1)), charCode >= 48 && charCode <= 57)) {
+                  // Illegal octal literal.
+                  abort();
+                }
+                isSigned = false;
+                // Parse the integer component.
+                for (; Index < length && ((charCode = source.charCodeAt(Index)), charCode >= 48 && charCode <= 57); Index++);
+                // Floats cannot contain a leading decimal point; however, this
+                // case is already accounted for by the parser.
+                if (source.charCodeAt(Index) == 46) {
+                  position = ++Index;
+                  // Parse the decimal component.
+                  for (; position < length && ((charCode = source.charCodeAt(position)), charCode >= 48 && charCode <= 57); position++);
+                  if (position == Index) {
+                    // Illegal trailing decimal.
+                    abort();
+                  }
+                  Index = position;
+                }
+                // Parse exponents. The `e` denoting the exponent is
+                // case-insensitive.
+                charCode = source.charCodeAt(Index);
+                if (charCode == 101 || charCode == 69) {
+                  charCode = source.charCodeAt(++Index);
+                  // Skip past the sign following the exponent, if one is
+                  // specified.
+                  if (charCode == 43 || charCode == 45) {
+                    Index++;
+                  }
+                  // Parse the exponential component.
+                  for (position = Index; position < length && ((charCode = source.charCodeAt(position)), charCode >= 48 && charCode <= 57); position++);
+                  if (position == Index) {
+                    // Illegal empty exponent.
+                    abort();
+                  }
+                  Index = position;
+                }
+                // Coerce the parsed value to a JavaScript number.
+                return +source.slice(begin, Index);
+              }
+              // A negative sign may only precede numbers.
+              if (isSigned) {
+                abort();
+              }
+              // `true`, `false`, and `null` literals.
+              if (source.slice(Index, Index + 4) == "true") {
+                Index += 4;
+                return true;
+              } else if (source.slice(Index, Index + 5) == "false") {
+                Index += 5;
+                return false;
+              } else if (source.slice(Index, Index + 4) == "null") {
+                Index += 4;
+                return null;
+              }
+              // Unrecognized token.
+              abort();
+          }
+        }
+        // Return the sentinel `$` character if the parser has reached the end
+        // of the source string.
+        return "$";
+      };
+
+      // Internal: Parses a JSON `value` token.
+      var get = function (value) {
+        var results, hasMembers;
+        if (value == "$") {
+          // Unexpected end of input.
+          abort();
+        }
+        if (typeof value == "string") {
+          if ((charIndexBuggy ? value.charAt(0) : value[0]) == "@") {
+            // Remove the sentinel `@` character.
+            return value.slice(1);
+          }
+          // Parse object and array literals.
+          if (value == "[") {
+            // Parses a JSON array, returning a new JavaScript array.
+            results = [];
+            for (;; hasMembers || (hasMembers = true)) {
+              value = lex();
+              // A closing square bracket marks the end of the array literal.
+              if (value == "]") {
+                break;
+              }
+              // If the array literal contains elements, the current token
+              // should be a comma separating the previous element from the
+              // next.
+              if (hasMembers) {
+                if (value == ",") {
+                  value = lex();
+                  if (value == "]") {
+                    // Unexpected trailing `,` in array literal.
+                    abort();
+                  }
+                } else {
+                  // A `,` must separate each array element.
+                  abort();
+                }
+              }
+              // Elisions and leading commas are not permitted.
+              if (value == ",") {
+                abort();
+              }
+              results.push(get(value));
+            }
+            return results;
+          } else if (value == "{") {
+            // Parses a JSON object, returning a new JavaScript object.
+            results = {};
+            for (;; hasMembers || (hasMembers = true)) {
+              value = lex();
+              // A closing curly brace marks the end of the object literal.
+              if (value == "}") {
+                break;
+              }
+              // If the object literal contains members, the current token
+              // should be a comma separator.
+              if (hasMembers) {
+                if (value == ",") {
+                  value = lex();
+                  if (value == "}") {
+                    // Unexpected trailing `,` in object literal.
+                    abort();
+                  }
+                } else {
+                  // A `,` must separate each object member.
+                  abort();
+                }
+              }
+              // Leading commas are not permitted, object property names must be
+              // double-quoted strings, and a `:` must separate each property
+              // name and value.
+              if (value == "," || typeof value != "string" || (charIndexBuggy ? value.charAt(0) : value[0]) != "@" || lex() != ":") {
+                abort();
+              }
+              results[value.slice(1)] = get(lex());
+            }
+            return results;
+          }
+          // Unexpected token encountered.
+          abort();
+        }
+        return value;
+      };
+
+      // Internal: Updates a traversed object member.
+      var update = function(source, property, callback) {
+        var element = walk(source, property, callback);
+        if (element === undef) {
+          delete source[property];
+        } else {
+          source[property] = element;
+        }
+      };
+
+      // Internal: Recursively traverses a parsed JSON object, invoking the
+      // `callback` function for each value. This is an implementation of the
+      // `Walk(holder, name)` operation defined in ES 5.1 section 15.12.2.
+      var walk = function (source, property, callback) {
+        var value = source[property], length;
+        if (typeof value == "object" && value) {
+          // `forEach` can't be used to traverse an array in Opera <= 8.54
+          // because its `Object#hasOwnProperty` implementation returns `false`
+          // for array indices (e.g., `![1, 2, 3].hasOwnProperty("0")`).
+          if (getClass.call(value) == arrayClass) {
+            for (length = value.length; length--;) {
+              update(value, length, callback);
+            }
+          } else {
+            forEach(value, function (property) {
+              update(value, property, callback);
+            });
+          }
+        }
+        return callback.call(source, property, value);
+      };
+
+      // Public: `JSON.parse`. See ES 5.1 section 15.12.2.
+      JSON3.parse = function (source, callback) {
+        var result, value;
+        Index = 0;
+        Source = "" + source;
+        result = get(lex());
+        // If a JSON string contains multiple tokens, it is invalid.
+        if (lex() != "$") {
+          abort();
+        }
+        // Reset the parser state.
+        Index = Source = null;
+        return callback && getClass.call(callback) == functionClass ? walk((value = {}, value[""] = result, value), "", callback) : result;
+      };
+    }
+  }
+
+  // Export for asynchronous module loaders.
+  if (isLoader) {
+    define(function () {
+      return JSON3;
+    });
+  }
+}(this));
+
+},{}],145:[function(require,module,exports){
 module.exports = toArray
 
 function toArray(list, index) {
@@ -33435,296 +37983,31 @@ function toArray(list, index) {
     return array
 }
 
-},{}],127:[function(require,module,exports){
-(function (global){
-/*! http://mths.be/utf8js v2.0.0 by @mathias */
-;(function(root) {
-
-	// Detect free variables `exports`
-	var freeExports = typeof exports == 'object' && exports;
-
-	// Detect free variable `module`
-	var freeModule = typeof module == 'object' && module &&
-		module.exports == freeExports && module;
-
-	// Detect free variable `global`, from Node.js or Browserified code,
-	// and use it as `root`
-	var freeGlobal = typeof global == 'object' && global;
-	if (freeGlobal.global === freeGlobal || freeGlobal.window === freeGlobal) {
-		root = freeGlobal;
-	}
-
-	/*--------------------------------------------------------------------------*/
-
-	var stringFromCharCode = String.fromCharCode;
-
-	// Taken from http://mths.be/punycode
-	function ucs2decode(string) {
-		var output = [];
-		var counter = 0;
-		var length = string.length;
-		var value;
-		var extra;
-		while (counter < length) {
-			value = string.charCodeAt(counter++);
-			if (value >= 0xD800 && value <= 0xDBFF && counter < length) {
-				// high surrogate, and there is a next character
-				extra = string.charCodeAt(counter++);
-				if ((extra & 0xFC00) == 0xDC00) { // low surrogate
-					output.push(((value & 0x3FF) << 10) + (extra & 0x3FF) + 0x10000);
-				} else {
-					// unmatched surrogate; only append this code unit, in case the next
-					// code unit is the high surrogate of a surrogate pair
-					output.push(value);
-					counter--;
-				}
-			} else {
-				output.push(value);
-			}
-		}
-		return output;
-	}
-
-	// Taken from http://mths.be/punycode
-	function ucs2encode(array) {
-		var length = array.length;
-		var index = -1;
-		var value;
-		var output = '';
-		while (++index < length) {
-			value = array[index];
-			if (value > 0xFFFF) {
-				value -= 0x10000;
-				output += stringFromCharCode(value >>> 10 & 0x3FF | 0xD800);
-				value = 0xDC00 | value & 0x3FF;
-			}
-			output += stringFromCharCode(value);
-		}
-		return output;
-	}
-
-	/*--------------------------------------------------------------------------*/
-
-	function createByte(codePoint, shift) {
-		return stringFromCharCode(((codePoint >> shift) & 0x3F) | 0x80);
-	}
-
-	function encodeCodePoint(codePoint) {
-		if ((codePoint & 0xFFFFFF80) == 0) { // 1-byte sequence
-			return stringFromCharCode(codePoint);
-		}
-		var symbol = '';
-		if ((codePoint & 0xFFFFF800) == 0) { // 2-byte sequence
-			symbol = stringFromCharCode(((codePoint >> 6) & 0x1F) | 0xC0);
-		}
-		else if ((codePoint & 0xFFFF0000) == 0) { // 3-byte sequence
-			symbol = stringFromCharCode(((codePoint >> 12) & 0x0F) | 0xE0);
-			symbol += createByte(codePoint, 6);
-		}
-		else if ((codePoint & 0xFFE00000) == 0) { // 4-byte sequence
-			symbol = stringFromCharCode(((codePoint >> 18) & 0x07) | 0xF0);
-			symbol += createByte(codePoint, 12);
-			symbol += createByte(codePoint, 6);
-		}
-		symbol += stringFromCharCode((codePoint & 0x3F) | 0x80);
-		return symbol;
-	}
-
-	function utf8encode(string) {
-		var codePoints = ucs2decode(string);
-
-		// console.log(JSON.stringify(codePoints.map(function(x) {
-		// 	return 'U+' + x.toString(16).toUpperCase();
-		// })));
-
-		var length = codePoints.length;
-		var index = -1;
-		var codePoint;
-		var byteString = '';
-		while (++index < length) {
-			codePoint = codePoints[index];
-			byteString += encodeCodePoint(codePoint);
-		}
-		return byteString;
-	}
-
-	/*--------------------------------------------------------------------------*/
-
-	function readContinuationByte() {
-		if (byteIndex >= byteCount) {
-			throw Error('Invalid byte index');
-		}
-
-		var continuationByte = byteArray[byteIndex] & 0xFF;
-		byteIndex++;
-
-		if ((continuationByte & 0xC0) == 0x80) {
-			return continuationByte & 0x3F;
-		}
-
-		// If we end up here, it’s not a continuation byte
-		throw Error('Invalid continuation byte');
-	}
-
-	function decodeSymbol() {
-		var byte1;
-		var byte2;
-		var byte3;
-		var byte4;
-		var codePoint;
-
-		if (byteIndex > byteCount) {
-			throw Error('Invalid byte index');
-		}
-
-		if (byteIndex == byteCount) {
-			return false;
-		}
-
-		// Read first byte
-		byte1 = byteArray[byteIndex] & 0xFF;
-		byteIndex++;
-
-		// 1-byte sequence (no continuation bytes)
-		if ((byte1 & 0x80) == 0) {
-			return byte1;
-		}
-
-		// 2-byte sequence
-		if ((byte1 & 0xE0) == 0xC0) {
-			var byte2 = readContinuationByte();
-			codePoint = ((byte1 & 0x1F) << 6) | byte2;
-			if (codePoint >= 0x80) {
-				return codePoint;
-			} else {
-				throw Error('Invalid continuation byte');
-			}
-		}
-
-		// 3-byte sequence (may include unpaired surrogates)
-		if ((byte1 & 0xF0) == 0xE0) {
-			byte2 = readContinuationByte();
-			byte3 = readContinuationByte();
-			codePoint = ((byte1 & 0x0F) << 12) | (byte2 << 6) | byte3;
-			if (codePoint >= 0x0800) {
-				return codePoint;
-			} else {
-				throw Error('Invalid continuation byte');
-			}
-		}
-
-		// 4-byte sequence
-		if ((byte1 & 0xF8) == 0xF0) {
-			byte2 = readContinuationByte();
-			byte3 = readContinuationByte();
-			byte4 = readContinuationByte();
-			codePoint = ((byte1 & 0x0F) << 0x12) | (byte2 << 0x0C) |
-				(byte3 << 0x06) | byte4;
-			if (codePoint >= 0x010000 && codePoint <= 0x10FFFF) {
-				return codePoint;
-			}
-		}
-
-		throw Error('Invalid UTF-8 detected');
-	}
-
-	var byteArray;
-	var byteCount;
-	var byteIndex;
-	function utf8decode(byteString) {
-		byteArray = ucs2decode(byteString);
-		byteCount = byteArray.length;
-		byteIndex = 0;
-		var codePoints = [];
-		var tmp;
-		while ((tmp = decodeSymbol()) !== false) {
-			codePoints.push(tmp);
-		}
-		return ucs2encode(codePoints);
-	}
-
-	/*--------------------------------------------------------------------------*/
-
-	var utf8 = {
-		'version': '2.0.0',
-		'encode': utf8encode,
-		'decode': utf8decode
-	};
-
-	// Some AMD build optimizers, like r.js, check for specific condition patterns
-	// like the following:
-	if (
-		typeof define == 'function' &&
-		typeof define.amd == 'object' &&
-		define.amd
-	) {
-		define(function() {
-			return utf8;
-		});
-	}	else if (freeExports && !freeExports.nodeType) {
-		if (freeModule) { // in Node.js or RingoJS v0.8.0+
-			freeModule.exports = utf8;
-		} else { // in Narwhal or RingoJS v0.7.0-
-			var object = {};
-			var hasOwnProperty = object.hasOwnProperty;
-			for (var key in utf8) {
-				hasOwnProperty.call(utf8, key) && (freeExports[key] = utf8[key]);
-			}
-		}
-	} else { // in Rhino or a web browser
-		root.utf8 = utf8;
-	}
-
-}(this));
-
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-
-},{}],128:[function(require,module,exports){
-
+},{}],146:[function(require,module,exports){
+/* global module */
 /**
- * Module dependencies.
- */
-
-var global = (function() { return this; })();
-
-/**
- * WebSocket constructor.
- */
-
-var WebSocket = global.WebSocket || global.MozWebSocket;
-
-/**
- * Module exports.
- */
-
-module.exports = WebSocket ? ws : null;
-
-/**
- * WebSocket constructor.
+ * The possible camera facing modes. For now support only 'user' and
+ * 'environment' because 'left' and 'right' are not used anywhere in our
+ * projects at the time of this writing. For more information please refer to
+ * https://w3c.github.io/mediacapture-main/getusermedia.html#def-constraint-facingMode
  *
- * The third `opts` options object gets ignored in web browsers, since it's
- * non-standard, and throws a TypeError if passed to the constructor.
- * See: https://github.com/einaros/ws/issues/227
- *
- * @param {String} uri
- * @param {Array} protocols (optional)
- * @param {Object) opts (optional)
- * @api public
+ * @enum {string}
  */
+var CameraFacingMode = {
+    /**
+     * The mode which specifies the environment-facing camera.
+     */
+    ENVIRONMENT: "environment",
 
-function ws(uri, protocols, opts) {
-  var instance;
-  if (protocols) {
-    instance = new WebSocket(uri, protocols);
-  } else {
-    instance = new WebSocket(uri);
-  }
-  return instance;
-}
+    /**
+     * The mode which specifies the user-facing camera.
+     */
+    USER: "user"
+};
 
-if (WebSocket) ws.prototype = WebSocket.prototype;
+module.exports = CameraFacingMode;
 
-},{}],129:[function(require,module,exports){
+},{}],147:[function(require,module,exports){
 /**
  * Enumeration of RTC media stream types
  * @type {{AUDIO: string, VIDEO: string}}
@@ -33740,7 +38023,7 @@ var MediaType = {
     VIDEO: "video"
 };
 module.exports = MediaType;
-},{}],130:[function(require,module,exports){
+},{}],148:[function(require,module,exports){
 var RTCEvents = {
     RTC_READY: "rtc.ready",
     DATA_CHANNEL_OPEN: "rtc.data_channel_open",
@@ -33748,13 +38031,21 @@ var RTCEvents = {
     DOMINANTSPEAKER_CHANGED: "rtc.dominantspeaker_changed",
     LASTN_ENDPOINT_CHANGED: "rtc.lastn_endpoint_changed",
     AVAILABLE_DEVICES_CHANGED: "rtc.available_devices_changed",
-    FAKE_VIDEO_TRACK_CREATED: "rtc.fake_video_track_created",
     TRACK_ATTACHED: "rtc.track_attached",
-    AUDIO_OUTPUT_DEVICE_CHANGED: "rtc.audio_output_device_changed"
+    AUDIO_OUTPUT_DEVICE_CHANGED: "rtc.audio_output_device_changed",
+    DEVICE_LIST_CHANGED: "rtc.device_list_changed",
+    DEVICE_LIST_AVAILABLE: "rtc.device_list_available",
+    /**
+     * Indicates that a message from another participant is received on
+     * data channel.
+     */
+    ENDPOINT_MESSAGE_RECEIVED:
+        "rtc.endpoint_message_received"
 };
 
 module.exports = RTCEvents;
-},{}],131:[function(require,module,exports){
+
+},{}],149:[function(require,module,exports){
 var Resolutions = {
     "1080": {
         width: 1920,
@@ -33810,7 +38101,7 @@ var Resolutions = {
     }
 };
 module.exports = Resolutions;
-},{}],132:[function(require,module,exports){
+},{}],150:[function(require,module,exports){
 /* global module */
 /**
  * Enumeration of the video types
@@ -33828,7 +38119,7 @@ var VideoType = {
 };
 module.exports = VideoType;
 
-},{}],133:[function(require,module,exports){
+},{}],151:[function(require,module,exports){
 var AuthenticationEvents = {
     /**
      * Event callback arguments:
@@ -33842,24 +38133,32 @@ var AuthenticationEvents = {
 };
 module.exports = AuthenticationEvents;
 
-},{}],134:[function(require,module,exports){
+},{}],152:[function(require,module,exports){
 module.exports = {
+    /**
+     * FIXME: needs documentation.
+     */
+    AUDIO_LEVEL: "statistics.audioLevel",
+    /**
+     * Notifies about audio problem with remote participant.
+     */
+    AUDIO_NOT_WORKING: "statistics.audio_not_working",
     /**
      * An event carrying connection statistics.
      */
     CONNECTION_STATS: "statistics.connectionstats",
     /**
-     * FIXME: needs documentation.
+     * An event carrying all statistics by ssrc.
      */
-    AUDIO_LEVEL: "statistics.audioLevel",
+    BYTE_SENT_STATS: "statistics.byte_sent_stats"
 };
 
-},{}],135:[function(require,module,exports){
+},{}],153:[function(require,module,exports){
 var Constants = {
     LOCAL_JID: 'local'
 };
 module.exports = Constants;
-},{}],136:[function(require,module,exports){
+},{}],154:[function(require,module,exports){
 var XMPPEvents = {
     /**
      * Indicates error while adding ice candidate.
@@ -33905,6 +38204,11 @@ var XMPPEvents = {
     FOCUS_DISCONNECTED: 'xmpp.focus_disconnected',
     FOCUS_LEFT: "xmpp.focus_left",
     GRACEFUL_SHUTDOWN: "xmpp.graceful_shutdown",
+    /**
+     * Event fired when 'transport-replace' Jingle message has been received,
+     * before the new offer is set on the PeerConnection.
+     */
+    ICE_RESTARTING: "rtc.ice_restarting",
     /* Event fired when XMPP error is returned to any request, it is meant to be
      * used to report 'signaling' errors to CallStats
      *
@@ -33936,6 +38240,8 @@ var XMPPEvents = {
     // Designates an event indicating that the MUC role of a participant has
     // changed.
     MUC_ROLE_CHANGED: "xmpp.muc_role_changed",
+    // Designates an event indicating that the MUC has been locked or unlocked.
+    MUC_LOCK_CHANGED: "xmpp.muc_lock_changed",
     // Designates an event indicating that a participant in the XMPP MUC has
     // advertised that they have audio muted (or unmuted).
     PARTICIPANT_AUDIO_MUTED: "xmpp.audio_muted",
@@ -33996,6 +38302,17 @@ var XMPPEvents = {
      * Indicates that the local sendrecv streams in local SDP are changed.
      */
     SENDRECV_STREAMS_CHANGED: "xmpp.sendrecv_streams_changed",
+    /**
+     * Event fired when we do not get our 'session-accept' acknowledged by
+     * Jicofo. It most likely means that there is serious problem with our
+     * connection or XMPP server and we should reload the conference.
+     *
+     * We have seen that to happen in BOSH requests race condition when the BOSH
+     * request table containing the 'session-accept' was discarded by Prosody.
+     * Jicofo does send the RESULT immediately without any condition, so missing
+     * packets means that most likely it has never seen our IQ.
+     */
+    SESSION_ACCEPT_TIMEOUT: "xmpp.session_accept_timeout",
     // TODO: only used in a hack, should probably be removed.
     SET_LOCAL_DESCRIPTION_ERROR: 'xmpp.set_local_description_error',
 
@@ -34014,10 +38331,16 @@ var XMPPEvents = {
     START_MUTED_FROM_FOCUS: "xmpp.start_muted_from_focus",
     // Designates an event indicating that the subject of the XMPP MUC has
     // changed.
-    SUBJECT_CHANGED: "xmpp.subject_changed"
+    SUBJECT_CHANGED: "xmpp.subject_changed",
+    // Designates an event indicating that the local ICE username fragment of
+    // the jingle session has changed.
+    LOCAL_UFRAG_CHANGED: "xmpp.local_ufrag_changed",
+    // Designates an event indicating that the local ICE username fragment of
+    // the jingle session has changed.
+    REMOTE_UFRAG_CHANGED: "xmpp.remote_ufrag_changed"
 };
 module.exports = XMPPEvents;
 
-},{}]},{},[7])(7)
+},{}]},{},[10])(10)
 });
 //# sourceMappingURL=lib-jitsi-meet.js.map
