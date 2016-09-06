@@ -52,7 +52,7 @@ LivechatVideoCall = new (class LivechatVideoCall {
 			'/jitsi/do_external_connect.js',
 			'/jitsi/interface_config.js',
 			'/jitsi/lib-jitsi-meet.js',
-			'/jitsi/app.bundle.min.js'
+			'/jitsi/app.bundle.js'
 		].reverse();
 
 		Meteor.defer(() => {
@@ -72,7 +72,7 @@ LivechatVideoCall = new (class LivechatVideoCall {
 					});
 			}
 			consume();
-			
+
 
 			// let interfaceConfig = {};
 			// // let interfaceConfig = { filmStripOnly: true };
