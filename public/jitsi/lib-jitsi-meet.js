@@ -6209,7 +6209,16 @@ function handleLocalStream(streams, resolution) {
     // video (e.g. Chrome). In order to not duplicate the logic here, examine
     // the specified streams and figure out what we've received based on
     // obtainAudioAndVideoPermissions' decision.
-    if (streams) {
+    if (RTCBrowserType.isiOSRTC()) {
+        //TODO avoid calling getAudioTracks getVideoTracks twice
+        console.log("HandleLocalStream iOSRTC", streams, resolution);
+        if (streams && streams.audioVideo) {
+            if(streams.audioVideo.getAudioTracks().length > 0)
+                audioStream = streams.audioVideo;
+            if(streams.audioVideo.getVideoTracks().length > 0)
+                videoStream = streams.audioVideo;
+        }
+    } else if (streams) {
         // As mentioned above, certian types of browser (e.g. Chrome) support
         // (with a result which meets our requirements expressed bellow) calling
         // getUserMedia once for both audio and video.
@@ -6229,15 +6238,6 @@ function handleLocalStream(streams, resolution) {
                 for (var j = 0; j < videoTracks.length; j++) {
                     videoStream.addTrack(videoTracks[j]);
                 }
-            }
-        } else if(RTCBrowserType.isiOSRTC()) {
-            //TODO avoid calling getAudioTracks getVideoTracks twice
-            console.log("HandleLocalStream iOSRTC", streams, resolution);
-            if (streams && streams.audioVideo) {
-                if(streams.audioVideo.getAudioTracks().length > 0)
-                    audioStream = streams.audioVideo;
-                if(streams.audioVideo.getVideoTracks().length > 0)
-                    videoStream = streams.audioVideo;
             }
         } else {
           // On other types of browser (e.g. Firefox) we choose (namely,
@@ -6374,6 +6374,7 @@ var RTCUtils = {
 
         return new Promise(function(resolve, reject) {
             if (RTCBrowserType.isFirefox()) {
+                console.log('RTCUtils.init -> isFirefox()');
                 var FFversion = RTCBrowserType.getFirefoxVersion();
                 if (FFversion < 40) {
                     logger.error(
@@ -6421,6 +6422,7 @@ var RTCUtils = {
                     RTCBrowserType.isOpera() ||
                     RTCBrowserType.isNWJS() ||
                     RTCBrowserType.isReactNative()) {
+                console.log('RTCUtils.init -> isChrome()');
                 this.peerconnection = webkitRTCPeerConnection;
                 var getUserMedia = navigator.webkitGetUserMedia.bind(navigator);
                 if (navigator.mediaDevices) {
@@ -6476,6 +6478,7 @@ var RTCUtils = {
             }
             // Detect IE/Safari
             else if (RTCBrowserType.isTemasysPluginUsed()) {
+                console.log('RTCUtils.init -> isTemasysPluginUsed()');
 
                 //AdapterJS.WebRTCPlugin.setLogLevel(
                 //    AdapterJS.WebRTCPlugin.PLUGIN_LOG_LEVELS.VERBOSE);
@@ -6520,6 +6523,7 @@ var RTCUtils = {
             }
             else if(RTCBrowserType.isiOSRTC())
             {
+                console.log('RTCUtils.init -> isiOSRTC()');
                 var self = this;
 
                 this.attachMediaStream = function (element, stream) {
@@ -6539,7 +6543,7 @@ var RTCUtils = {
                     };
 
                 self.pc_constraints = {};
-                window.addEventListener("load", function () {
+                // window.addEventListener("load", function () {
                     console.log("lib-jitsi-cordova >>> DOM ready event");
                     document.addEventListener("deviceready", function () {
                         console.log("lib-jitsi-cordova >>> deviceready event");
@@ -6581,8 +6585,9 @@ var RTCUtils = {
                         onReady(options, this.getUserMediaWithConstraints);
                         resolve();
                      });  // End of ondeviceready.
-                });
+                // });
             } else {
+                console.log('Browser does not appear to be WebRTC-capable');
                 var errmsg = 'Browser does not appear to be WebRTC-capable';
                 try {
                     logger.error(errmsg);
