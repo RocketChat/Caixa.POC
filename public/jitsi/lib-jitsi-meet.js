@@ -5240,7 +5240,7 @@ var RTCBrowserType = {
 
     RTC_BROWSER_NWJS: "rtc_browser.nwjs",
 
-	RTC_BROWSER_IOSRTC: "rtc_browser.iosrtc",
+    RTC_BROWSER_IOSRTC: "rtc_browser.iosrtc",
 
     RTC_BROWSER_REACT_NATIVE: "rtc_browser.react-native",
 
@@ -5537,7 +5537,7 @@ function detectBrowser() {
         detectFirefox,
         detectIE,
         detectSafari,
-		detectiOSRTC
+        detectiOSRTC
     ];
     // Try all browser detectors
     for (var i = 0; i < detectors.length; i++) {
@@ -6230,6 +6230,15 @@ function handleLocalStream(streams, resolution) {
                     videoStream.addTrack(videoTracks[j]);
                 }
             }
+        } else if(RTCBrowserType.isiOSRTC()) {
+            //TODO avoid calling getAudioTracks getVideoTracks twice
+            console.log("HandleLocalStream iOSRTC", streams, resolution);
+            if (streams && streams.audioVideo) {
+                if(streams.audioVideo.getAudioTracks().length > 0)
+                    audioStream = streams.audioVideo;
+                if(streams.audioVideo.getVideoTracks().length > 0)
+                    videoStream = streams.audioVideo;
+            }
         } else {
           // On other types of browser (e.g. Firefox) we choose (namely,
           // obtainAudioAndVideoPermissions) to call getUsermedia per device
@@ -6240,20 +6249,6 @@ function handleLocalStream(streams, resolution) {
         // Again, different choices on different types of browser.
         desktopStream = streams.desktopStream || streams.desktop;
     }
-
-	else if(RTCBrowserType.isiOSRTC())
-	{
-		//TODO avoid calling getAudioTracks getVideoTracks twice
-		console.log("HandleLocalStream iOSRTC", streams, resolution);
-		if (streams && streams.audioVideo)
-		{
-			if(streams.audioVideo.getAudioTracks().length > 0)
-            audioStream = streams.audioVideo;
-
-			if(streams.audioVideo.getVideoTracks().length > 0)
-            videoStream = streams.audioVideo;
-		}
-	}
 
     if (desktopStream) {
         res.push({
@@ -18847,7 +18842,7 @@ XMPP.prototype.initFeaturesList = function () {
         disco.addFeature('urn:xmpp:jingle:apps:rtp:video');
 
         if (RTCBrowserType.isChrome() || RTCBrowserType.isOpera()
-            || RTCBrowserType.isTemasysPluginUsed()) {
+            || RTCBrowserType.isTemasysPluginUsed() || RTCBrowserType.isiOSRTC()) {
             disco.addFeature('urn:ietf:rfc:4588');
         }
 
@@ -18861,7 +18856,7 @@ XMPP.prototype.initFeaturesList = function () {
         //disco.addFeature('urn:ietf:rfc:5576'); // a=ssrc
 
         // Enable Lipsync ?
-        if (this.options.enableLipSync && RTCBrowserType.isChrome()) {
+        if (this.options.enableLipSync && (RTCBrowserType.isChrome() || RTCBrowserType.isiOSRTC())) {
             logger.info("Lip-sync enabled !");
             this.connection.disco.addFeature('http://jitsi.org/meet/lipsync');
         }
