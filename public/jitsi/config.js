@@ -71,5 +71,9 @@ var config = {
     'During that time service will not be available. ' +
     'Apologise for inconvenience.',*/
     disableThirdPartyRequests: false,
-    minHDHeight: 540
+    minHDHeight: 540,
+    getroomnode: function() {
+        console.log('getting room name');
+        return LivechatVideoCall.getRoomName();
+    }
 };
