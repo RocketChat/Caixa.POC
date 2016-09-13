@@ -2,6 +2,7 @@ LivechatVideoCall = new (class LivechatVideoCall {
 	constructor() {
 		this.live = new ReactiveVar(false);
 		this.calling = new ReactiveVar(false);
+		this.roomName = '';
 	}
 
 	askPermissions(callback) {
@@ -26,10 +27,12 @@ LivechatVideoCall = new (class LivechatVideoCall {
 		this.askPermissions((granted) => {
 			if (granted) {
 				this.calling.set(true);
+
 				Meteor.call('livechat:startVideoCall', visitor.getRoom(true), (error, result) => {
 					if (error) {
 						return;
 					}
+
 					visitor.subscribeToRoom(result.roomId);
 
 					// after get ok from server, start the chat
@@ -40,36 +43,43 @@ LivechatVideoCall = new (class LivechatVideoCall {
 	}
 
 	start(domain, room) {
+		this.roomName = room;
+		var files = [
+			'/jitsi/run.js',
+			'/jitsi/fix_ios.js',
+			'/jitsi/config.js',
+			'/jitsi/utils.js',
+			'/jitsi/do_external_connect.js',
+			'/jitsi/interface_config.js',
+			'/jitsi/lib-jitsi-meet.js',
+			'/jitsi/app.bundle.js',
+		].reverse();
+
 		Meteor.defer(() => {
-			let interfaceConfig = {};
-			// let interfaceConfig = { filmStripOnly: true };
-			interfaceConfig['TOOLBAR_BUTTONS'] = '[""]';
-			interfaceConfig['APP_NAME'] = '"Livechat"';
-
-			this.api = new jitsiAPI(domain, room, $('.video-call').width(), $('.video-call').height(), $('.video-call .container').get(0), {}, interfaceConfig);
-
-			this.live.set(true);
-
-			let logListener = (what) => {
-				console.log('Jitsi.addEventListener ->',what);
+			function consume() {
+				var file = files.pop();
+				if (!file) {
+					return;
+				}
+				$.getScript(file)
+					.done(function() {
+						consume();
+					})
+					.fail(function( jqxhr, settings, exception, a ) {
+						window.ex = exception;
+						console.log(jqxhr, settings, exception, a);
+					});
 			}
-
-			this.api.addEventListeners({
-				incomingMessage() { logListener('incomingMessage'); },
-				outgoingMessage() { logListener('outgoingMessage'); },
-				displayNameChange() { logListener('displayNameChange'); },
-				participantJoined() { logListener('participantJoined'); },
-				participantLeft() { logListener('participantLeft'); },
-				videoConferenceJoined() { logListener('videoConferenceJoined'); },
-				videoConferenceLeft() { logListener('videoConferenceLeft'); },
-			});
+			consume();
 		});
 	}
 
 	finish() {
 		this.live.set(false);
 		this.calling.set(false);
-		this.api.dispose();
+		if (APP && APP.API && APP.API.dispose) {
+			APP.API.dispose();
+		}
 	}
 
 	isActive() {
@@ -78,5 +88,9 @@ LivechatVideoCall = new (class LivechatVideoCall {
 
 	isLive() {
 		return this.live.get();
+	}
+
+	getRoomName() {
+		return this.roomName.toLowerCase();
 	}
 });
